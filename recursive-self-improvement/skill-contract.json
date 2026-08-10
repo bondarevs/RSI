@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "name": "recursive-self-improvement",
+  "kind": "role",
+  "owns": [
+    "rsi.objectives",
+    "rsi.lifecycle",
+    "rsi.evaluation",
+    "rsi.experiment",
+    "rsi.metrics",
+    "rsi.policy",
+    "rsi.reporting",
+    "rsi.rollout"
+  ],
+  "requires": {
+    "skill-evolver": [
+      "skill-learning.list",
+      "skill-learning.route",
+      "skill-learning.capture",
+      "skill-learning.defer",
+      "skill-learning.resolve",
+      "skill-learning.snapshot",
+      "skill-learning.restore",
+      "skill-learning.validate"
+    ]
+  },
+  "profiles": {
+    "default": "profiles/default.json",
+    "production": "profiles/production.json"
+  }
+}

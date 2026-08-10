@@ -1,0 +1,15 @@
+[project]
+name = "recursive-self-improvement"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "hypothesis>=6,<7",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["recursive-self-improvement/tests"]
+pythonpath = ["recursive-self-improvement/scripts"]
+addopts = "-ra"

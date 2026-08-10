@@ -1,0 +1,6 @@
+interface:
+  display_name: "Recursive Self-Improvement"
+  short_description: "Safely improve role-skills from evidence"
+  default_prompt: "Use $recursive-self-improvement to review the completed skill-driven task and validate a safe, evidence-backed improvement."
+policy:
+  allow_implicit_invocation: false

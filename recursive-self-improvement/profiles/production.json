@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "baseProfile": "default",
+  "mode": "promote-safe",
+  "orchestration": {
+    "hookMode": "coordinated"
+  },
+  "activation": {
+    "stageAttestationRequired": true,
+    "stageAttestationRef": null,
+    "hookAttestationRef": null,
+    "allowedTargets": []
+  },
+  "promotion": {
+    "allowKnowledge": true,
+    "allowLowRiskBehavior": false,
+    "allowMaterialChanges": false
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "mode": "observe",
+  "orchestration": {
+    "hookMode": "late-review"
+  },
+  "local": {
+    "enabled": true,
+    "maxCandidatesPerTask": 3,
+    "monitoringWindowTasks": 10
+  },
+  "global": {
+    "enabled": false,
+    "minimumIndependentTasks": 3,
+    "minimumDistinctSkills": 2,
+    "autoPromote": false
+  },
+  "defragmentation": {
+    "enabled": true,
+    "mode": "audit-only",
+    "requireCompleteMigrationLedger": true,
+    "requireExplicitApproval": true
+  },
+  "promotion": {
+    "allowKnowledge": true,
+    "allowLowRiskBehavior": false,
+    "allowMaterialChanges": false,
+    "requireSnapshot": true,
+    "requireTargetTests": true
+  },
+  "storage": {
+    "observationRetentionDays": 90,
+    "reportRetentionDays": 180
+  },
+  "limits": {
+    "maxEvidenceItems": 5,
+    "maxEvidenceItemChars": 1200,
+    "maxFindingChars": 2000
+  }
+}
