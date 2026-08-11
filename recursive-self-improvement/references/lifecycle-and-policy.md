@@ -19,6 +19,13 @@ The shipped default is exact and fail-closed:
 - evidence limits: 5 items, 1,200 characters per item, 2,000 finding
   characters.
 
+The sanitizer's ordinary output ceiling remains 1,200 characters. Candidate
+seed validation alone selects the bounded 2,000-character finding-output
+envelope after first enforcing the raw finding schema limit. The 4,096-character
+sanitizer source cap, instruction/secret/PII classification, task/path
+generalization, exact-output comparison, and 1,200-character evidence limit do
+not expand.
+
 The production overlay names `promote-safe`, but its stage and hook attestation
 references are `null` and `allowedTargets` is empty. It therefore resolves to
 `observe` until an operator installs a versioned attested deployment overlay

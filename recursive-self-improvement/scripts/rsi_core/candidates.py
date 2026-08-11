@@ -107,10 +107,19 @@ def _strict_json(data: bytes, label: str) -> object:
         raise LifecycleError(f"durable {label} is unavailable") from None
 
 
-def _safe_text(value: object, label: str, limit: int) -> str:
+def _safe_text(
+    value: object,
+    label: str,
+    limit: int,
+    *,
+    max_output_chars: int | None = None,
+) -> str:
     if not isinstance(value, str) or not value or len(value) > limit or value != value.strip():
         raise LifecycleError(f"candidate {label} is invalid")
-    result = sanitize_evidence([{"kind": "candidate", "summary": value}])
+    result = sanitize_evidence(
+        [{"kind": "candidate", "summary": value}],
+        max_output_chars=max_output_chars,
+    )
     if result.rejected_count or result.truncated_count or len(result.accepted) != 1:
         raise LifecycleError(f"candidate {label} is unsafe")
     admitted = result.accepted[0]["summary"]
@@ -196,7 +205,9 @@ def validate_candidate_seed(
         "relatedSkills": canonical_related,
         "targetHint": _safe_hint(value["targetHint"]),
         "title": _safe_text(value["title"], "title", 120),
-        "finding": _safe_text(value["finding"], "finding", 2000),
+        "finding": _safe_text(
+            value["finding"], "finding", 2000, max_output_chars=2000
+        ),
         "evidence": admitted_evidence,
         "confidence": float(confidence),
         "risk": risk,

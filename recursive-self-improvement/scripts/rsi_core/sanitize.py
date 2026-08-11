@@ -9,6 +9,7 @@ import unicodedata
 from urllib.parse import unquote
 
 MAX_ITEMS, MAX_CHARS, MAX_SOURCE_CHARS, MAX_DIAGNOSTICS, MAX_INPUT_ITEMS = 5, 1200, 4096, 5, 32
+MAX_EXTENDED_OUTPUT_CHARS = 2000
 MAX_DECODED_VIEWS, MAX_ENCODED_TOKENS_PER_VIEW = 12, 8
 _SECRET = re.compile(r"(?:sk_(?:live|test)_[\w-]{12,}|(?:ghp_|github_pat_)[\w-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[\w-]{10,}|bearer\s+[\w.-]{16,}|api[_ -]?key\s*[:=]|-----BEGIN [A-Z ]*PRIVATE KEY-----|password\b\s*[-:=])", re.I)
 _PII = re.compile(r"(?:\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b|\+?\d[\d ()-]{8,}\d|\b\d{1,5}\s+[A-Za-z]+\s+(?:Street|St|Avenue|Ave|Road|Rd)\b|\b(?:name|имя)\s*[:=])", re.I)
@@ -158,6 +159,15 @@ def _variants(text: str) -> tuple[tuple[str, ...], bool]:
                 break
         if budget_exceeded:
             break
+        if len(decoded_tokens) > 1:
+            pending.extend(
+                reconstruction
+                for reconstruction in (
+                    "".join(decoded_tokens),
+                    " ".join(decoded_tokens),
+                )
+                if len(reconstruction) <= MAX_SOURCE_CHARS
+            )
         pending.extend(
             decoded
             for decoded in decoded_tokens
@@ -178,9 +188,22 @@ def _reason(text:str)->str|None:
         if _LOW.search(value) and not _UUID.search(value):return "low-entropy-identifier"
         if _INSTRUCTION.search(value):return "instruction-payload"
     return None
-def sanitize_evidence(items:Iterable[object],*,max_items:int=MAX_ITEMS,max_chars:int=MAX_CHARS)->SanitizationResult:
+def sanitize_evidence(
+    items: Iterable[object],
+    *,
+    max_items: int = MAX_ITEMS,
+    max_chars: int = MAX_CHARS,
+    max_output_chars: int | None = None,
+) -> SanitizationResult:
     limit=min(MAX_ITEMS,max(0,max_items)) if isinstance(max_items,int) else MAX_ITEMS
-    chars=min(MAX_CHARS,max(1,max_chars)) if isinstance(max_chars,int) else MAX_CHARS
+    if max_output_chars is None:
+        chars=min(MAX_CHARS,max(1,max_chars)) if isinstance(max_chars,int) else MAX_CHARS
+    else:
+        chars=(
+            min(MAX_EXTENDED_OUTPUT_CHARS,max(1,max_output_chars))
+            if isinstance(max_output_chars,int)
+            else MAX_CHARS
+        )
     accepted=[]; diagnostics=[]; rejected=truncated=0
     for index,item in enumerate(items):
         if index>=MAX_INPUT_ITEMS: truncated+=1; break

@@ -85,7 +85,11 @@ the ordinary normalized view so accepted accented, presentation-form,
 control-bearing, and multilingual evidence is not rewritten. Base64 admission
 examines all bounded candidates, admits only canonical encodings, counts at
 most eight successfully decoded UTF-8 tokens per view, and fails closed above
-that limit or the twelve-view limit. Generate the
+that limit or the twelve-view limit. When a view has two or more decoded
+tokens, enqueue exactly two additional ordered views: direct concatenation and
+single-space joining. Those views may undergo the same bounded nested decoding;
+never generate subsets, permutations, or a combinatorial cross-product.
+Generate the
 path/FSM cases from independent literal oracles rather than repeating a small
 template set. The V1 release corpus includes 22 path
 structure classes (Unicode normalization/casefold, internal and escaping
