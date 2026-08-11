@@ -9,6 +9,7 @@ import unicodedata
 from urllib.parse import unquote
 
 MAX_ITEMS, MAX_CHARS, MAX_SOURCE_CHARS, MAX_DIAGNOSTICS, MAX_INPUT_ITEMS = 5, 1200, 4096, 5, 32
+MAX_DECODED_VIEWS, MAX_ENCODED_TOKENS_PER_VIEW = 12, 8
 _SECRET = re.compile(r"(?:sk_(?:live|test)_[\w-]{12,}|(?:ghp_|github_pat_)[\w-]{16,}|AKIA[0-9A-Z]{16}|xox[baprs]-[\w-]{10,}|bearer\s+[\w.-]{16,}|api[_ -]?key\s*[:=]|-----BEGIN [A-Z ]*PRIVATE KEY-----|password\b\s*[-:=])", re.I)
 _PII = re.compile(r"(?:\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b|\+?\d[\d ()-]{8,}\d|\b\d{1,5}\s+[A-Za-z]+\s+(?:Street|St|Avenue|Ave|Road|Rd)\b|\b(?:name|имя)\s*[:=])", re.I)
 _LOW = re.compile(r"(?<!\d)(?:\d[ -]?){12,}\d(?!\d)")
@@ -29,7 +30,9 @@ _INSTRUCTION = re.compile(
     r")",
     re.I | re.S,
 )
-_BASE64 = re.compile(r"(?<![A-Za-z0-9+/=])([A-Za-z0-9+/]{24,}={0,2})(?![A-Za-z0-9+/=])")
+_BASE64 = re.compile(
+    r"(?<![A-Za-z0-9+/_=-])([A-Za-z0-9+/_-]{24,}={0,2})(?![A-Za-z0-9+/_=-])"
+)
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
 _TASK = re.compile(r"(?:\b(?:task|run|ticket|candidate)[-_ ][A-Za-z0-9]{3,}\b|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b)", re.I)
 _PATH = re.compile(r"(?:[A-Za-z]:\\[^\s]+|(?<!\S)/(?:[^\s/]+/)+[^\s]+)")
@@ -57,12 +60,25 @@ def _unicode_unescape(value: str) -> str:
         return value
 
 
-def _variants(text: str) -> tuple[str, ...]:
-    """Return a small bounded set of decoded views without retaining raw data."""
+def _decode_base64(token: str) -> str | None:
+    if len(token) % 4 == 1:
+        return None
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        return base64.b64decode(
+            padded, altchars=b"-_", validate=True
+        ).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _variants(text: str) -> tuple[tuple[str, ...], bool]:
+    """Return bounded decoded views and whether a decode budget was exceeded."""
     pending = [text]
     admitted: list[str] = []
     seen: set[str] = set()
-    while pending and len(admitted) < 12:
+    budget_exceeded = False
+    while pending and len(admitted) < MAX_DECODED_VIEWS:
         value = pending.pop(0)
         normalized = _normalized(value)
         if normalized in seen:
@@ -76,19 +92,24 @@ def _variants(text: str) -> tuple[str, ...]:
         ):
             if decoded != normalized and len(decoded) <= MAX_SOURCE_CHARS:
                 pending.append(decoded)
-        for token in _BASE64.findall(normalized)[:2]:
-            try:
-                decoded = base64.b64decode(token, validate=True).decode("utf-8")
-            except (ValueError, UnicodeDecodeError):
-                continue
-            if len(decoded) <= MAX_SOURCE_CHARS:
+        tokens = _BASE64.findall(normalized)
+        if len(tokens) > MAX_ENCODED_TOKENS_PER_VIEW:
+            budget_exceeded = True
+            break
+        for token in tokens:
+            decoded = _decode_base64(token)
+            if decoded is not None and len(decoded) <= MAX_SOURCE_CHARS:
                 pending.append(decoded)
-    return tuple(admitted)
+    if pending:
+        budget_exceeded = True
+    return tuple(admitted), budget_exceeded
 
 
 def _reason(text:str)->str|None:
     if len(text)>MAX_SOURCE_CHARS:return "source-too-long"
-    for value in _variants(text):
+    variants, budget_exceeded = _variants(text)
+    if budget_exceeded:return "encoded-content-budget"
+    for value in variants:
         if _SECRET.search(value):return "secret"
         if _PII.search(value) and not _UUID.search(value):return "pii"
         if _LOW.search(value) and not _UUID.search(value):return "low-entropy-identifier"

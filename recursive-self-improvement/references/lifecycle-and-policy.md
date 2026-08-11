@@ -42,6 +42,9 @@ Otherwise invoke an explicit `late-review` with final artifacts. Report the
 warning that in-dialog-only signals were unavailable. Do not accept a finding
 draft in late-review mode. If RSI is not invoked, return the explicit `no-rsi`
 legacy result with `rsiGuarantees=false`; do not claim an RSI fallback.
+For public `local-review`, an omitted `hookMode` resolves to `late-review` and
+therefore requires non-empty `finalArtifacts`; coordinated mode must be named
+explicitly and cannot be inferred from coordinated-only fields.
 
 ## Effective CLI
 
@@ -84,9 +87,19 @@ Successful envelopes contain these stable common fields:
 }
 ```
 
-Error envelopes use `schemaVersion`, `command`, `runId`, `status="failed"`, and
-one closed `error` object with `code`, safe `message`, `retryable`, and
-non-sensitive `details`. The effective process codes are:
+The CLI has two closed, command-specific error variants for compatibility:
+
+- lifecycle result envelopes, including a public proposal blocked before state
+  creation, retain the common success fields and a plural `errors` array of
+  closed objects with `code`, safe `message`, `retryable`, and non-sensitive
+  `details`; they do not contain singular `error`;
+- command-processing failures and `promote-candidate` continuation blocks use
+  `schemaVersion`, `command`, `runId`, `status`, and one singular closed `error`
+  object with those four fields; they do not contain plural `errors`.
+
+Consumers must select the variant by field presence, reject an envelope that
+contains both, and apply the same process-code table to either variant. The
+effective process codes are:
 
 | Code | Effective meaning |
 |---:|---|

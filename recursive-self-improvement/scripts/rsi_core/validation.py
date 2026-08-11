@@ -139,7 +139,7 @@ def validate_local_review(value: object) -> dict[str, object]:
     if set(value) - allowed:
         raise LifecycleError("local-review input contains unknown fields")
     mode = value.get("mode", "observe")
-    hook_mode = value.get("hookMode", "coordinated")
+    hook_mode = value.get("hookMode", "late-review")
     if type(mode) is not str or mode not in MODES:
         raise LifecycleError("local-review mode is invalid")
     if type(hook_mode) is not str or hook_mode not in HOOK_MODES:

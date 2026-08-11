@@ -11,7 +11,8 @@ a production target.
 
 The implementation commit is
 `5c9dddd1f273877d36f958121b838a3388c253fd`, with the required subject
-`docs: complete RSI v1 release package`.
+`docs: complete RSI v1 release package`. A later independent-review correction
+commit contains the additional evidence and fixes documented below.
 
 ## Baseline
 
@@ -23,8 +24,8 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest -q --tb=
 ```
 
 The worktree already contained an untracked root `uv.lock`. It was treated as a
-user-owned baseline artifact, was not edited, and is not included in either
-Task 11 commit.
+user-owned baseline artifact, was not edited, and is not included in any Task
+11 implementation change.
 
 ## Changed files
 
@@ -46,19 +47,24 @@ Task 11 commit.
 - `recursive-self-improvement/references/defragmentation.md`: exact audit-only
   defaults, valid digest example, routing, and no-repair recovery guidance.
 - `recursive-self-improvement/tests/test_adversarial.py`: 250 injections, 100
-  canaries, 10,000 real path/FSM cases, and real provider fault/replay drills.
+  canaries, three held-out encoded-decoy injections, 10,000 generated real
+  path/FSM cases, and real provider fault/replay drills.
 - `recursive-self-improvement/tests/test_forward.py`: seven independent forward
   scenarios plus examples, links, metadata, permissions, defaults, CLI codes,
-  index, contract graph, provider ledger, and package-validator checks.
+  omitted-hook and real envelope variants, index, contract graph, provider
+  ledger, and package-validator checks.
 - `recursive-self-improvement/scripts/rsi_core/sanitize.py`: bounded NFKC/control
   normalization and repeated URL, HTML-entity, Unicode-escape, and Base64 views,
   plus the multilingual instruction set required by the RED corpus.
+- `recursive-self-improvement/scripts/rsi_core/validation.py`: public omitted
+  `hookMode` now resolves to the shipped `late-review` default.
 - `recursive-self-improvement/scripts/rsi.py`: typed result-envelope-to-process
   status mapping for normative V1 exit codes.
 - This report records the evidence and implementation commit.
 
-The last two production files were outside the brief's documentation/test list.
-Each was changed only after a focused RED demonstrated a release blocker.
+The production files were outside the brief's documentation/test list. Each
+behavior change was made only after a focused RED demonstrated a release
+blocker.
 
 ## Strict TDD evidence
 
@@ -100,6 +106,72 @@ Policy, validation/attestation, approval, conflict, ambiguous, and quarantined
 result envelopes returned process success or the generic provider code instead
 of the V1 code table. This justified the small `rsi.py` production change.
 
+## Independent-review TDD follow-up
+
+### RED 4: decoy-prefix encoded injection
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'decoy_prefix'
+3 failed, 121 deselected in 0.46s
+```
+
+Padded standard, unpadded standard, and unpadded Base64url instruction payloads
+were each admitted when placed after two valid Base64 decoys. The root cause was
+the production `[:2]` token slice plus a standard/padded-only token grammar.
+The fix scans every token up to eight per decoded view, supports standard and
+URL-safe alphabets with canonical padding repair, and rejects the evidence with
+`encoded-content-budget` if the eight-token or twelve-view bound is exceeded.
+Each held-out case now also drives the real coordinator/store boundary and
+proves the raw/encoded payload is absent from durable state.
+
+### RED 5: omitted public hook mode
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_forward.py -q --tb=short -k 'omitted_hook_mode'
+1 failed, 19 deselected in 0.55s
+```
+
+The real CLI returned exit 2 and `coordinated local-review does not accept
+finalArtifacts`; `validate_local_review` defaulted to coordinated despite the
+shipped/default documentation. It now defaults omitted `hookMode` to
+`late-review`. The end-to-end test proves the response warning, persisted
+`run.started.payload.hookMode`, and unchanged target byte/mode tree.
+
+### Characterization before test-quality/documentation corrections
+
+The diverse property corpus required no production fix. Its first construction
+run exposed a missing test-helper import (`NameError`) and is not a behavioral
+RED. After that test-only correction, the generated independent-oracle corpus
+passed against production:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'path_and_fsm_property_corpus'
+1 passed, 123 deselected in 1.30s
+```
+
+The envelope mismatch was documentation, not dispatch behavior. A real CLI
+characterization (no monkeypatched result dictionaries) confirmed the existing
+closed variants before the reference was corrected:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_forward.py -q --tb=short -k 'real_cli_blocked_envelopes'
+1 passed, 19 deselected in 0.67s
+```
+
+Public proposal lifecycle results use plural `errors`; command-processing and
+promotion-continuation blocks use singular `error`. The reference now documents
+field-presence selection, mutual exclusion, and one shared exit-code table.
+
+### Follow-up GREEN
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py recursive-self-improvement/tests/test_forward.py -q --tb=short -k 'decoy_prefix or omitted_hook_mode or path_and_fsm_property_corpus or real_cli_blocked_envelopes'
+6 passed, 138 deselected in 1.81s
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_sanitize.py recursive-self-improvement/tests/test_candidates.py recursive-self-improvement/tests/test_observe.py recursive-self-improvement/tests/test_local_lifecycle.py recursive-self-improvement/tests/test_adversarial.py recursive-self-improvement/tests/test_forward.py -q --tb=short
+278 passed in 14.48s
+```
+
 ## Focused GREEN evidence
 
 ```text
@@ -135,12 +207,20 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursiv
 - Injection fixtures: exactly 250 unique cases: 10 instruction-bearing phrases
   in English, Spanish, French, German, Portuguese, Russian, Ukrainian, Chinese,
   Japanese, and Arabic, each under 25 independent plain/nested/encoded/control
-  transformations.
+  transformations. Three additional held-out decoy-prefix cases cover padded,
+  unpadded, and Base64url third-token bypasses without inflating the 250 count.
 - Secret/PII canaries: exactly 100 unique values: 20 each of Stripe-like,
   GitHub-like, AWS-like, email, and telephone forms. All 100 were rejected and
   byte scans of the real temporary `EventStore` found zero persisted canaries.
-- Property cases: exactly 10,000 real calls: 5,000 path-admission cases through
-  `_path_reason` and 5,000 valid/terminal-order cases through `fold_run`.
+- Property cases: exactly 10,000 real calls with independent literal oracles:
+  5,000 generated path-admission cases through `_path_reason` across 22
+  filesystem/path classes, and 5,000 generated histories through `fold_run`
+  across 33 run-kind, predecessor, terminal, incident, apply, verification, and
+  resolution graph classes. Paths include multilingual/decomposed Unicode,
+  normalization and casefold collisions, internal and escaping symlinks,
+  FIFO/special entries,
+  missing/directory/symlink/FIFO markers, broad roots, marker targets, reserved
+  roots, absolute paths, and traversal.
 - Release provider fault cases: 14 pytest cases and 15 injected cuts. Six
   capture cases cover lookup, pre-append, partial write, file fsync, parent
   fsync, and post-commit/pre-return; seven snapshot cases cover prepare append,
@@ -187,8 +267,9 @@ helper:
    mutation;
 7. defragmentation detects copy and digest drift without repair.
 
-The final `test_forward.py` result is included in the 139-test combined run
-above; its 18 tests all pass.
+The initial `test_forward.py` result is included in the 139-test combined run
+above; the follow-up real-dispatch/default tests are included in the fresh full
+suite below.
 
 ## Full suite and release validators
 
@@ -205,6 +286,13 @@ required project environment wrapper:
 ```text
 PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests -q
 1453 passed in 62.91s (0:01:02)
+```
+
+Fresh authoritative GREEN after every independent-review correction:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest -q --tb=short
+1458 passed in 62.45s (0:01:02)
 ```
 
 The release validators and static package checks produced:
@@ -246,9 +334,10 @@ live provider validator was read-only; all provider mutation drills set
 - No Task 11 code introduces a target-writing call. The only new production
   behavior is bounded evidence classification and result exit selection. Target
   mutation remains confined to the already-gated `promote-candidate` path.
-- Normalization is bounded to at most 12 decoded views, two Base64 tokens per
-  view, and the existing source-length cap. Rejected raw data is neither hashed
-  nor persisted.
+- Normalization is bounded to at most 12 decoded views, eight Base64 tokens per
+  view, and the existing source-length cap. Every token within the bound is
+  decoded; exceeding either bound rejects rather than silently skipping later
+  tokens. Rejected raw data is neither hashed nor persisted.
 - The injection fixtures generate their phrases/transforms independently; the
   forward cases assert durable events, objects, reports, process status, and
   byte/mode trees rather than source strings.
@@ -256,6 +345,8 @@ live provider validator was read-only; all provider mutation drills set
   validation, integrity, and policy types are distinguished; an otherwise
   blocked result remains provider/unavailable code 6, and failed unknowns are
   code 2.
+- Real dispatch proves the two compatible blocked/error envelope variants and
+  the documentation now names them instead of claiming one universal shape.
 - Documentation does not overclaim deployment readiness. It identifies this as
   a Stage 0/1 package, not an attested Stage 6 installation.
 - The pending queues inspected for the active TDD, verification, validator, and

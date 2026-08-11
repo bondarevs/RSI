@@ -76,7 +76,13 @@ Stage 6 deployment.
 Run at least 250 injection fixtures, 100 secret/PII canaries, and 10,000
 path/FSM property cases. Include nested Markdown, Unicode controls and
 compatibility forms, URL/Base64/escaped encodings, and multilingual instruction
-payloads. Inject real faults at every reachable durable boundary: event and
+payloads. Generate the path/FSM cases from independent literal oracles rather
+than repeating a small template set. The V1 release corpus includes 22 path
+structure classes (Unicode normalization/casefold, internal and escaping
+symlinks, special files, marker topology, broad roots, and traversal) and 33
+lifecycle graph classes varying run kind, predecessor, terminal, incident,
+apply, verification, and resolution structure. Inject real faults at every
+reachable durable boundary: event and
 sidecar append, provider commit/replay, validation reservation/result/post-image
 write, file and directory fsync, create-once publication, readback, verifier
 receipt/non-issuance, snapshot, defer, and resolve. For the live target exchange

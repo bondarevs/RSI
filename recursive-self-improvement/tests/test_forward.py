@@ -322,6 +322,58 @@ def test_forward_explicit_late_review_fixture_discloses_signal_loss_and_is_read_
     assert _tree(target) == before
 
 
+def test_public_local_review_omitted_hook_mode_uses_late_review_and_persists_warning(
+    tmp_path: Path,
+) -> None:
+    """Changing the public default back to coordinated loses the declared warning."""
+    target = _skill(tmp_path / "target", "mail", "mail.transport")
+    before = _tree(target)
+    body = {
+        "mode": "observe",
+        "taskClass": "code.change",
+        "activeSkills": [{"name": "mail", "versionHash": DIGEST_A}],
+        "taskFingerprint": DIGEST_B,
+        "artifactDigest": DIGEST_C,
+        "finalArtifacts": [
+            {"kind": "test", "summary": "The completed fixture passed."}
+        ],
+    }
+    request = tmp_path / "omitted-hook.json"
+    request.write_text(json.dumps(body), encoding="utf-8")
+    home = tmp_path / "state"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RSI_CLI),
+            "local-review",
+            "--home",
+            str(home),
+            "--target-root",
+            str(target),
+            "--run-id",
+            "forward-default-late",
+            "--idempotency-key",
+            "late-review",
+            "--input-file",
+            str(request),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    response = json.loads(completed.stdout)
+    assert response["warnings"] == [
+        "late-review: in-dialog-only signals were unavailable"
+    ]
+    events = EventStore.open_existing(home).read_events()
+    started = next(event for event in events if event.event_type == "run.started")
+    assert started.payload["hookMode"] == "late-review"
+    assert _tree(target) == before
+
+
 def test_forward_no_rsi_legacy_fixture_creates_no_state_and_claims_no_guarantees(
     tmp_path: Path,
 ) -> None:
@@ -511,6 +563,108 @@ def test_release_cli_result_statuses_use_normative_exit_codes(
 
     assert module.main(["preflight", "--json"]) == expected
     assert json.loads(capsys.readouterr().out) == result
+
+
+def _promotion_continuation_ids(plan_digest: str) -> tuple[str, str]:
+    run_payload = json.dumps(
+        {"domain": "rsi-promotion-continuation-v1", "planDigest": plan_digest},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    operation_payload = json.dumps(
+        {"domain": "rsi-promote-cli-v1", "planDigest": plan_digest},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return (
+        "run_promote_" + hashlib.sha256(run_payload).hexdigest(),
+        "promote_" + hashlib.sha256(operation_payload).hexdigest(),
+    )
+
+
+def test_real_cli_blocked_envelopes_use_closed_command_specific_error_variants(
+    tmp_path: Path,
+) -> None:
+    """Local lifecycle blocks are plural; promotion continuation blocks are singular."""
+    target = _skill(tmp_path / "target", "mail", "mail.transport")
+    proposal_request = tmp_path / "proposal.json"
+    proposal_request.write_text(
+        json.dumps(
+            {
+                "mode": "propose",
+                "hookMode": "coordinated",
+                "taskClass": "code.change",
+                "activeSkills": [{"name": "mail", "versionHash": DIGEST_A}],
+                "taskFingerprint": DIGEST_B,
+                "artifactDigest": DIGEST_C,
+                "signalsByTarget": {"mail@" + DIGEST_A: {}},
+                "evidence": [],
+                "findings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    proposed = subprocess.run(
+        [
+            sys.executable,
+            str(RSI_CLI),
+            "local-review",
+            "--home",
+            str(tmp_path / "proposal-state"),
+            "--target-root",
+            str(target),
+            "--run-id",
+            "release-proposal-block",
+            "--idempotency-key",
+            "proposal",
+            "--input-file",
+            str(proposal_request),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    proposal = json.loads(proposed.stdout)
+    assert proposed.returncode == 6
+    assert "error" not in proposal
+    assert [item["code"] for item in proposal["errors"]] == [
+        "trusted-verification-required"
+    ]
+
+    promotion_home = tmp_path / "promotion-state"
+    EventStore(promotion_home)
+    plan = "sha256:" + "b" * 64
+    run_id, operation_id = _promotion_continuation_ids(plan)
+    promoted = subprocess.run(
+        [
+            sys.executable,
+            str(RSI_CLI),
+            "promote-candidate",
+            "--home",
+            str(promotion_home),
+            "--candidate-id",
+            "release-candidate",
+            "--promotion-plan",
+            plan,
+            "--validation-attestation",
+            "sha256:" + "c" * 64,
+            "--expected-target-hash",
+            "sha256:" + "d" * 64,
+            "--run-id",
+            run_id,
+            "--idempotency-key",
+            operation_id,
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    promotion = json.loads(promoted.stdout)
+    assert promoted.returncode == 6
+    assert "errors" not in promotion
+    assert promotion["error"]["code"] == "promotion-plan-unavailable"
 
 
 def test_release_package_links_examples_metadata_permissions_and_validator() -> None:
