@@ -4,6 +4,12 @@ Task 9 evaluates later verified work against a promotion without changing the
 target.  The public commands are `monitor`, `global-review`, and `report`.
 Every result and durable report declares `mutationPerformed=false`.
 
+Read [lifecycle and policy](lifecycle-and-policy.md) before incident recovery
+and [rollout and testing](rollout-and-testing.md) before using a metric as a
+stage gate. The effective default monitoring window is 10 unique later tasks.
+Global reporting defaults to disabled and requires at least 3 independent task
+fingerprints and 2 target skills when enabled.
+
 ## Metric record
 
 A V1 record is a closed JSON object with:
@@ -70,3 +76,13 @@ real, disjoint target roots; the verification suite snapshots their complete
 byte/mode trees before and after the command. `report` opens existing state
 read-only and accepts only the exact
 content-addressed global JSON reference.
+
+## Operational limits
+
+Do not treat an open monitoring window, a missing metric, a confounded change,
+or an `insufficient-evidence` global conclusion as support for promotion or
+rollback. Do not compare different baseline keys. A quarantine outcome latches
+the target and requires the recovery runbook; it is never a successful report
+merely because report publication itself completed. Monitoring and reporting
+do not restore, edit a target, resolve a provider candidate, or clear an
+incident latch.

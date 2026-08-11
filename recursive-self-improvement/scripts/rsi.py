@@ -465,6 +465,39 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _result_exit_code(result: Mapping[str, object]) -> int:
+    status = result.get("status")
+    if status in {"ambiguous", "quarantined"}:
+        return 9
+    codes: list[str] = []
+    error = result.get("error")
+    if isinstance(error, Mapping) and isinstance(error.get("code"), str):
+        codes.append(str(error["code"]))
+    errors = result.get("errors")
+    if isinstance(errors, Sequence) and not isinstance(errors, (str, bytes)):
+        for item in errors:
+            if isinstance(item, Mapping) and isinstance(item.get("code"), str):
+                codes.append(str(item["code"]))
+    normalized = " ".join(codes).lower()
+    if any(token in normalized for token in ("operation-id-conflict", "concurrency", "hash-conflict")):
+        return 8
+    if "approval" in normalized:
+        return 7
+    if any(token in normalized for token in ("provider", "dependency", "promotion-plan-unavailable")):
+        return 6
+    if any(token in normalized for token in ("validation", "attestation")):
+        return 5
+    if any(token in normalized for token in ("store", "ledger", "integrity")):
+        return 4
+    if any(token in normalized for token in ("policy", "allowlist")):
+        return 3
+    if status == "blocked":
+        return 6
+    if status == "failed":
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     command = argv if argv is not None else sys.argv[1:]
@@ -479,7 +512,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = _dispatch(arguments)
         print(json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
-        return 6 if result.get("status") == "blocked" else 0
+        return _result_exit_code(result)
     except LifecycleError as error:
         print(json.dumps(_error(arguments.command, getattr(arguments, "run_id", None), "invalid-arguments", str(error)), sort_keys=True, separators=(",", ":")))
         return 2

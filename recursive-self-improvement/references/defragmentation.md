@@ -7,6 +7,12 @@ corresponding lifecycle events. They never edit, move, unlink, replace, or
 chmod a canonical or runtime skill artifact. There is deliberately no apply
 entrypoint in `rsi_core.defragment`.
 
+Read [architecture](architecture.md) before admitting canonical/runtime roots,
+[schemas](schemas.md) before changing durable objects, and
+[rollout and testing](rollout-and-testing.md) before treating an audit as a
+release gate. The effective package default is enabled `audit-only` with a
+complete migration ledger and explicit approval required.
+
 ## Registration audit
 
 `defrag-audit` accepts one closed `SkillRegistrationManifest` and a bounded set
@@ -20,13 +26,13 @@ The registration manifest has exactly:
 {
   "schemaVersion": 1,
   "skillName": "example-role",
-  "canonical": {"path": "/absolute/canonical/example-role", "digest": "sha256:..."},
+  "canonical": {"path": "/absolute/canonical/example-role", "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"},
   "runtimeRegistrations": [
     {
       "path": "/absolute/runtime/example-role",
       "type": "symlink",
       "expectedRealpath": "/absolute/canonical/example-role",
-      "expectedDigest": "sha256:..."
+      "expectedDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }
   ]
 }
@@ -97,3 +103,9 @@ converge; conflicts and missing or tampered sidecars fail closed.
 Before and after every public command, hosts should compare complete
 byte/mode/symlink-text snapshots of every admitted target root. Every command
 result and durable defrag event declares `mutationPerformed=false`.
+
+If canonical bytes, runtime registration, content-addressed objects, rule
+coverage, owner mapping, golden-test digest, or rollback-plan digest drifts,
+stop and preserve the audit/plan evidence. Do not repair a registration or
+apply a ledger from RSI. Re-audit clean current roots under a new run and send
+any approved structural execution to a separate explicit out-of-band workflow.

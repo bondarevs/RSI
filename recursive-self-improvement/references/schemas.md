@@ -1,5 +1,12 @@
 # RSI event schemas (V1)
 
+Read this reference before changing any durable RSI object. Read
+[architecture](architecture.md) for authority boundaries and
+[lifecycle and policy](lifecycle-and-policy.md) for CLI envelopes, exit codes,
+and recovery. All JSON examples in this package are strict UTF-8 JSON; durable
+objects additionally require sorted compact encoding, rejection of duplicate
+keys/non-finite numbers, and one final LF where stated.
+
 `rsi_core.events.EventRegistry` is the executable, closed registry for the V1
 event envelope. Every event has exactly these top-level fields:
 
@@ -67,6 +74,10 @@ and an `ambiguous|quarantined` close; no other terminal status can hide it.
 
 The source ledger is append-only JSONL. SQLite is a rebuildable query cache;
 `doctor --salvage-report` is read-only and never repairs the JSONL source.
+
+Rebuild the index only after the complete event and referenced-object graph
+validates. A byte-identical rebuilt index is release evidence, not authority to
+repair or ignore a malformed source ledger.
 
 ## Task 9 monitoring reports
 
@@ -172,3 +183,14 @@ Every globally selected draft has exactly one admission and every allowed
 admission exactly one capture terminal. No eligible drafts produce a read-only
 `no-op` without a provider call. Task 6 never fabricates `promotion.gated` and
 never mutates the target tree.
+
+## Release compatibility limits
+
+The standalone package exposes no `validate-candidate` CLI command even though
+the isolated experiment and immutable plan APIs are present. The public
+`promote-candidate` path consumes only already-existing attested plan objects and
+fails closed when they are unavailable. Ordinary hosts also lack the attested
+non-bypassable namespace lease needed for target exchange. Keep the shipped
+allowlist empty and mode effectively `observe` until those deployment
+prerequisites are independently attested. See
+[rollout and testing](rollout-and-testing.md) for the manifest and release gates.
