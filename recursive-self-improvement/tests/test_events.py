@@ -321,7 +321,8 @@ def test_fold_run_exercises_every_alternate_legal_predecessor_edge() -> None:
 )
 def test_mode_and_run_kind_forbid_apply_transactions(mode: str, run_kind: str) -> None:
     """Only promote-safe local runs may create an apply transaction."""
-    with pytest.raises(EventValidationError, match="apply transaction"):
+    expected = "global" if run_kind == "global" else "apply transaction"
+    with pytest.raises(EventValidationError, match=expected):
         fold_run(promotion_prefix(mode=mode, run_kind=run_kind))
 
 

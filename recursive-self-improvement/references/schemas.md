@@ -68,6 +68,16 @@ and an `ambiguous|quarantined` close; no other terminal status can hide it.
 The source ledger is append-only JSONL. SQLite is a rebuildable query cache;
 `doctor --salvage-report` is read-only and never repairs the JSONL source.
 
+## Task 9 monitoring reports
+
+Content-addressed Task 9 objects live under `reports/`. A monitoring JSON object
+is referenced by `monitoring.recorded`; a global JSON object is referenced by
+`global.report.generated` and has a deterministic Markdown derivative. The
+event is appended only after its JSON bytes are durable. Replay validates the
+same path and exact bytes. Global runs accept exactly one report terminal plus
+an optional incident and close; local lifecycle and mutation events are
+forbidden. See `metrics.md` for the closed metric record and aggregation rules.
+
 ## Task 6 durable proposal objects
 
 Canonical proposal mode reconstructs candidates only from write-once objects

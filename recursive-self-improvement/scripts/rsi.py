@@ -6,18 +6,28 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import sys
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 
-from rsi_core.hooks import LifecycleError, RunCoordinator, append_event, canonical_digest
-from rsi_core.observe import Observer
 from rsi_core.evaluate import Evaluator
-from rsi_core.storage import EventStore, StoreIntegrityError
-from rsi_core.evolver_adapter import EvolverAdapter, OperationIdConflict, ProviderProtocolError
+from rsi_core.evolver_adapter import (
+    EvolverAdapter,
+    OperationIdConflict,
+    ProviderProtocolError,
+)
+from rsi_core.hooks import (
+    LifecycleError,
+    RunCoordinator,
+    append_event,
+    canonical_digest,
+)
+from rsi_core.observe import Observer
 from rsi_core.proposal import ProposalService
+from rsi_core.report import GlobalReportService, MonitoringService, read_report
+from rsi_core.storage import EventStore, StoreIntegrityError
 from rsi_core.validation import (
     validate_cli_identifiers,
     validate_evaluate,
@@ -260,6 +270,73 @@ def _dispatch(arguments: argparse.Namespace) -> dict[str, object]:
     body = _require_write_arguments(arguments)
     run_id, operation = validate_cli_identifiers(arguments.run_id, arguments.idempotency_key)
     arguments.run_id, arguments.idempotency_key = run_id, operation
+    if arguments.command == "monitor":
+        expected = {
+            "promotionRef",
+            "evaluationRef",
+            "baseline",
+            "variant",
+            "causalAttribution",
+            "expectedControlPlaneVersion",
+        }
+        if set(body) != expected:
+            raise LifecycleError("monitor input has invalid fields")
+        if not isinstance(body["baseline"], Mapping) or not isinstance(body["variant"], Mapping):
+            raise LifecycleError("monitor records must be JSON objects")
+        _require_disjoint_home(arguments.home, arguments.target_root)
+        result = MonitoringService(EventStore(arguments.home)).record(
+            run_id=run_id,
+            logical_operation_id=operation,
+            promotion_ref=str(body["promotionRef"]),
+            evaluation_ref=str(body["evaluationRef"]),
+            baseline=body["baseline"],
+            variant=body["variant"],
+            causal_attribution=str(body["causalAttribution"]),
+            expected_control_plane_version=str(body["expectedControlPlaneVersion"]),
+        )
+        return _envelope(
+            "monitor",
+            run_id,
+            status="completed" if result["outcome"] != "quarantined" else "quarantined",
+            event_ids=list(result["eventIds"]),
+            mutation=False,
+            **{key: value for key, value in result.items() if key not in {"schemaVersion", "runId", "eventIds", "mutationPerformed"}},
+        )
+    if arguments.command == "global-review":
+        expected = {
+            "sourceEvaluationRefs",
+            "records",
+            "minimumFingerprints",
+            "minimumSkills",
+        }
+        if set(body) != expected or not isinstance(body["sourceEvaluationRefs"], list) or not isinstance(body["records"], list):
+            raise LifecycleError("global-review input has invalid fields")
+        if any(type(value) is not str for value in body["sourceEvaluationRefs"]) or any(
+            not isinstance(value, Mapping) for value in body["records"]
+        ):
+            raise LifecycleError("global-review sources are invalid")
+        _require_disjoint_home(arguments.home, arguments.target_root)
+        result = GlobalReportService(EventStore(arguments.home)).generate(
+            run_id=run_id,
+            logical_operation_id=operation,
+            source_evaluation_refs=body["sourceEvaluationRefs"],
+            records=body["records"],
+            minimum_fingerprints=body["minimumFingerprints"],  # type: ignore[arg-type]
+            minimum_skills=body["minimumSkills"],  # type: ignore[arg-type]
+        )
+        return _envelope(
+            "global-review",
+            run_id,
+            status="completed" if result["conclusion"] == "supported" else str(result["conclusion"]),
+            event_ids=list(result["eventIds"]),
+            mutation=False,
+            **{key: value for key, value in result.items() if key not in {"schemaVersion", "runId", "eventIds", "mutationPerformed"}},
+        )
+    if arguments.command == "report":
+        if set(body) != {"reportRef"}:
+            raise LifecycleError("report input has invalid fields")
+        report = read_report(EventStore.open_existing(arguments.home), body["reportRef"])
+        return _envelope("report", run_id, status="completed", mutation=False, report=report)
     if arguments.command == "local-review":
         admitted = validate_local_review(body)
         _require_disjoint_home(arguments.home, arguments.target_root, arguments.provider_learning_home)
@@ -287,7 +364,16 @@ def _dispatch(arguments: argparse.Namespace) -> dict[str, object]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     commands = parser.add_subparsers(dest="command")
-    for name in ("preflight", "note-finding", "observe", "evaluate", "local-review"):
+    for name in (
+        "preflight",
+        "note-finding",
+        "observe",
+        "evaluate",
+        "local-review",
+        "monitor",
+        "global-review",
+        "report",
+    ):
         command = commands.add_parser(name, add_help=False)
         command.add_argument("--home", default=str(Path.home() / ".codex" / "rsi"))
         command.add_argument("--json", action="store_true")
@@ -295,8 +381,9 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--run-id")
             command.add_argument("--idempotency-key")
             command.add_argument("--input-file")
-        if name == "local-review":
+        if name in {"local-review", "monitor", "global-review"}:
             command.add_argument("--target-root", action="append", required=True)
+        if name == "local-review":
             command.add_argument("--provider-root")
             command.add_argument("--provider-learning-home")
             command.add_argument("--contract-root", action="append")

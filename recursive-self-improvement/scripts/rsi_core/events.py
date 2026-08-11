@@ -742,6 +742,7 @@ def fold_run(
     captured_admissions: set[str] = set()
     mode = "off"
     run_kind = "local"
+    global_report_generated = False
 
     for index, event in enumerate(sequence):
         registry.validate(event)
@@ -757,6 +758,14 @@ def fold_run(
             mode = event.payload["mode"]
             run_kind = event.payload.get("runKind", "local")
         else:
+            if run_kind == "global" and event.event_type not in {
+                "global.report.generated",
+                "incident.latched",
+                "run.closed",
+            }:
+                raise EventValidationError(
+                    "global runs accept only global reporting and terminal events"
+                )
             if event.causation_id is None:
                 raise EventValidationError(f"{event.event_type} requires causation")
             predecessor = by_id.get(event.causation_id or "")
@@ -764,6 +773,8 @@ def fold_run(
                 raise EventValidationError("missing causation event")
             if not _allows_predecessor(event, predecessor):
                 raise EventValidationError(f"illegal predecessor {predecessor.event_type} for {event.event_type}")
+            if event.event_type == "global.report.generated" and run_kind != "global":
+                raise EventValidationError("global report event requires a global run")
             if event.event_type == "candidate.captured" and predecessor.payload["decision"] != "allow":
                 raise EventValidationError("candidate.captured requires admission allow")
             if event.event_type == "candidate.captured":
@@ -819,9 +830,15 @@ def fold_run(
                 resolved_applies.add(apply_started.payload["transactionId"])
         elif event.event_type == "payload.expired":
             expired[event.payload["sourceEventId"]] = event.payload["originalDigest"]
+        elif event.event_type == "global.report.generated":
+            if global_report_generated:
+                raise EventValidationError("duplicate global report terminal")
+            global_report_generated = True
         elif event.event_type == "incident.latched":
             incident_latched = True
         elif event.event_type == "run.closed":
+            if run_kind == "global" and not global_report_generated:
+                raise EventValidationError("global run close requires one global report")
             closing_status = event.payload["status"]
             unresolved = open_applies | (completed_applies - resolved_applies)
             if closing_status not in {"ambiguous", "quarantined"} and unresolved:

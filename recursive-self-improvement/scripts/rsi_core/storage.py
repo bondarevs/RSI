@@ -971,6 +971,29 @@ class EventStore:
                 raise StoreIntegrityError("invalid lifecycle: monitoring promotionRef is not a promotion resolution")
             if not (verification.payload["liveReadback"] and verification.payload["tests"] == "passed" and verification.payload["attestationMatch"]):
                 raise StoreIntegrityError("invalid lifecycle: monitoring promotionRef is not verified")
+        for position, event in enumerate(sequence):
+            if event.event_type != "global.report.generated":
+                continue
+            references = list(event.payload["sourceEvaluationRefs"])
+            if not references or len(references) != len(set(references)):
+                raise StoreIntegrityError(
+                    "invalid lifecycle: global source evaluations must be nonempty and unique"
+                )
+            start_position = run_started_at[event.run_id]
+            for reference in references:
+                source_id = reference.removeprefix("event:")
+                source = by_id.get(source_id)
+                if (
+                    not reference.startswith("event:")
+                    or source is None
+                    or source.event_type != "evaluation.completed"
+                    or source.run_id == event.run_id
+                    or sequence.index(source) >= start_position
+                    or sequence.index(source) >= position
+                ):
+                    raise StoreIntegrityError(
+                        "invalid lifecycle: global source evaluation reference is invalid"
+                    )
 
     def read_events(
         self, *, historical_batch: object | None = None,
@@ -1248,7 +1271,9 @@ class EventStore:
             if replay is not None:
                 if replay.payload_ref is None:
                     raise StoreIntegrityError("sidecar replay lacks its durable payload reference")
-                replay_relative = Path("objects") / replay.payload_ref
+                replay_relative = Path(replay.payload_ref)
+                if replay_relative.parts[0] != "reports":
+                    replay_relative = Path("objects") / replay_relative
                 try:
                     if self._read_regular(str(replay_relative)) != data:
                         raise StoreIntegrityError("sidecar replay conflicts with durable payload")
@@ -1403,6 +1428,8 @@ class EventStore:
         run = [prior for prior in recorded if prior.run_id == event.run_id]
         started = next((prior for prior in run if prior.event_type == "run.started"), None)
         if started is None or not started.payload["activeSkills"] or not all("@sha256:" in str(value) for value in started.payload["activeSkills"]):
+            return
+        if started.payload.get("runKind", "local") != "local":
             return
         observed = [prior for prior in run if prior.event_type == "task.observed"]
         evaluations = [prior for prior in run if prior.event_type == "evaluation.completed"]
