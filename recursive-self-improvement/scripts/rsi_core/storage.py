@@ -40,7 +40,14 @@ STATE_DIRECTORIES = (
 )
 CRITICAL_FILES = ("events.jsonl", "locks/events.lock", "index.sqlite")
 SIDECAR_DIRECTORIES = frozenset(
-    {"objects/findings", "objects/evaluations", "objects/observations", "objects/proposals", "reports"}
+    {
+        "objects/findings",
+        "objects/evaluations",
+        "objects/observations",
+        "objects/proposals",
+        "reports",
+        "defragmentation",
+    }
 )
 TASK8_TOPOLOGY_DIRECTORIES = (
     "objects/transactions",
@@ -1272,7 +1279,7 @@ class EventStore:
                 if replay.payload_ref is None:
                     raise StoreIntegrityError("sidecar replay lacks its durable payload reference")
                 replay_relative = Path(replay.payload_ref)
-                if replay_relative.parts[0] != "reports":
+                if replay_relative.parts[0] not in {"reports", "defragmentation"}:
                     replay_relative = Path("objects") / replay_relative
                 try:
                     if self._read_regular(str(replay_relative)) != data:

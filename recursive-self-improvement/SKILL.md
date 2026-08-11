@@ -33,10 +33,11 @@ recovery references before their respective operations when those references
 are present in the package.
 
 Use `observe`, `evaluate`, `validate-candidate`, `promote-candidate`, `monitor`,
-`global-review`, and `report` only through the declared CLI and provider
+`global-review`, `report`, `defrag-audit`, `defrag-plan`, and
+`defrag-validate` only through the declared CLI and provider
 capability. `monitor` may emit an exact approval-required rollback proposal but
-never restores. `global-review` and `report` are read-only and have no target
-mutation path. Canonical Stage 2 proposal mode is available only when the
+never restores. `global-review`, `report`, and every `defrag-*` command are
+read-only and have no target mutation path. Canonical Stage 2 proposal mode is available only when the
 pinned provider-v2 identity validates and returns a bound route receipt. Resume
 it with explicit provider root, temporary or approved provider learning home,
 repeatable target roots, and repeatable contract roots; never accept a public

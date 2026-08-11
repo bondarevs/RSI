@@ -12,6 +12,7 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from rsi_core.defragment import DefragmentationService
 from rsi_core.evaluate import Evaluator
 from rsi_core.evolver_adapter import (
     EvolverAdapter,
@@ -337,6 +338,64 @@ def _dispatch(arguments: argparse.Namespace) -> dict[str, object]:
             raise LifecycleError("report input has invalid fields")
         report = read_report(EventStore.open_existing(arguments.home), body["reportRef"])
         return _envelope("report", run_id, status="completed", mutation=False, report=report)
+    if arguments.command == "defrag-audit":
+        if set(body) != {"registrationManifest", "ruleDeclarations"}:
+            raise LifecycleError("defrag-audit input has invalid fields")
+        if not isinstance(body["registrationManifest"], Mapping) or not isinstance(body["ruleDeclarations"], list):
+            raise LifecycleError("defrag-audit input is invalid")
+        _require_disjoint_home(arguments.home, arguments.target_root)
+        result = DefragmentationService(EventStore(arguments.home), arguments.target_root).audit(
+            run_id=run_id,
+            logical_operation_id=operation,
+            registration_manifest=body["registrationManifest"],
+            rule_declarations=body["ruleDeclarations"],
+        )
+        return _envelope(
+            "defrag-audit",
+            run_id,
+            status="completed-with-findings" if result["findings"] else "completed",
+            event_ids=list(result["eventIds"]),
+            mutation=False,
+            **{key: value for key, value in result.items() if key not in {"schemaVersion", "runId", "eventIds", "mutationPerformed"}},
+        )
+    if arguments.command == "defrag-plan":
+        expected = {"auditRef", "ledgerEntries", "ownerTargetHashes", "goldenTests"}
+        if set(body) != expected or not isinstance(body["ledgerEntries"], list) or not isinstance(body["ownerTargetHashes"], Mapping) or not isinstance(body["goldenTests"], list):
+            raise LifecycleError("defrag-plan input has invalid fields")
+        _require_disjoint_home(arguments.home, arguments.target_root)
+        result = DefragmentationService(EventStore(arguments.home), arguments.target_root).plan(
+            run_id=run_id,
+            logical_operation_id=operation,
+            audit_ref=str(body["auditRef"]),
+            ledger_entries=body["ledgerEntries"],
+            owner_target_hashes=body["ownerTargetHashes"],
+            golden_tests=body["goldenTests"],
+        )
+        return _envelope(
+            "defrag-plan",
+            run_id,
+            status="validated-proposal",
+            event_ids=list(result["eventIds"]),
+            mutation=False,
+            **{key: value for key, value in result.items() if key not in {"schemaVersion", "runId", "eventIds", "mutationPerformed"}},
+        )
+    if arguments.command == "defrag-validate":
+        if set(body) != {"planRef"}:
+            raise LifecycleError("defrag-validate input has invalid fields")
+        _require_disjoint_home(arguments.home, arguments.target_root)
+        result = DefragmentationService(EventStore(arguments.home), arguments.target_root).validate(
+            run_id=run_id,
+            logical_operation_id=operation,
+            plan_ref=str(body["planRef"]),
+        )
+        return _envelope(
+            "defrag-validate",
+            run_id,
+            status=str(result["status"]),
+            event_ids=list(result["eventIds"]),
+            mutation=False,
+            **{key: value for key, value in result.items() if key not in {"schemaVersion", "runId", "eventIds", "mutationPerformed", "status"}},
+        )
     if arguments.command == "local-review":
         admitted = validate_local_review(body)
         _require_disjoint_home(arguments.home, arguments.target_root, arguments.provider_learning_home)
@@ -373,6 +432,9 @@ def _parser() -> argparse.ArgumentParser:
         "monitor",
         "global-review",
         "report",
+        "defrag-audit",
+        "defrag-plan",
+        "defrag-validate",
     ):
         command = commands.add_parser(name, add_help=False)
         command.add_argument("--home", default=str(Path.home() / ".codex" / "rsi"))
@@ -381,7 +443,7 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--run-id")
             command.add_argument("--idempotency-key")
             command.add_argument("--input-file")
-        if name in {"local-review", "monitor", "global-review"}:
+        if name in {"local-review", "monitor", "global-review", "defrag-audit", "defrag-plan", "defrag-validate"}:
             command.add_argument("--target-root", action="append", required=True)
         if name == "local-review":
             command.add_argument("--provider-root")

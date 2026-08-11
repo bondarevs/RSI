@@ -78,6 +78,26 @@ same path and exact bytes. Global runs accept exactly one report terminal plus
 an optional incident and close; local lifecycle and mutation events are
 forbidden. See `metrics.md` for the closed metric record and aggregation rules.
 
+## Task 10 defragmentation objects
+
+Content-addressed Task 10 objects live directly under `defragmentation/` and
+are referenced marker-last by their corresponding defrag event. Audit objects
+bind the registration manifest, independently observed canonical/runtime
+state, stable `RuleInventory`, findings, and `mutationPerformed=false`. Plan
+objects bind the audit raw digest, inventory, exactly-covering
+`MigrationLedger`, owner-scoped change sets, golden-test plan, coordinated
+rollback plan, and umbrella `MigrationPlan`. Validation objects bind the plan
+digest and the three passed structural checks. Every object is canonical
+compact JSON followed by one LF, is at most 4 MiB, and has its raw SHA-256 in
+the filename.
+
+The only clean defrag fold is `run.started(runKind=defrag)` ->
+`defrag.audit.completed` -> `defrag.plan.built` ->
+`defrag.plan.validated` -> `run.closed(completed)`. Each phase is unique. Apply
+and ordinary local/global events are rejected; clean close before validation
+is rejected. See `defragmentation.md` for inventory, ledger, ownership,
+duplicate, golden-test, rollback, and replay rules.
+
 ## Task 6 durable proposal objects
 
 Canonical proposal mode reconstructs candidates only from write-once objects

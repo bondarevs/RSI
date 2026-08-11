@@ -722,6 +722,14 @@ def fold_run(
     sequence = list(events)
     if not sequence:
         raise EventValidationError("a run must contain events")
+    if (
+        sequence[0].event_type == "run.started"
+        and sequence[0].payload.get("runKind", "local") in {"defrag", "retention"}
+        and any(event.event_type == "apply.started" for event in sequence[1:])
+    ):
+        raise EventValidationError(
+            "apply transaction is forbidden for this run mode or kind"
+        )
     if sequence[0].run_id.startswith("run_promote_"):
         return _fold_task8_run(sequence, external_predecessors)
     if external_predecessors:
@@ -743,6 +751,9 @@ def fold_run(
     mode = "off"
     run_kind = "local"
     global_report_generated = False
+    defrag_audited = False
+    defrag_planned = False
+    defrag_validated = False
 
     for index, event in enumerate(sequence):
         registry.validate(event)
@@ -766,6 +777,20 @@ def fold_run(
                 raise EventValidationError(
                     "global runs accept only global reporting and terminal events"
                 )
+            if run_kind == "defrag" and event.event_type not in {
+                "defrag.audit.completed",
+                "defrag.plan.built",
+                "defrag.plan.validated",
+                "incident.latched",
+                "run.closed",
+            }:
+                if event.event_type == "apply.started":
+                    raise EventValidationError(
+                        "apply transaction is forbidden for this run mode or kind"
+                    )
+                raise EventValidationError(
+                    "defrag runs accept only defragmentation and terminal events"
+                )
             if event.causation_id is None:
                 raise EventValidationError(f"{event.event_type} requires causation")
             predecessor = by_id.get(event.causation_id or "")
@@ -775,6 +800,8 @@ def fold_run(
                 raise EventValidationError(f"illegal predecessor {predecessor.event_type} for {event.event_type}")
             if event.event_type == "global.report.generated" and run_kind != "global":
                 raise EventValidationError("global report event requires a global run")
+            if event.event_type.startswith("defrag.") and run_kind != "defrag":
+                raise EventValidationError("defragmentation event requires a defrag run")
             if event.event_type == "candidate.captured" and predecessor.payload["decision"] != "allow":
                 raise EventValidationError("candidate.captured requires admission allow")
             if event.event_type == "candidate.captured":
@@ -834,12 +861,32 @@ def fold_run(
             if global_report_generated:
                 raise EventValidationError("duplicate global report terminal")
             global_report_generated = True
+        elif event.event_type == "defrag.audit.completed":
+            if defrag_audited or defrag_planned or defrag_validated:
+                raise EventValidationError("duplicate or out-of-order defragmentation audit")
+            defrag_audited = True
+        elif event.event_type == "defrag.plan.built":
+            if not defrag_audited or defrag_planned or defrag_validated:
+                raise EventValidationError("duplicate or out-of-order defragmentation plan")
+            defrag_planned = True
+        elif event.event_type == "defrag.plan.validated":
+            if not defrag_planned or defrag_validated:
+                raise EventValidationError("duplicate or out-of-order defragmentation validation")
+            defrag_validated = True
         elif event.event_type == "incident.latched":
             incident_latched = True
         elif event.event_type == "run.closed":
             if run_kind == "global" and not global_report_generated:
                 raise EventValidationError("global run close requires one global report")
+            if run_kind == "defrag" and not defrag_validated:
+                raise EventValidationError("defrag run close requires a validated plan")
             closing_status = event.payload["status"]
+            if run_kind == "defrag" and closing_status not in {
+                "completed",
+                "ambiguous",
+                "quarantined",
+            }:
+                raise EventValidationError("defrag run close status is invalid")
             unresolved = open_applies | (completed_applies - resolved_applies)
             if closing_status not in {"ambiguous", "quarantined"} and unresolved:
                 raise EventValidationError("unresolved apply blocks clean close")
