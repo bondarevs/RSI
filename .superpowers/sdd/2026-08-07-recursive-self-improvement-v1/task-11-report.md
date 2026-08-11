@@ -48,17 +48,25 @@ user-owned baseline artifact, was not edited, and is not included in any Task
   defaults, valid digest example, routing, and no-repair recovery guidance.
 - `recursive-self-improvement/tests/test_adversarial.py`: 250 injections, 100
   canaries, three held-out encoded-decoy injections, three short-Base64 and four
-  combining/default-ignorable durable regressions, benign encoding/Unicode
-  controls, 10,000 generated real path/FSM cases, and real provider
-  fault/replay drills.
+  combining/default-ignorable durable regressions, four shorter canonical
+  Base64 and four letter/reserved/control durable regressions, benign
+  encoding/Unicode controls, 10,000 generated real path/FSM cases, and real
+  provider fault/replay drills.
+- `recursive-self-improvement/tests/test_experiment.py`: exact held-marker,
+  unsafe/deadline, bounded-membership, and real concurrent initializer/read-only
+  open regressions.
 - `recursive-self-improvement/tests/test_forward.py`: seven independent forward
   scenarios plus examples, links, metadata, permissions, defaults, CLI codes,
   omitted-hook and real envelope variants, index, contract graph, provider
   ledger, and package-validator checks.
 - `recursive-self-improvement/scripts/rsi_core/sanitize.py`: bounded ordinary
   NFKC and classifier-only mark-stripped views plus repeated URL, HTML-entity,
-  Unicode-escape, and short/standard/URL-safe Base64 views, and the multilingual
-  instruction set required by the RED corpus.
+  Unicode-escape, versioned Unicode 16.0.0 default-ignorable/control handling,
+  and canonical seven-character-or-longer standard/URL-safe Base64 views, and
+  the multilingual instruction set required by the RED corpus.
+- `recursive-self-improvement/scripts/rsi_core/experiment.py`: bounded,
+  read-only recognition/retry for the exact no-replace ownership-marker
+  publication transient; every other topology remains fail-closed.
 - `recursive-self-improvement/scripts/rsi_core/validation.py`: public omitted
   `hookMode` now resolves to the shipped `late-review` default.
 - `recursive-self-improvement/scripts/rsi.py`: typed result-envelope-to-process
@@ -234,6 +242,93 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursiv
 293 passed in 14.70s
 ```
 
+## Third independent-review TDD follow-up
+
+### RED 8: seven-to-eleven-character canonical Base64
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'shorter_canonical_base64_instruction'
+4 failed, 150 deselected in 0.52s
+```
+
+The 12-character candidate floor admitted and durably persisted padded and
+unpadded `run x`, unpadded `edit x`, and Base64url `run ¾`. The production
+decoder now scans candidates with at least seven alphabet characters and
+admits only an exact canonical padded or unpadded re-encoding. Successfully
+decoded UTF-8 tokens still share the existing eight-token/twelve-view limits.
+
+### RED 9: Unicode 16 default-ignorables and controls
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'default_ignorable_letter_reserved_and_control_instruction'
+4 failed, 150 deselected in 0.56s
+```
+
+U+115F (`Lo`), U+FFA0 (`Lo`, normalized to U+1160), U+FFF0 (`Cn`), and NUL
+(`Cc`) split `ignore`, bypassed classification, and persisted through the real
+coordinator/store path. The deterministic predicate now uses the complete
+Unicode 16.0.0 `Default_Ignorable_Code_Point` ranges. The classifier-only view
+removes those code points, combining marks, and `Cc` controls while the ordinary
+view and accepted evidence remain unchanged.
+
+Seven benign controls passed before either sanitizer change:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'shorter_base64_lookalike_and_benign or benign_default_ignorable_and_control'
+7 passed, 147 deselected in 0.41s
+```
+
+They cover ordinary seven/eight-character alphabetic words, canonical benign
+standard and URL-safe encodings, exactly eight short decoded tokens, Hangul
+fillers, a reserved default-ignorable, and benign NUL-bearing evidence. Every
+accepted summary remains exactly equal to its input.
+
+### RED 10: read-only experiment-store initializer race
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_experiment.py -q --tb=short -k 'exact_held_marker_publication_link or retries_only_exact_marker_publication_transient or concurrent_read_only_open_converges'
+3 failed, 172 deselected in 2.66s
+```
+
+`open_existing()` made one marker read and treated the initializer's real
+no-replace hard-link window (`st_nlink == 2`) as permanent unsafe topology. The
+new read-only path retries only when root membership is exact and the marker
+and one `.tmp-<32-lower-hex>` name are the same byte-exact, mode-`0600`,
+two-link regular inode. It makes at most 100 attempts separated by 5 ms. Other
+hard-link names fail immediately, a stuck exact topology fails at the deadline,
+and the reader never repairs state.
+
+Self-review then exposed an unbounded root-membership materialization in that
+recognizer. Its focused test failed before the bounded scan was implemented:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_experiment.py -q --tb=short -k 'marker_publication_transient_membership_scan_is_bounded'
+1 failed, 175 deselected in 0.68s
+```
+
+The recognizer now consumes at most six entries: the five exact transient
+members are admissible for retry, and a sixth proves non-exact membership and
+fails closed without scanning further.
+
+### Third follow-up GREEN
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'shorter_canonical_base64_instruction or shorter_base64_lookalike_and_benign'
+7 passed, 147 deselected in 0.43s
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'default_ignorable_letter_reserved_and_control_instruction or benign_default_ignorable_and_control'
+8 passed, 146 deselected in 0.45s
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_experiment.py -q --tb=short -k 'exact_held_marker_publication_link or retries_only_exact_marker_publication_transient or marker_publication_transient_membership_scan_is_bounded or concurrent_read_only_open_converges'
+4 passed, 172 deselected in 0.52s
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_sanitize.py recursive-self-improvement/tests/test_adversarial.py -q --tb=short
+176 passed in 4.69s
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_experiment.py -q --tb=short
+176 passed in 26.47s
+```
+
 ## Focused GREEN evidence
 
 ```text
@@ -272,9 +367,11 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursiv
   transformations. Three additional held-out decoy-prefix cases cover padded,
   unpadded, and Base64url third-token bypasses; three short-Base64 cases cover
   padded, unpadded, and URL-safe forms below 24 characters; and four durable
-  cases cover U+034F, U+180B, U+FE00, and U+E0100 keyword splitting. These ten
-  held-out cases do not inflate the 250 count. Eight benign encoding and
-  Unicode cases constrain false positives and output preservation.
+  cases cover U+034F, U+180B, U+FE00, and U+E0100 keyword splitting. Four more
+  canonical Base64 cases cover seven-to-eleven-character padded, unpadded, and
+  URL-safe forms; four more durable cases cover U+115F, U+FFA0, U+FFF0, and NUL.
+  These 18 held-out cases do not inflate the 250 count. Fifteen benign encoding
+  and Unicode/control cases constrain false positives and output preservation.
 - Secret/PII canaries: exactly 100 unique values: 20 each of Stripe-like,
   GitHub-like, AWS-like, email, and telephone forms. All 100 were rejected and
   byte scans of the real temporary `EventStore` found zero persisted canaries.
@@ -294,6 +391,10 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursiv
   fsync, and post-commit/pre-return; one case separately loses defer and resolve
   results after their commits. Every exact retry converged to one operation and
   the real provider validator passed in the controlled temporary home.
+- Experiment initializer/read-only concurrency: four pytest cases cover a held
+  exact two-link window, an immediate noninitializer hard-link rejection, an
+  exact stuck-window deadline, a six-entry membership-consumption ceiling, and
+  a real concurrent `_write_once` marker publication/read-only open.
 - The pre-existing durable-store/recovery drill was rerun explicitly:
 
 ```text
@@ -312,7 +413,7 @@ Together these exercise every reachable V1 durable boundary: event/sidecar
 write and marker, short/partial write, file and directory fsync, create-once
 publication, atomic index replace, readback, validation reservation/result and
 post-image, verifier receipt/non-issuance, provider capture/snapshot/defer/
-resolve commit/replay, and conservative recovery. The live target exchange is
+  resolve commit/replay, and conservative recovery. The live target exchange is
 not reachable on an ordinary host by design: the production backend fails
 before mutation without an attested non-bypassable coordinator.
 
@@ -369,11 +470,22 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest -q --tb=
 1473 passed in 62.75s (0:01:02)
 ```
 
+Two sequential authoritative GREEN runs after the canonical-short-Base64,
+Unicode 16.0.0, and experiment-store initializer-race corrections:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest -q --tb=short
+1492 passed in 71.50s (0:01:11)
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest -q --tb=short
+1492 passed in 70.70s (0:01:10)
+```
+
 The release validators and static package checks produced:
 
 ```text
 python3 /Users/macbook/.codex/skills/skill-evolver/scripts/learning_log.py validate
-OK: 1294 events
+OK: 1295 events
 
 python3 /Users/macbook/.codex/skills/.system/skill-creator/scripts/quick_validate.py recursive-self-improvement
 Skill is valid!
@@ -394,12 +506,20 @@ python3 /Users/macbook/.codex/skills/skill-evolver/scripts/learning_log.py list 
 []
 ```
 
-The final package/link validator test was rerun after the follow-up report and
+The package/link validator test was rerun after the second follow-up report and
 release-matrix changes:
 
 ```text
 PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_forward.py -q --tb=short -k 'release_package_links'
 1 passed, 19 deselected in 0.43s
+```
+
+It was rerun again after the third follow-up report, architecture, and release
+matrix changes:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_forward.py -q --tb=short -k 'release_package_links'
+1 passed, 19 deselected in 0.45s
 ```
 
 The package test parses every fenced JSON example, parses the closed
@@ -418,12 +538,17 @@ live provider validator was read-only; all provider mutation drills set
   mutation remains confined to the already-gated `promote-candidate` path.
 - Normalization is bounded to at most 12 decoded views, eight successfully
   decoded UTF-8 Base64 tokens per view, and the existing source-length cap. All
-  token candidates in the bounded source are examined until the ninth decoded
-  token fails closed. An ordinary normalized view preserves accented and
-  multilingual evidence, while a separate classifier-only view removes format
-  and combining obfuscators. Exceeding either bound rejects rather than
-  silently skipping later tokens. Rejected raw data is neither hashed nor
-  persisted.
+  seven-character-or-longer token candidates in the bounded source are checked
+  for canonical padded/unpadded standard or URL-safe encoding until the ninth
+  decoded token fails closed. An ordinary normalized view preserves accented,
+  control-bearing, and multilingual evidence, while a separate classifier-only
+  view removes Unicode 16.0.0 default-ignorables, combining marks, and `Cc`
+  controls. Exceeding either bound rejects rather than silently skipping later
+  tokens. Rejected raw data is neither hashed nor persisted.
+- Read-only experiment-store open retries only the exact byte/mode/inode/root
+  membership of the initializer's marker hard-link window, at most 100 times
+  with 5 ms intervals. The membership probe reads at most six names. All other
+  unsafe topologies fail immediately; deadline expiry fails without mutation.
 - The injection fixtures generate their phrases/transforms independently; the
   forward cases assert durable events, objects, reports, process status, and
   byte/mode trees rather than source strings.
@@ -456,6 +581,9 @@ live provider validator was read-only; all provider mutation drills set
   lifecycle guarantees.
 - Global RSI and defragmentation remain report/proposal-only; monitoring never
   restores automatically.
+- The classifier's `Default_Ignorable_Code_Point` table is intentionally frozen
+  to Unicode 16.0.0; a future Unicode upgrade requires an explicit reviewed
+  table and corpus update rather than changing behavior with the interpreter.
 - Index rebuild and `doctor --salvage-report` do not repair corrupt authority.
 - The root `uv.lock` remains an intentional pre-existing untracked artifact.
 

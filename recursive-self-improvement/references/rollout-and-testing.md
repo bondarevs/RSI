@@ -76,12 +76,16 @@ Stage 6 deployment.
 Run at least 250 injection fixtures, 100 secret/PII canaries, and 10,000
 path/FSM property cases. Include nested Markdown, Unicode controls and
 compatibility forms, classifier-only views with default-ignorable and combining
-marks removed, short padded/unpadded standard Base64, short Base64url,
-URL/escaped encodings, and multilingual instruction payloads. Retain the
-ordinary normalized view so accepted accented, presentation-form, and
-multilingual evidence is not rewritten. Base64 admission examines all bounded
-candidates, counts at most eight successfully decoded UTF-8 tokens per view,
-and fails closed above that limit or the twelve-view limit. Generate the
+marks removed, seven-character-or-longer canonical padded/unpadded standard
+Base64, canonical Base64url, URL/escaped encodings, and multilingual instruction
+payloads. The default-ignorable predicate is frozen to
+[Unicode 16.0.0 `Default_Ignorable_Code_Point`](https://www.unicode.org/Public/16.0.0/ucd/DerivedCoreProperties.txt);
+the classifier-only view also removes combining marks and `Cc` controls. Retain
+the ordinary normalized view so accepted accented, presentation-form,
+control-bearing, and multilingual evidence is not rewritten. Base64 admission
+examines all bounded candidates, admits only canonical encodings, counts at
+most eight successfully decoded UTF-8 tokens per view, and fails closed above
+that limit or the twelve-view limit. Generate the
 path/FSM cases from independent literal oracles rather than repeating a small
 template set. The V1 release corpus includes 22 path
 structure classes (Unicode normalization/casefold, internal and escaping
@@ -94,6 +98,14 @@ write, file and directory fsync, create-once publication, readback, verifier
 receipt/non-issuance, snapshot, defer, and resolve. For the live target exchange
 boundary, require an attested privileged coordinator; the ordinary host backend
 must fail before mutation.
+
+The experiment-store initializer publishes its ownership marker without
+replacement by linking one `.tmp-<32-lower-hex>` file and then unlinking that
+temporary name. A read-only concurrent open may retry only when the complete
+root membership, marker bytes, regular-file mode, size, inode, and exactly-two
+links prove that precise transient. It makes at most 100 attempts separated by
+5 ms. Missing markers, other names/topologies, changed bytes, or an unresolved
+transient fail closed; a read-only open never repairs or removes an entry.
 
 Forward-test these independent fixtures without disclosing the expected result:
 

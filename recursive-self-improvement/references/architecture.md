@@ -90,3 +90,11 @@ Keep regular state files owner-only and state directories mode `0700`. Never
 store raw rejected evidence, credentials, PII, external symlink targets,
 generated caches, or target snapshots outside the provider-owned snapshot
 protocol.
+
+The isolated experiment artifact store publishes its ownership marker with a
+same-directory no-replace hard link after all fixed directories exist. A
+read-only opener recognizes only the exact marker plus one
+`.tmp-<32-lower-hex>` alias of the same two-link, mode-`0600`, byte-exact inode;
+it retries that initializer window for at most 100 attempts at 5 ms intervals.
+All other marker/topology errors fail immediately, and an exact transient still
+present at the deadline fails without repair.

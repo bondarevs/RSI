@@ -31,11 +31,32 @@ _INSTRUCTION = re.compile(
     re.I | re.S,
 )
 _BASE64 = re.compile(
-    r"(?<![A-Za-z0-9+/_=-])([A-Za-z0-9+/_-]{12,}={0,2})(?![A-Za-z0-9+/_=-])"
+    r"(?<![A-Za-z0-9+/_=-])([A-Za-z0-9+/_-]{7,}={0,2})(?![A-Za-z0-9+/_=-])"
 )
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
 _TASK = re.compile(r"(?:\b(?:task|run|ticket|candidate)[-_ ][A-Za-z0-9]{3,}\b|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b)", re.I)
 _PATH = re.compile(r"(?:[A-Za-z]:\\[^\s]+|(?<!\S)/(?:[^\s/]+/)+[^\s]+)")
+_DEFAULT_IGNORABLE_UNICODE_VERSION = "16.0.0"
+# Unicode 16.0.0 DerivedCoreProperties.txt, Default_Ignorable_Code_Point.
+_DEFAULT_IGNORABLE_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 @dataclass(frozen=True)
 class SanitizationResult:
     accepted: tuple[dict[str,str],...]; diagnostics: tuple[dict[str,object],...]; rejected_count:int; truncated_count:int
@@ -45,14 +66,27 @@ def _normalized(value: str) -> str:
     return unicodedata.normalize("NFKC", value)
 
 
+def _is_default_ignorable(character: str) -> bool:
+    code_point = ord(character)
+    return any(
+        first <= code_point <= last
+        for first, last in _DEFAULT_IGNORABLE_RANGES
+    )
+
+
 def _classifier_view(value: str) -> str:
     decomposed = unicodedata.normalize("NFD", value)
-    stripped = "".join(
-        character
-        for character in decomposed
-        if unicodedata.category(character) != "Cf"
-        and not unicodedata.category(character).startswith("M")
-    )
+    kept: list[str] = []
+    for character in decomposed:
+        category = unicodedata.category(character)
+        if (
+            _is_default_ignorable(character)
+            or category == "Cc"
+            or category.startswith("M")
+        ):
+            continue
+        kept.append(character)
+    stripped = "".join(kept)
     return unicodedata.normalize("NFC", stripped)
 
 
@@ -69,12 +103,24 @@ def _unicode_unescape(value: str) -> str:
 def _decode_base64(token: str) -> str | None:
     if len(token) % 4 == 1:
         return None
+    if ({"+", "/"} & set(token)) and ({"-", "_"} & set(token)):
+        return None
     padded = token + "=" * (-len(token) % 4)
     try:
-        return base64.b64decode(
-            padded, altchars=b"-_", validate=True
-        ).decode("utf-8")
+        decoded = base64.b64decode(padded, altchars=b"-_", validate=True)
     except (ValueError, UnicodeDecodeError):
+        return None
+    encoder = (
+        base64.urlsafe_b64encode
+        if "-" in token or "_" in token
+        else base64.b64encode
+    )
+    canonical = encoder(decoded).decode("ascii")
+    if token not in {canonical, canonical.rstrip("=")}:
+        return None
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
         return None
 
 

@@ -4169,6 +4169,160 @@ def test_store_owner_marker_is_published_after_complete_internal_topology(
     assert bundles[0].plan.plan_id == bundles[1].plan.plan_id
 
 
+def test_read_only_open_waits_for_exact_held_marker_publication_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing the exact marker-publication retry makes this open fail transiently."""
+    experiment = _experiment()
+    home = tmp_path / "held-marker-home"
+    experiment.ExperimentArtifactStore(home)
+    temporary = home / (".tmp-" + "a" * 32)
+    os.link(home / experiment._STORE_MARKER, temporary)
+    assert (home / experiment._STORE_MARKER).stat().st_nlink == 2
+
+    retry_sleep_entered = threading.Event()
+    release_retry = threading.Event()
+
+    def hold_retry_sleep(_seconds: float) -> None:
+        retry_sleep_entered.set()
+        assert release_retry.wait(5)
+
+    monkeypatch.setattr(experiment.time, "sleep", hold_retry_sleep)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        reader_future = pool.submit(
+            experiment.ExperimentArtifactStore.open_existing, home
+        )
+        assert retry_sleep_entered.wait(1)
+        temporary.unlink()
+        expected = _tree(home)
+        release_retry.set()
+        reader = reader_future.result(timeout=5)
+
+    assert reader.home == home
+    assert _tree(home) == expected
+
+
+def test_read_only_open_retries_only_exact_marker_publication_transient_and_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A noninitializer link fails immediately; a stuck exact link fails boundedly."""
+    experiment = _experiment()
+    attacker_home = tmp_path / "attacker-link-home"
+    experiment.ExperimentArtifactStore(attacker_home)
+    os.link(
+        attacker_home / experiment._STORE_MARKER,
+        attacker_home / "attacker-selected-link",
+    )
+    sleeps = 0
+
+    def count_sleep(_seconds: float) -> None:
+        nonlocal sleeps
+        sleeps += 1
+
+    monkeypatch.setattr(experiment.time, "sleep", count_sleep)
+    attacker_before = _tree(attacker_home)
+    with pytest.raises(experiment.ExperimentStoreError, match="topology|store|owned"):
+        experiment.ExperimentArtifactStore.open_existing(attacker_home)
+    assert sleeps == 0
+    assert _tree(attacker_home) == attacker_before
+
+    stuck_home = tmp_path / "stuck-initializer-home"
+    experiment.ExperimentArtifactStore(stuck_home)
+    os.link(
+        stuck_home / experiment._STORE_MARKER,
+        stuck_home / (".tmp-" + "b" * 32),
+    )
+    stuck_before = _tree(stuck_home)
+    with pytest.raises(experiment.ExperimentStoreError, match="topology|store|owned"):
+        experiment.ExperimentArtifactStore.open_existing(stuck_home)
+    assert 1 <= sleeps <= 100
+    assert _tree(stuck_home) == stuck_before
+
+
+def test_read_only_marker_publication_transient_membership_scan_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Removing the six-entry stop lets hostile root membership drive the scan."""
+    experiment = _experiment()
+    home = tmp_path / "bounded-membership-home"
+    experiment.ExperimentArtifactStore(home)
+    os.link(
+        home / experiment._STORE_MARKER,
+        home / (".tmp-" + "c" * 32),
+    )
+    for index in range(20):
+        (home / f"unexpected-{index:02d}").write_bytes(b"x")
+
+    real_scandir = os.scandir
+
+    class SixEntryScandir:
+        def __init__(self, directory: int) -> None:
+            self._iterator = real_scandir(directory)
+            self._count = 0
+
+        def __enter__(self):
+            self._iterator.__enter__()
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._iterator.__exit__(*exc)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._count >= 6:
+                raise AssertionError("marker transient scan exceeded six entries")
+            self._count += 1
+            return next(self._iterator)
+
+    monkeypatch.setattr(experiment.os, "scandir", SixEntryScandir)
+    with pytest.raises(experiment.ExperimentStoreError, match="topology|store|owned"):
+        experiment.ExperimentArtifactStore.open_existing(home)
+
+
+def test_concurrent_read_only_open_converges_during_real_marker_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real no-replace initializer's two-link window is read-only retryable."""
+    experiment = _experiment()
+    home = tmp_path / "concurrent-read-home"
+    real_link = os.link
+    real_sleep = time.sleep
+    marker_linked = threading.Event()
+    release_initializer = threading.Event()
+    retry_observed = threading.Event()
+
+    def hold_marker_link(src, dst, *args, **kwargs):
+        result = real_link(src, dst, *args, **kwargs)
+        if dst == experiment._STORE_MARKER:
+            marker_linked.set()
+            assert release_initializer.wait(5)
+        return result
+
+    def release_on_retry(seconds: float) -> None:
+        retry_observed.set()
+        release_initializer.set()
+        real_sleep(seconds)
+
+    monkeypatch.setattr(experiment.os, "link", hold_marker_link)
+    monkeypatch.setattr(experiment.time, "sleep", release_on_retry)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        initializer_future = pool.submit(experiment.ExperimentArtifactStore, home)
+        assert marker_linked.wait(5)
+        reader_future = pool.submit(
+            experiment.ExperimentArtifactStore.open_existing, home
+        )
+        observed = retry_observed.wait(1)
+        release_initializer.set()
+        initializer = initializer_future.result(timeout=5)
+        assert observed
+        reader = reader_future.result(timeout=5)
+
+    assert initializer.home == reader.home == home
+    assert set(path.name for path in home.glob(".tmp-*")) == set()
+
+
 def test_read_only_store_rejects_marker_only_crash_topology_without_repair(
     tmp_path: Path,
 ) -> None:

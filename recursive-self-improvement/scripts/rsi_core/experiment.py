@@ -138,6 +138,9 @@ _MAX_REQUEST_BYTES = 512 * 1024
 _MAX_BUNDLE_BYTES = 1024 * 1024
 _STORE_MARKER = ".rsi-experiment-store-v1"
 _STORE_MARKER_BYTES = b'{"domain":"rsi-experiment-store-v1","schemaVersion":1}'
+_STORE_MARKER_TEMP_RE = re.compile(r"\.tmp-[0-9a-f]{32}\Z")
+_STORE_INITIALIZER_ATTEMPTS = 100
+_STORE_INITIALIZER_RETRY_SECONDS = 0.005
 _STORE_REQUIRED_DIRECTORIES = (
     "locks",
     "locks/experiments",
@@ -4342,7 +4345,10 @@ class ExperimentArtifactStore:
         self._fault_injector = fault_injector
         self._read_only = _read_only
         if _read_only:
-            self._verify_owned_home(wait_for_initializer=False)
+            self._verify_owned_home(
+                wait_for_initializer=False,
+                wait_for_marker_publication=True,
+            )
             self._verify_required_topology()
             return
         self._initialize_owned_home()
@@ -4480,7 +4486,94 @@ class ExperimentArtifactStore:
         finally:
             os.close(home_descriptor)
 
-    def _verify_owned_home(self, *, wait_for_initializer: bool) -> None:
+    @staticmethod
+    def _is_marker_publication_transient(home_fd: int) -> bool:
+        """Recognize only `_write_once`'s exact marker/temp hard-link window."""
+
+        marker_fd: int | None = None
+        temporary_fd: int | None = None
+        try:
+            with os.scandir(home_fd) as entries:
+                names: list[str] = []
+                for entry in entries:
+                    names.append(entry.name)
+                    if len(names) > 5:
+                        return False
+            temporary_names = [
+                name for name in names if _STORE_MARKER_TEMP_RE.fullmatch(name)
+            ]
+            if (
+                len(temporary_names) != 1
+                or set(names)
+                != {
+                    _STORE_MARKER,
+                    temporary_names[0],
+                    "locks",
+                    "objects",
+                    "experiments",
+                }
+            ):
+                return False
+            temporary_name = temporary_names[0]
+            marker_named = os.stat(
+                _STORE_MARKER, dir_fd=home_fd, follow_symlinks=False
+            )
+            temporary_named = os.stat(
+                temporary_name, dir_fd=home_fd, follow_symlinks=False
+            )
+            marker_fd = os.open(
+                _STORE_MARKER,
+                os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=home_fd,
+            )
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=home_fd,
+            )
+            marker_opened = os.fstat(marker_fd)
+            temporary_opened = os.fstat(temporary_fd)
+            identities = {
+                (metadata.st_dev, metadata.st_ino)
+                for metadata in (
+                    marker_named,
+                    temporary_named,
+                    marker_opened,
+                    temporary_opened,
+                )
+            }
+            if (
+                len(identities) != 1
+                or any(
+                    not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_nlink != 2
+                    or metadata.st_size != len(_STORE_MARKER_BYTES)
+                    for metadata in (
+                        marker_named,
+                        temporary_named,
+                        marker_opened,
+                        temporary_opened,
+                    )
+                )
+            ):
+                return False
+            payload = os.read(marker_fd, len(_STORE_MARKER_BYTES) + 1)
+            return payload == _STORE_MARKER_BYTES
+        except (OSError, ExperimentStoreError):
+            return False
+        finally:
+            if marker_fd is not None:
+                os.close(marker_fd)
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+
+    def _verify_owned_home(
+        self,
+        *,
+        wait_for_initializer: bool,
+        wait_for_marker_publication: bool = False,
+    ) -> None:
         try:
             metadata = self.home.lstat()
         except FileNotFoundError:
@@ -4491,26 +4584,47 @@ class ExperimentArtifactStore:
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
             raise ExperimentStoreError("unsafe or unowned experiment store topology")
-        attempts = 100 if wait_for_initializer else 1
+        attempts = (
+            _STORE_INITIALIZER_ATTEMPTS
+            if wait_for_initializer or wait_for_marker_publication
+            else 1
+        )
         for attempt in range(attempts):
+            retryable = False
             home_fd = self._open_absolute(self.home, create=False)
             try:
                 try:
                     marker = self._read_named(home_fd, _STORE_MARKER)
                 except FileNotFoundError:
                     marker = None
-                except ExperimentStoreError:
-                    if not wait_for_initializer:
+                    retryable = wait_for_initializer
+                except ExperimentStoreError as error:
+                    if wait_for_initializer:
+                        marker = None
+                        retryable = True
+                    elif (
+                        wait_for_marker_publication
+                        and self._is_marker_publication_transient(home_fd)
+                    ):
+                        marker = None
+                        retryable = True
+                    elif wait_for_marker_publication:
+                        try:
+                            marker = self._read_named(home_fd, _STORE_MARKER)
+                        except (FileNotFoundError, ExperimentStoreError):
+                            raise error
+                    else:
                         raise
-                    marker = None
             finally:
                 os.close(home_fd)
             if marker is not None:
                 if marker != _STORE_MARKER_BYTES:
                     raise ExperimentStoreError("experiment store ownership marker is invalid")
                 return
+            if not retryable:
+                break
             if attempt + 1 < attempts:
-                time.sleep(0.005)
+                time.sleep(_STORE_INITIALIZER_RETRY_SECONDS)
         raise ExperimentStoreError("existing directory is not an owned experiment store")
 
     @staticmethod
