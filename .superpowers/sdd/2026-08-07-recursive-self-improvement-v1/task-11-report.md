@@ -11,8 +11,8 @@ a production target.
 
 The implementation commit is
 `5c9dddd1f273877d36f958121b838a3388c253fd`, with the required subject
-`docs: complete RSI v1 release package`. A later independent-review correction
-commit contains the additional evidence and fixes documented below.
+`docs: complete RSI v1 release package`. Later independent-review correction
+commits contain the additional evidence and fixes documented below.
 
 ## Baseline
 
@@ -47,15 +47,18 @@ user-owned baseline artifact, was not edited, and is not included in any Task
 - `recursive-self-improvement/references/defragmentation.md`: exact audit-only
   defaults, valid digest example, routing, and no-repair recovery guidance.
 - `recursive-self-improvement/tests/test_adversarial.py`: 250 injections, 100
-  canaries, three held-out encoded-decoy injections, 10,000 generated real
-  path/FSM cases, and real provider fault/replay drills.
+  canaries, three held-out encoded-decoy injections, three short-Base64 and four
+  combining/default-ignorable durable regressions, benign encoding/Unicode
+  controls, 10,000 generated real path/FSM cases, and real provider
+  fault/replay drills.
 - `recursive-self-improvement/tests/test_forward.py`: seven independent forward
   scenarios plus examples, links, metadata, permissions, defaults, CLI codes,
   omitted-hook and real envelope variants, index, contract graph, provider
   ledger, and package-validator checks.
-- `recursive-self-improvement/scripts/rsi_core/sanitize.py`: bounded NFKC/control
-  normalization and repeated URL, HTML-entity, Unicode-escape, and Base64 views,
-  plus the multilingual instruction set required by the RED corpus.
+- `recursive-self-improvement/scripts/rsi_core/sanitize.py`: bounded ordinary
+  NFKC and classifier-only mark-stripped views plus repeated URL, HTML-entity,
+  Unicode-escape, and short/standard/URL-safe Base64 views, and the multilingual
+  instruction set required by the RED corpus.
 - `recursive-self-improvement/scripts/rsi_core/validation.py`: public omitted
   `hookMode` now resolves to the shipped `late-review` default.
 - `recursive-self-improvement/scripts/rsi.py`: typed result-envelope-to-process
@@ -172,6 +175,65 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursiv
 278 passed in 14.48s
 ```
 
+## Second independent-review TDD follow-up
+
+### RED 6: short Base64 instruction payloads
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'short_base64_instruction'
+3 failed, 136 deselected in 0.53s
+```
+
+The existing 24-character token floor admitted the held-out padded standard,
+unpadded standard, and unpadded Base64url instructions. Each fixture first
+drove the real coordinator/store path, so the baseline accepted and durably
+persisted the bypass before the assertion failed. The minimum is now 12
+characters. Only successfully decoded UTF-8 tokens consume the existing
+eight-token budget, which avoids treating long Base64-alphabet English words as
+encoded content while still failing closed on a ninth decoded token.
+
+### RED 7: default-ignorable combining marks
+
+The first construction used an independent `edit AGENTS.md` trigger and passed
+four cases; it was corrected before the authoritative behavioral RED and is not
+counted as evidence. With that unrelated trigger removed:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'default_ignorable_combining_mark_instruction'
+4 failed, 135 deselected in 0.53s
+```
+
+U+034F, U+180B, U+FE00, and U+E0100 split `ignore`, bypassed classification,
+and were persisted through the real coordinator/store path. The sanitizer now
+retains its ordinary NFKC view and adds a classifier-only NFD view with format
+and combining marks removed. Both participate in the unchanged twelve-view
+limit; accepted output continues to derive from the original evidence.
+
+Benign controls passed before production changed:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'short_base64_lookalike_and_benign or benign_accented_multilingual'
+8 passed, 131 deselected in 0.41s
+```
+
+They cover long Base64-alphabet English words, exactly eight benign decoded
+tokens, benign short standard/Base64url payloads, composed and decomposed
+accents, Greek, Arabic, Japanese, Hindi, and benign variation selectors. The
+accepted summaries remain exactly equal to their original strings.
+
+### Second follow-up GREEN
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py -q --tb=short -k 'short_base64_instruction or default_ignorable_combining_mark_instruction or short_base64_lookalike_and_benign or benign_accented_multilingual'
+15 passed, 124 deselected in 0.48s
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_adversarial.py recursive-self-improvement/tests/test_sanitize.py -q --tb=short
+161 passed in 4.61s
+
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_sanitize.py recursive-self-improvement/tests/test_candidates.py recursive-self-improvement/tests/test_observe.py recursive-self-improvement/tests/test_local_lifecycle.py recursive-self-improvement/tests/test_adversarial.py recursive-self-improvement/tests/test_forward.py -q --tb=short
+293 passed in 14.70s
+```
+
 ## Focused GREEN evidence
 
 ```text
@@ -208,7 +270,11 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursiv
   in English, Spanish, French, German, Portuguese, Russian, Ukrainian, Chinese,
   Japanese, and Arabic, each under 25 independent plain/nested/encoded/control
   transformations. Three additional held-out decoy-prefix cases cover padded,
-  unpadded, and Base64url third-token bypasses without inflating the 250 count.
+  unpadded, and Base64url third-token bypasses; three short-Base64 cases cover
+  padded, unpadded, and URL-safe forms below 24 characters; and four durable
+  cases cover U+034F, U+180B, U+FE00, and U+E0100 keyword splitting. These ten
+  held-out cases do not inflate the 250 count. Eight benign encoding and
+  Unicode cases constrain false positives and output preservation.
 - Secret/PII canaries: exactly 100 unique values: 20 each of Stripe-like,
   GitHub-like, AWS-like, email, and telephone forms. All 100 were rejected and
   byte scans of the real temporary `EventStore` found zero persisted canaries.
@@ -295,11 +361,19 @@ PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest -q --tb=
 1458 passed in 62.45s (0:01:02)
 ```
 
+Fresh authoritative GREEN after the short-Base64 and Unicode-obfuscation
+corrections:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest -q --tb=short
+1473 passed in 62.75s (0:01:02)
+```
+
 The release validators and static package checks produced:
 
 ```text
 python3 /Users/macbook/.codex/skills/skill-evolver/scripts/learning_log.py validate
-OK: 1293 events
+OK: 1294 events
 
 python3 /Users/macbook/.codex/skills/.system/skill-creator/scripts/quick_validate.py recursive-self-improvement
 Skill is valid!
@@ -320,6 +394,14 @@ python3 /Users/macbook/.codex/skills/skill-evolver/scripts/learning_log.py list 
 []
 ```
 
+The final package/link validator test was rerun after the follow-up report and
+release-matrix changes:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 uv run --with pytest --with hypothesis pytest recursive-self-improvement/tests/test_forward.py -q --tb=short -k 'release_package_links'
+1 passed, 19 deselected in 0.43s
+```
+
 The package test parses every fenced JSON example, parses the closed
 `agents/openai.yaml` metadata shape, resolves every local Markdown link, rejects
 symlinks and group/world-writable files, proves the default mode is `observe`,
@@ -334,10 +416,14 @@ live provider validator was read-only; all provider mutation drills set
 - No Task 11 code introduces a target-writing call. The only new production
   behavior is bounded evidence classification and result exit selection. Target
   mutation remains confined to the already-gated `promote-candidate` path.
-- Normalization is bounded to at most 12 decoded views, eight Base64 tokens per
-  view, and the existing source-length cap. Every token within the bound is
-  decoded; exceeding either bound rejects rather than silently skipping later
-  tokens. Rejected raw data is neither hashed nor persisted.
+- Normalization is bounded to at most 12 decoded views, eight successfully
+  decoded UTF-8 Base64 tokens per view, and the existing source-length cap. All
+  token candidates in the bounded source are examined until the ninth decoded
+  token fails closed. An ordinary normalized view preserves accented and
+  multilingual evidence, while a separate classifier-only view removes format
+  and combining obfuscators. Exceeding either bound rejects rather than
+  silently skipping later tokens. Rejected raw data is neither hashed nor
+  persisted.
 - The injection fixtures generate their phrases/transforms independently; the
   forward cases assert durable events, objects, reports, process status, and
   byte/mode trees rather than source strings.

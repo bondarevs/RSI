@@ -75,9 +75,15 @@ Stage 6 deployment.
 
 Run at least 250 injection fixtures, 100 secret/PII canaries, and 10,000
 path/FSM property cases. Include nested Markdown, Unicode controls and
-compatibility forms, URL/Base64/escaped encodings, and multilingual instruction
-payloads. Generate the path/FSM cases from independent literal oracles rather
-than repeating a small template set. The V1 release corpus includes 22 path
+compatibility forms, classifier-only views with default-ignorable and combining
+marks removed, short padded/unpadded standard Base64, short Base64url,
+URL/escaped encodings, and multilingual instruction payloads. Retain the
+ordinary normalized view so accepted accented, presentation-form, and
+multilingual evidence is not rewritten. Base64 admission examines all bounded
+candidates, counts at most eight successfully decoded UTF-8 tokens per view,
+and fails closed above that limit or the twelve-view limit. Generate the
+path/FSM cases from independent literal oracles rather than repeating a small
+template set. The V1 release corpus includes 22 path
 structure classes (Unicode normalization/casefold, internal and escaping
 symlinks, special files, marker topology, broad roots, and traversal) and 33
 lifecycle graph classes varying run kind, predecessor, terminal, incident,

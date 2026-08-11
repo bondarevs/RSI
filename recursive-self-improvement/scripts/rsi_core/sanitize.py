@@ -31,7 +31,7 @@ _INSTRUCTION = re.compile(
     re.I | re.S,
 )
 _BASE64 = re.compile(
-    r"(?<![A-Za-z0-9+/_=-])([A-Za-z0-9+/_-]{24,}={0,2})(?![A-Za-z0-9+/_=-])"
+    r"(?<![A-Za-z0-9+/_=-])([A-Za-z0-9+/_-]{12,}={0,2})(?![A-Za-z0-9+/_=-])"
 )
 _UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
 _TASK = re.compile(r"(?:\b(?:task|run|ticket|candidate)[-_ ][A-Za-z0-9]{3,}\b|\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b)", re.I)
@@ -42,12 +42,18 @@ class SanitizationResult:
 
 
 def _normalized(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value)
-    return "".join(
+    return unicodedata.normalize("NFKC", value)
+
+
+def _classifier_view(value: str) -> str:
+    decomposed = unicodedata.normalize("NFD", value)
+    stripped = "".join(
         character
-        for character in normalized
+        for character in decomposed
         if unicodedata.category(character) != "Cf"
+        and not unicodedata.category(character).startswith("M")
     )
+    return unicodedata.normalize("NFC", stripped)
 
 
 def _unicode_unescape(value: str) -> str:
@@ -85,6 +91,9 @@ def _variants(text: str) -> tuple[tuple[str, ...], bool]:
             continue
         seen.add(normalized)
         admitted.append(normalized)
+        classifier_view = _classifier_view(normalized)
+        if classifier_view != normalized and len(classifier_view) <= MAX_SOURCE_CHARS:
+            pending.append(classifier_view)
         for decoded in (
             unquote(normalized),
             html.unescape(normalized),
@@ -92,14 +101,22 @@ def _variants(text: str) -> tuple[tuple[str, ...], bool]:
         ):
             if decoded != normalized and len(decoded) <= MAX_SOURCE_CHARS:
                 pending.append(decoded)
-        tokens = _BASE64.findall(normalized)
-        if len(tokens) > MAX_ENCODED_TOKENS_PER_VIEW:
-            budget_exceeded = True
-            break
-        for token in tokens:
+        decoded_tokens: list[str] = []
+        for token in _BASE64.findall(normalized):
             decoded = _decode_base64(token)
-            if decoded is not None and len(decoded) <= MAX_SOURCE_CHARS:
-                pending.append(decoded)
+            if decoded is None:
+                continue
+            decoded_tokens.append(decoded)
+            if len(decoded_tokens) > MAX_ENCODED_TOKENS_PER_VIEW:
+                budget_exceeded = True
+                break
+        if budget_exceeded:
+            break
+        pending.extend(
+            decoded
+            for decoded in decoded_tokens
+            if len(decoded) <= MAX_SOURCE_CHARS
+        )
     if pending:
         budget_exceeded = True
     return tuple(admitted), budget_exceeded
