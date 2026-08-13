@@ -87,9 +87,14 @@ closed schema contains:
 - installation timestamp;
 - deployment operation ID.
 
-The manifest is stored inside the installed release and in the deployment
-receipt directory. The installed copy is authoritative only when both copies
-match and a fresh descriptor-relative scan reproduces every entry and digest.
+The manifest is stored as `.rsi-deployment-manifest.json` inside the installed
+release and as `manifest.json` beside the deployment receipt. To keep the
+digest graph acyclic, the manifest file itself is excluded from `fileEntries`
+and both tree digests. The receipt separately binds the SHA-256 digest and byte
+length of the exact canonical manifest bytes. The installed copy is
+authoritative only when both manifest copies are byte-identical, the receipt
+binding matches them, and a fresh descriptor-relative scan reproduces every
+listed package entry and digest. No other unlisted installed member is legal.
 
 Deployment state lives under `~/.codex/rsi-deployments-v1`: `lock` is the
 single deployment lock; `receipts/<operation-id>.json` contains immutable
