@@ -1840,6 +1840,13 @@ def test_task8_adapter_recovers_exact_committed_snapshot_and_resolve_after_write
     provider_module = _load_temporary_provider_module(
         provider, learning, monkeypatch
     )
+    initial_clock_reads: list[None] = []
+
+    def before_authority_expiry() -> str:
+        initial_clock_reads.append(None)
+        return "2026-08-11T23:59:59Z"
+
+    monkeypatch.setattr(provider_module, "now", before_authority_expiry)
 
     class CommitThenTransportLossAdapter(EvolverAdapter):
         def _execute_verified(self, arguments: list[str]) -> ProviderProcessResult:
@@ -1872,6 +1879,8 @@ def test_task8_adapter_recovers_exact_committed_snapshot_and_resolve_after_write
         candidate_authority=bound,
         authority_expires_at="2026-08-12T00:00:00Z",
     )
+    assert initial_clock_reads
+    snapshot_clock_reads = len(initial_clock_reads)
     resolution = adapter.resolve(
         candidate["id"],
         "promoted",
@@ -1881,6 +1890,7 @@ def test_task8_adapter_recovers_exact_committed_snapshot_and_resolve_after_write
         candidate_authority=bound,
         authority_expires_at="2026-08-12T00:00:00Z",
     )
+    assert len(initial_clock_reads) > snapshot_clock_reads
 
     assert Path(snapshot.path).is_dir()
     assert resolution.event_id
@@ -1909,6 +1919,13 @@ def test_guarded_v2_snapshot_lookup_first_replays_commit_after_unknown_writer_ou
     _write_existing_provider_home(learning, [candidate])
     expected = _expected_candidate_authority(provider, target, [candidate])
     module = _load_temporary_provider_module(provider, learning, monkeypatch)
+    initial_clock_reads: list[None] = []
+
+    def before_authority_expiry() -> str:
+        initial_clock_reads.append(None)
+        return "2026-08-11T23:59:59Z"
+
+    monkeypatch.setattr(module, "now", before_authority_expiry)
     arguments = SimpleNamespace(
         operation_id="op_snapshot_" + "a" * 32,
         skill_name="mail",
@@ -1938,6 +1955,7 @@ def test_guarded_v2_snapshot_lookup_first_replays_commit_after_unknown_writer_ou
 
     with pytest.raises(OSError, match="post-commit-pre-return"):
         module.command_snapshot(arguments)
+    assert initial_clock_reads
 
     monkeypatch.delenv("CODEX_SKILL_LEARNING_FAULT")
     events = [
@@ -2061,6 +2079,13 @@ def test_guarded_v2_resolve_lookup_first_converges_race_and_commit_before_return
     _write_existing_provider_home(learning, [candidate])
     expected = _expected_candidate_authority(provider, target, [candidate])
     module = _load_temporary_provider_module(provider, learning, monkeypatch)
+    initial_clock_reads: list[None] = []
+
+    def before_authority_expiry() -> str:
+        initial_clock_reads.append(None)
+        return "2026-08-11T23:59:59Z"
+
+    monkeypatch.setattr(module, "now", before_authority_expiry)
     arguments = SimpleNamespace(
         candidate_id=candidate["id"],
         decision="promoted",
@@ -2089,6 +2114,7 @@ def test_guarded_v2_resolve_lookup_first_converges_race_and_commit_before_return
 
     with pytest.raises(OSError, match="post-commit-pre-return"):
         module.command_resolve(arguments)
+    assert initial_clock_reads
 
     monkeypatch.delenv("CODEX_SKILL_LEARNING_FAULT")
     monkeypatch.setattr(module, "now", lambda: "2026-08-13T00:00:00Z")
@@ -2146,6 +2172,13 @@ def test_guarded_v2_resolve_lookup_first_converges_race_and_commit_before_return
     race_home = tmp_path / "race-learning"
     _write_existing_provider_home(race_home, [candidate])
     race_module = _load_temporary_provider_module(provider, race_home, monkeypatch)
+    race_clock_reads: list[None] = []
+
+    def before_race_authority_expiry() -> str:
+        race_clock_reads.append(None)
+        return "2026-08-11T23:59:59Z"
+
+    monkeypatch.setattr(race_module, "now", before_race_authority_expiry)
     barrier = __import__("threading").Barrier(2)
     errors: list[BaseException] = []
 
@@ -2163,6 +2196,7 @@ def test_guarded_v2_resolve_lookup_first_converges_race_and_commit_before_return
     first.join(timeout=10)
     second.join(timeout=10)
     assert not errors and not first.is_alive() and not second.is_alive()
+    assert race_clock_reads
     race_events = [
         json.loads(line)
         for line in (race_home / "events.jsonl").read_text(encoding="utf-8").splitlines()
