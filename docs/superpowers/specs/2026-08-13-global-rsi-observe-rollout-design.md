@@ -65,10 +65,12 @@ dirty source tree, symlinks, special files, unsafe permissions, untracked files
 inside the package, invalid JSON/YAML, an invalid skill package, a non-`observe`
 default profile, or a non-empty production allowlist.
 
-The installed release is a regular-file-only tree owned by the current user.
-Directories use mode `0700`; files use `0600`, except repository-declared
-executables, which retain `0700`. The installer never follows a destination
-symlink and rejects hard-linked, group-writable, or world-writable installed
+The installed release contains only directories and regular files owned by the
+current user. Directories use mode `0700`; files use `0600`, except
+repository-declared executables, which retain `0700`. Every regular file must
+have `nlink=1`; directories are pinned and rechecked through retained nofollow
+FDs rather than a one-link rule. The installer never follows a destination
+symlink and rejects hard-linked files and group-writable or world-writable
 members.
 
 The manifest is canonical UTF-8 JSON with sorted keys and one final LF. Its
@@ -112,7 +114,8 @@ through ambient environment variables.
 The deployer manages one exactly delimited block in `~/.codex/AGENTS.md`. Text
 outside the block belongs to the user and must remain byte-identical. A missing
 file is created privately; an existing file must be a current-user-owned,
-single-link regular file with safe permissions.
+single-link regular file with safe permissions. A newly created file uses mode
+`0600`; an existing safe file retains its exact permission mode.
 
 The exact managed block is:
 
