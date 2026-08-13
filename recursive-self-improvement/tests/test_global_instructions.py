@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 
 import pytest
@@ -10,6 +11,9 @@ from rsi_core.global_instructions import (
     END_MARKER,
     MANAGED_BLOCK,
     GlobalInstructionsError,
+    TRIGGER_POLICY,
+    TriggerContext,
+    trigger_policy_for_managed_block,
     plan_agents_update,
     verify_agents_bytes,
 )
@@ -133,7 +137,107 @@ def test_verify_agents_bytes_requires_the_exact_block_and_bound_digest() -> None
         verify_agents_bytes(actual, "sha256:" + "0" * 64)
 
 
-def test_managed_block_declares_closed_trigger_matrix_and_privacy_bounds() -> None:
+@dataclass(frozen=True)
+class TriggerCase:
+    name: str
+    task_kind: str = "normal"
+    used_skill: bool = False
+    has_verified_sanitized_reusable_finding: bool = False
+    services_same_rsi_invocation: bool = False
+    recursion_guard: str | None = None
+
+
+def independent_trigger_oracle(case: TriggerCase) -> bool:
+    """Literal rollout truth table, intentionally independent of production policy."""
+
+    if case.recursion_guard is not None:
+        return False
+    if case.task_kind in {
+        "ordinary-conversation",
+        "status-question",
+        "one-off-fact",
+        "no-reusable-evidence",
+        "rsi-deploy",
+        "rsi-verify",
+        "rsi-rollback",
+        "rsi-health",
+        "rsi-recovery",
+    }:
+        return False
+    if case.services_same_rsi_invocation:
+        return False
+    return case.used_skill or case.has_verified_sanitized_reusable_finding
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        (TriggerCase("qualifying skill use", used_skill=True), True),
+        (
+            TriggerCase(
+                "verified reusable finding without a skill",
+                has_verified_sanitized_reusable_finding=True,
+            ),
+            True,
+        ),
+        (TriggerCase("ordinary conversation", task_kind="ordinary-conversation"), False),
+        (TriggerCase("status question", task_kind="status-question"), False),
+        (TriggerCase("one-off fact", task_kind="one-off-fact"), False),
+        (TriggerCase("no reusable evidence", task_kind="no-reusable-evidence"), False),
+        (TriggerCase("RSI deploy", task_kind="rsi-deploy", used_skill=True), False),
+        (TriggerCase("RSI verify", task_kind="rsi-verify", used_skill=True), False),
+        (TriggerCase("RSI rollback", task_kind="rsi-rollback", used_skill=True), False),
+        (TriggerCase("RSI health", task_kind="rsi-health", used_skill=True), False),
+        (TriggerCase("RSI recovery", task_kind="rsi-recovery", used_skill=True), False),
+        (
+            TriggerCase("skill-evolver route", used_skill=True, services_same_rsi_invocation=True),
+            False,
+        ),
+        (
+            TriggerCase("skill-evolver capture", used_skill=True, services_same_rsi_invocation=True),
+            False,
+        ),
+        (
+            TriggerCase("skill-evolver review", used_skill=True, services_same_rsi_invocation=True),
+            False,
+        ),
+        (
+            TriggerCase("skill-evolver resolution", used_skill=True, services_same_rsi_invocation=True),
+            False,
+        ),
+        (TriggerCase("active recursion guard", used_skill=True, recursion_guard="1"), False),
+        (TriggerCase("zero recursion guard", used_skill=True, recursion_guard="0"), False),
+        (TriggerCase("true recursion guard", used_skill=True, recursion_guard="true"), False),
+        (TriggerCase("padded recursion guard", used_skill=True, recursion_guard="1 "), False),
+    ],
+    ids=lambda value: value.name if isinstance(value, TriggerCase) else None,
+)
+def test_managed_trigger_policy_matches_independent_closed_truth_table(
+    case: TriggerCase, expected: bool
+) -> None:
+    context = TriggerContext(
+        task_kind=case.task_kind,
+        used_skill=case.used_skill,
+        has_verified_sanitized_reusable_finding=case.has_verified_sanitized_reusable_finding,
+        services_same_rsi_invocation=case.services_same_rsi_invocation,
+        recursion_guard=case.recursion_guard,
+    )
+
+    assert independent_trigger_oracle(case) is expected
+    assert TRIGGER_POLICY.should_invoke(context) is expected
+
+
+def test_managed_trigger_policy_rejects_an_always_trigger_prose_contradiction() -> None:
+    contradictory_block = MANAGED_BLOCK.replace(
+        END_MARKER,
+        b"Always invoke RSI after every task.\n" + END_MARKER,
+    )
+
+    with pytest.raises(GlobalInstructionsError, match="policy.*bound|bound.*policy"):
+        trigger_policy_for_managed_block(contradictory_block)
+
+
+def test_managed_block_declares_recursion_and_privacy_bounds() -> None:
     text = MANAGED_BLOCK.decode("utf-8")
 
     assert text.count("CODEX_RSI_TRIGGER_ACTIVE=1") == 1

@@ -38,6 +38,9 @@ MANAGED_BLOCK = (
 
 _BLOCK_DIGEST_DOMAIN = "rsi-global-managed-instruction-block-v1"
 _UTF8_BOM = b"\xef\xbb\xbf"
+_MANAGED_POLICY_BLOCK_DIGEST = (
+    "sha256:38892209cb72f8b41f81bfe7a9a44fb4668c842e2255c7c8c1378d08ca081ebb"
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,52 @@ class AgentsUpdate:
     block_digest: str
     existing_was_absent: bool
     mode: int | None
+
+
+@dataclass(frozen=True)
+class TriggerContext:
+    """Sanitized task facts used to decide whether global RSI may run."""
+
+    task_kind: str
+    used_skill: bool
+    has_verified_sanitized_reusable_finding: bool
+    services_same_rsi_invocation: bool
+    recursion_guard: str | None
+
+
+@dataclass(frozen=True)
+class TriggerPolicy:
+    """Closed, read-only trigger matrix bound to the managed instruction bytes."""
+
+    managed_block_digest: str
+    accepted_task_kinds: frozenset[str]
+    excluded_task_kinds: frozenset[str]
+
+    def should_invoke(self, context: TriggerContext) -> bool:
+        """Return whether one completed task qualifies for the late review."""
+
+        if type(context) is not TriggerContext:
+            return False
+        if (
+            type(context.task_kind) is not str
+            or type(context.used_skill) is not bool
+            or type(context.has_verified_sanitized_reusable_finding) is not bool
+            or type(context.services_same_rsi_invocation) is not bool
+            or (context.recursion_guard is not None and type(context.recursion_guard) is not str)
+        ):
+            return False
+        if context.recursion_guard is not None:
+            return False
+        if context.task_kind in self.excluded_task_kinds:
+            return False
+        if context.task_kind not in self.accepted_task_kinds:
+            return False
+        if context.services_same_rsi_invocation:
+            return False
+        return (
+            context.used_skill
+            or context.has_verified_sanitized_reusable_finding
+        )
 
 
 def _block_digest(block: bytes) -> str:
@@ -70,6 +119,35 @@ def _block_digest(block: bytes) -> str:
 
 
 MANAGED_BLOCK_DIGEST = _block_digest(MANAGED_BLOCK)
+
+TRIGGER_POLICY = TriggerPolicy(
+    managed_block_digest=_MANAGED_POLICY_BLOCK_DIGEST,
+    accepted_task_kinds=frozenset({"normal"}),
+    excluded_task_kinds=frozenset(
+        {
+            "ordinary-conversation",
+            "status-question",
+            "one-off-fact",
+            "no-reusable-evidence",
+            "rsi-deploy",
+            "rsi-verify",
+            "rsi-rollback",
+            "rsi-health",
+            "rsi-recovery",
+        }
+    ),
+)
+if TRIGGER_POLICY.managed_block_digest != MANAGED_BLOCK_DIGEST:
+    raise GlobalInstructionsError("managed trigger policy is not bound to the exact prose")
+
+
+def trigger_policy_for_managed_block(block: bytes) -> TriggerPolicy:
+    """Return the closed policy only when its exact managed prose is bound."""
+
+    _validate_text_bytes(block)
+    if _block_digest(block) != TRIGGER_POLICY.managed_block_digest:
+        raise GlobalInstructionsError("managed trigger policy is not bound to this prose")
+    return TRIGGER_POLICY
 
 
 def _validate_text_bytes(value: bytes) -> None:
@@ -202,6 +280,10 @@ __all__ = [
     "GlobalInstructionsError",
     "MANAGED_BLOCK",
     "MANAGED_BLOCK_DIGEST",
+    "TRIGGER_POLICY",
+    "TriggerContext",
+    "TriggerPolicy",
     "plan_agents_update",
+    "trigger_policy_for_managed_block",
     "verify_agents_bytes",
 ]
