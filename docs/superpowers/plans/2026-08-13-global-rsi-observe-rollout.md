@@ -21,7 +21,9 @@
 - Installed members are current-user-owned directories or regular files; regular files require `nlink=1`, while directories use retained nofollow FD identity. Symlinks, special files, unsafe modes, and hard-linked files are rejected.
 - The installed manifest excludes itself from package entries/tree digests; the receipt separately binds its exact bytes.
 - Immutable deployment authority uses exactly `receipts/<operation-id>.manifest.json` followed marker-last by `receipts/<operation-id>.json`.
+- Backups use a domain-separated digest over both prior package state and exact prior `AGENTS.md` state/bytes/mode; package tree digest alone is not a valid backup key.
 - Global instruction text outside the exact managed block remains byte-identical.
+- The complete global instruction file remains strict UTF-8 without BOM, NUL, or CR; invalid existing text blocks deployment without repair.
 - Recursion guard is exactly `CODEX_RSI_TRIGGER_ACTIVE=1`; other values skip nested review fail closed.
 - Ordinary conversation, status questions, one-off facts, and tasks without reusable evidence never trigger RSI state.
 - No P0, P1, or P2 may remain after independent review.
@@ -130,7 +132,7 @@ git commit -m "feat: add strict RSI deployment identity"
 
 ```python
 def test_agents_update_preserves_every_unmanaged_byte() -> None:
-    before = b"prefix\n\xff-owned\n"
+    before = "prefix\nпользовательский текст\n".encode("utf-8")
     plan = plan_agents_update(before)
     assert plan.after.startswith(before)
     assert plan.after.count(BEGIN_MARKER) == 1
@@ -155,7 +157,7 @@ Expected: import failure for the missing module.
 
 - [ ] **Step 3: Implement the exact managed block and parser**
 
-Embed the block from the design as a constant. Accept zero or one complete block. Reject duplicate markers, unmatched markers, non-UTF-8 managed content, NUL, unsafe line framing, or any existing block whose bytes differ from a previously manifest-bound block unless the caller is executing a verified update. Preserve unmanaged prefix/suffix bytes exactly, including an absent final LF. Preserve the exact safe mode of an existing file; use `0600` only when creating it.
+Embed the block from the design as a constant. Accept zero or one complete block. Reject duplicate markers, unmatched markers, any non-UTF-8 byte, BOM, NUL, CR, unsafe line framing, or any existing block whose bytes differ from a previously manifest-bound block unless the caller is executing a verified update. Preserve unmanaged prefix/suffix bytes exactly, including an absent final LF. Preserve the exact safe mode of an existing file; use `0600` only when creating it.
 
 - [ ] **Step 4: Add recursion and privacy tests**
 
@@ -230,7 +232,7 @@ Use a current-user `flock` with nonblocking monotonic retry. Create staging unde
 
 - [ ] **Step 6: Write update/exchange and rollback RED tests**
 
-Test byte-identical no-op, v1→v2 update, v2→v1 rollback, absent prior `AGENTS.md`, exact non-UTF-8 unmanaged bytes, drift before exchange, drift before instruction replace, and unsupported exchange capability. On macOS, test the real `renameatx_np(RENAME_SWAP)` backend in a temporary same-filesystem directory; on other platforms, require typed unsupported status and no write.
+Test byte-identical no-op, v1→v2 update, v2→v1 rollback, absent prior `AGENTS.md`, exact multibyte UTF-8 unmanaged bytes, rejected invalid UTF-8, two identical package versions with different unmanaged instruction bytes producing different backup identities, drift before exchange, drift before instruction replace, and unsupported exchange capability. On macOS, test the real `renameatx_np(RENAME_SWAP)` backend in a temporary same-filesystem directory; on other platforms, require typed unsupported status and no write.
 
 - [ ] **Step 7: Implement atomic update backend and exact rollback**
 

@@ -101,8 +101,11 @@ listed package entry and digest. No other unlisted installed member is legal.
 Deployment state lives under `~/.codex/rsi-deployments-v1`: `lock` is the
 single deployment lock; `receipts/<operation-id>.manifest.json` contains the
 exact immutable manifest; `receipts/<operation-id>.json` is its immutable
-marker-last receipt; and `backups/<tree-digest>/` contains immutable package,
-manifest, and exact global-instruction bytes. An absent pre-deployment
+marker-last receipt; and `backups/<backup-digest>/` contains immutable package,
+manifest, and exact global-instruction bytes. `backup-digest` is the
+domain-separated digest of the prior package state/digest plus the prior
+`AGENTS.md` state, exact byte digest, byte length, and safe mode; it is never the
+package tree digest alone. An absent pre-deployment
 `AGENTS.md` is represented by the closed `agentsState="absent"` backup arm,
 never by invented empty bytes. These paths are constructor-fixed and cannot be
 supplied by a caller or environment variable in live mode. Tests use an
@@ -115,7 +118,9 @@ The deployer manages one exactly delimited block in `~/.codex/AGENTS.md`. Text
 outside the block belongs to the user and must remain byte-identical. A missing
 file is created privately; an existing file must be a current-user-owned,
 single-link regular file with safe permissions. A newly created file uses mode
-`0600`; an existing safe file retains its exact permission mode.
+`0600`; an existing safe file retains its exact permission mode. The complete
+existing and resulting file must be strict UTF-8 without BOM, NUL, or CR; an
+invalid global instruction file blocks deployment without rewriting it.
 
 The exact managed block is:
 
