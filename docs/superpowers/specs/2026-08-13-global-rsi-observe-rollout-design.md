@@ -97,12 +97,15 @@ binding matches them, and a fresh descriptor-relative scan reproduces every
 listed package entry and digest. No other unlisted installed member is legal.
 
 Deployment state lives under `~/.codex/rsi-deployments-v1`: `lock` is the
-single deployment lock; `receipts/<operation-id>.json` contains immutable
-marker-last receipts; and `backups/<tree-digest>/` contains immutable package,
-manifest, and exact global-instruction bytes. These paths are constructor-fixed
-and cannot be supplied by a caller or environment variable in live mode. Tests
-use an explicitly injected temporary Codex home and never redirect a live
-deployment through ambient environment variables.
+single deployment lock; `receipts/<operation-id>.manifest.json` contains the
+exact immutable manifest; `receipts/<operation-id>.json` is its immutable
+marker-last receipt; and `backups/<tree-digest>/` contains immutable package,
+manifest, and exact global-instruction bytes. An absent pre-deployment
+`AGENTS.md` is represented by the closed `agentsState="absent"` backup arm,
+never by invented empty bytes. These paths are constructor-fixed and cannot be
+supplied by a caller or environment variable in live mode. Tests use an
+explicitly injected temporary Codex home and never redirect a live deployment
+through ambient environment variables.
 
 ## Global trigger contract
 
