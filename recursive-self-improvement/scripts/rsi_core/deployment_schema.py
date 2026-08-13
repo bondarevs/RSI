@@ -21,10 +21,11 @@ RECEIPT_DOMAIN = "rsi-global-observe-receipt-v1"
 PACKAGE_TREE_DOMAIN = "rsi-global-package-tree-v1"
 MANIFEST_RELATIVE_PATH = ".rsi-deployment-manifest.json"
 PACKAGE_RELATIVE_PATH = "recursive-self-improvement"
+MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 
 _DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
-_OPERATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,199}\Z")
+_OPERATION_ID_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,199}\Z")
 _MAX_JSON_DEPTH = 64
 _MAX_FILE_ENTRIES = 4_096
 _MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -368,6 +369,8 @@ class DeploymentManifest:
         )
         _require_timestamp(self.installed_at)
         _require_operation_id(self.operation_id)
+        if len(canonical_json_bytes(self.to_mapping())) > MAX_MANIFEST_BYTES:
+            raise DeploymentSchemaError("deployment manifest size exceeds its bound")
 
     @classmethod
     def from_mapping(cls, value: object) -> "DeploymentManifest":
@@ -396,6 +399,8 @@ class DeploymentManifest:
 
     @classmethod
     def from_bytes(cls, payload: bytes) -> "DeploymentManifest":
+        if type(payload) is not bytes or len(payload) > MAX_MANIFEST_BYTES:
+            raise DeploymentSchemaError("deployment manifest size exceeds its bound")
         return cls.from_mapping(_parse_canonical_mapping(payload))
 
     def to_mapping(self) -> dict[str, object]:
@@ -418,7 +423,10 @@ class DeploymentManifest:
         }
 
     def to_bytes(self) -> bytes:
-        return canonical_json_bytes(self.to_mapping())
+        payload = canonical_json_bytes(self.to_mapping())
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise DeploymentSchemaError("deployment manifest size exceeds its bound")
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -439,7 +447,7 @@ class DeploymentReceipt:
             self.manifest_byte_length,
             label="manifest byte length",
             minimum=1,
-            maximum=_MAX_FILE_BYTES,
+            maximum=MAX_MANIFEST_BYTES,
         )
         _require_digest(self.manifest_digest, label="manifest")
 
@@ -478,6 +486,7 @@ __all__ = [
     "DeploymentSchemaError",
     "FileEntry",
     "MANIFEST_RELATIVE_PATH",
+    "MAX_MANIFEST_BYTES",
     "PACKAGE_TREE_DOMAIN",
     "PACKAGE_RELATIVE_PATH",
     "RECEIPT_DOMAIN",

@@ -282,6 +282,7 @@ def _scan_directory(
                 opened_before = os.fstat(child_fd)
                 _require_safe_member(opened_before, directory=True, label=relative)
                 _require_same_identity(named_before, opened_before, label=relative)
+                entries_before = len(state.entries)
                 _scan_directory(
                     child_fd,
                     relative,
@@ -300,6 +301,10 @@ def _scan_directory(
                     named_after,
                     label=relative,
                 )
+                if len(state.entries) == entries_before:
+                    raise DeploymentIntegrityError(
+                        f"{relative} directory has no included regular file descendant"
+                    )
             finally:
                 os.close(child_fd)
             continue
@@ -356,6 +361,10 @@ def scan_package(root: Path, *, exclude_manifest: bool) -> PackageSnapshot:
             named_after,
             label="package root",
         )
+        if not state.entries:
+            raise DeploymentIntegrityError(
+                "package root directory has no included regular file descendant"
+            )
     finally:
         os.close(root_fd)
 

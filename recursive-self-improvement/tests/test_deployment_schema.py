@@ -6,6 +6,7 @@ import unicodedata
 
 import pytest
 
+import rsi_core.deployment_schema as deployment_schema
 from rsi_core.deployment_schema import (
     DeploymentManifest,
     DeploymentReceipt,
@@ -20,6 +21,7 @@ DIGEST_B = "sha256:" + "b" * 64
 DIGEST_C = "sha256:" + "c" * 64
 DIGEST_D = "sha256:" + "d" * 64
 TREE_DIGEST = "sha256:216fe03013da28e67ed8062a49536f56b8e6e7e1405c2e80d6496b072e294f39"
+MANIFEST_MAX_BYTES = 16 * 1024 * 1024
 
 
 def manifest_fixture() -> dict[str, object]:
@@ -69,6 +71,27 @@ def receipt_fixture() -> dict[str, object]:
     }
 
 
+def _manifest_with_wire_length(byte_length: int) -> tuple[dict[str, object], bytes]:
+    value = manifest_fixture()
+    baseline = canonical_json_bytes(value)
+    padding = byte_length - len(baseline)
+    assert padding >= 0
+    value["sourceRepository"] = str(value["sourceRepository"]) + "r" * padding
+    payload = canonical_json_bytes(value)
+    assert len(payload) == byte_length
+    return value, payload
+
+
+@pytest.fixture(scope="module")
+def manifest_size_boundaries() -> tuple[
+    tuple[dict[str, object], bytes], tuple[dict[str, object], bytes]
+]:
+    return (
+        _manifest_with_wire_length(MANIFEST_MAX_BYTES),
+        _manifest_with_wire_length(MANIFEST_MAX_BYTES + 1),
+    )
+
+
 def test_manifest_has_exact_canonical_bytes_and_acyclic_membership() -> None:
     expected = (
         b'{"domain":"rsi-global-observe-deployment-v1","fileEntries":'
@@ -92,6 +115,46 @@ def test_manifest_has_exact_canonical_bytes_and_acyclic_membership() -> None:
     assert encoded == expected
     assert b'.rsi-deployment-manifest.json' not in encoded
     assert DeploymentManifest.from_bytes(encoded).to_bytes() == encoded
+
+
+def test_manifest_accepts_exact_wire_size_bound(
+    manifest_size_boundaries: tuple[
+        tuple[dict[str, object], bytes], tuple[dict[str, object], bytes]
+    ],
+) -> None:
+    (value, payload), _ = manifest_size_boundaries
+
+    assert DeploymentManifest.from_mapping(value).to_bytes() == payload
+    assert DeploymentManifest.from_bytes(payload).to_bytes() == payload
+
+
+def test_manifest_rejects_wire_size_bound_plus_one_in_construction_and_parsing(
+    manifest_size_boundaries: tuple[
+        tuple[dict[str, object], bytes], tuple[dict[str, object], bytes]
+    ],
+) -> None:
+    _, (value, payload) = manifest_size_boundaries
+
+    with pytest.raises(DeploymentSchemaError, match="size|bound"):
+        DeploymentManifest.from_mapping(value)
+    with pytest.raises(DeploymentSchemaError, match="size|bound"):
+        DeploymentManifest.from_bytes(payload)
+
+
+def test_oversized_manifest_is_rejected_before_json_decode(
+    manifest_size_boundaries: tuple[
+        tuple[dict[str, object], bytes], tuple[dict[str, object], bytes]
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, (_, payload) = manifest_size_boundaries
+
+    def unexpected_decode(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("oversized manifest reached json.loads")
+
+    monkeypatch.setattr(deployment_schema.json, "loads", unexpected_decode)
+    with pytest.raises(DeploymentSchemaError, match="size|bound"):
+        DeploymentManifest.from_bytes(payload)
 
 
 def test_manifest_and_entries_are_immutable_owned_values() -> None:
@@ -257,6 +320,61 @@ def test_receipt_rejects_nonclosed_or_invalid_bindings(mutation) -> None:
     mutation(value)
     with pytest.raises(DeploymentSchemaError):
         DeploymentReceipt.from_mapping(value)
+
+
+@pytest.mark.parametrize("operation_id", ["A", "Deploy-1", "a.b", "a:b"])
+@pytest.mark.parametrize("schema", ["manifest", "receipt"])
+def test_operation_ids_reject_casefold_and_receipt_path_alias_grammar(
+    operation_id: str, schema: str
+) -> None:
+    value = manifest_fixture() if schema == "manifest" else receipt_fixture()
+    value["operationId"] = operation_id
+    parser = (
+        DeploymentManifest.from_mapping
+        if schema == "manifest"
+        else DeploymentReceipt.from_mapping
+    )
+
+    with pytest.raises(DeploymentSchemaError, match="operation ID"):
+        parser(value)
+
+
+def test_admitted_operation_ids_make_marker_and_manifest_paths_casefold_injective() -> None:
+    candidates = ["a", "a.manifest", "A"]
+    admitted: list[str] = []
+    for operation_id in candidates:
+        value = receipt_fixture()
+        value["operationId"] = operation_id
+        try:
+            admitted.append(DeploymentReceipt.from_mapping(value).operation_id)
+        except DeploymentSchemaError:
+            pass
+
+    paths = [
+        path
+        for operation_id in admitted
+        for path in (f"{operation_id}.json", f"{operation_id}.manifest.json")
+    ]
+    assert len(paths) == len({path.casefold() for path in paths})
+
+
+def test_valid_operation_id_paths_are_pairwise_casefold_distinct() -> None:
+    operation_ids = ["a", "a-manifest", "a_manifest", "a0", "0"]
+    receipts = []
+    for operation_id in operation_ids:
+        value = receipt_fixture()
+        value["operationId"] = operation_id
+        receipts.append(DeploymentReceipt.from_mapping(value))
+
+    paths = [
+        path
+        for receipt in receipts
+        for path in (
+            f"{receipt.operation_id}.json",
+            f"{receipt.operation_id}.manifest.json",
+        )
+    ]
+    assert len(paths) == len({path.casefold() for path in paths})
 
 
 class ForgedString(str):
