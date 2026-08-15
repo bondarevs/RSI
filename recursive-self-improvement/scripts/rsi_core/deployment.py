@@ -75,7 +75,6 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _ALLOWLIST_DOMAIN = "rsi-global-production-allowlist-v1"
 _FaultInjector = Callable[[str], None]
-_PATH_FACTORY_TOKEN = object()
 
 
 def _cut(fault_injector: _FaultInjector | None, boundary: str) -> None:
@@ -106,8 +105,10 @@ class DeploymentPaths:
     lock_file: Path
     receipts_root: Path
     backups_root: Path
+    authorities_root: Path
+    active_authority_file: Path
     testing: bool
-    _factory_provenance: object
+    _factory_provenance: str
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise DeploymentError(
@@ -120,40 +121,14 @@ class DeploymentPaths:
         codex_home: Path,
         *,
         testing: bool,
-        _factory_token: object | None = None,
     ) -> "DeploymentPaths":
-        if _factory_token is not _PATH_FACTORY_TOKEN:
-            raise DeploymentError("deployment paths require an approved factory")
-        if not isinstance(codex_home, Path) or not codex_home.is_absolute():
-            raise DeploymentError("Codex home must be an absolute Path")
-        skills_root = codex_home / "skills"
-        state_root = codex_home / "rsi-deployments-v1"
-        instance = object.__new__(cls)
-        values = {
-            "codex_home": codex_home,
-            "skills_root": skills_root,
-            "installed_root": skills_root / PACKAGE_RELATIVE_PATH,
-            "agents_file": codex_home / "AGENTS.md",
-            "state_root": state_root,
-            "lock_file": state_root / "lock",
-            "receipts_root": state_root / "receipts",
-            "backups_root": state_root / "backups",
-            "testing": testing,
-            "_factory_provenance": _PATH_FACTORY_TOKEN,
-        }
-        for name, value in values.items():
-            object.__setattr__(instance, name, value)
-        return instance
+        raise DeploymentError("private deployment path construction is unavailable")
 
     @classmethod
     def live(cls) -> "DeploymentPaths":
         """Return fixed live paths; ``HOME`` and deployment env vars are ignored."""
 
-        return cls._from_home(
-            _actual_user_home() / ".codex",
-            testing=False,
-            _factory_token=_PATH_FACTORY_TOKEN,
-        )
+        return _new_deployment_paths(_actual_user_home() / ".codex", testing=False)
 
     @classmethod
     def for_testing(cls, codex_home: Path) -> "DeploymentPaths":
@@ -185,16 +160,53 @@ class DeploymentPaths:
             if current.parent == current:
                 break
             current = current.parent
-        return cls._from_home(
-            injected,
-            testing=True,
-            _factory_token=_PATH_FACTORY_TOKEN,
-        )
+        return _new_deployment_paths(injected, testing=True)
+
+
+def _new_deployment_paths(codex_home: Path, *, testing: bool) -> DeploymentPaths:
+    if not isinstance(codex_home, Path) or not codex_home.is_absolute():
+        raise DeploymentError("Codex home must be an absolute Path")
+    exact_live = _actual_user_home() / ".codex"
+    if not testing and codex_home != exact_live:
+        raise DeploymentError("production deployment path must be the exact live Codex home")
+    if testing:
+        try:
+            codex_home.relative_to(exact_live)
+        except ValueError:
+            pass
+        else:
+            raise DeploymentError("test deployment path cannot alias the live Codex tree")
+    skills_root = codex_home / "skills"
+    state_root = codex_home / "rsi-deployments-v1"
+    instance = object.__new__(DeploymentPaths)
+    values = {
+        "codex_home": codex_home,
+        "skills_root": skills_root,
+        "installed_root": skills_root / PACKAGE_RELATIVE_PATH,
+        "agents_file": codex_home / "AGENTS.md",
+        "state_root": state_root,
+        "lock_file": state_root / "lock",
+        "receipts_root": state_root / "receipts",
+        "backups_root": state_root / "backups",
+        "authorities_root": state_root / "authorities",
+        "active_authority_file": state_root / "active.json",
+        "testing": testing,
+        "_factory_provenance": "testing" if testing else "live",
+    }
+    for name, value in values.items():
+        object.__setattr__(instance, name, value)
+    return instance
 
 
 def _validate_deployment_paths(paths: DeploymentPaths) -> None:
-    if paths._factory_provenance is not _PATH_FACTORY_TOKEN:
+    expected_provenance = "testing" if paths.testing else "live"
+    if paths._factory_provenance != expected_provenance:
         raise DeploymentError("deployment path provenance is invalid")
+    live = _actual_user_home() / ".codex"
+    if (not paths.testing and paths.codex_home != live) or (
+        paths.testing and paths.codex_home == live
+    ):
+        raise DeploymentError("deployment path authority is invalid")
     home = paths.codex_home
     expected = {
         "skills_root": home / "skills",
@@ -204,6 +216,8 @@ def _validate_deployment_paths(paths: DeploymentPaths) -> None:
         "lock_file": home / "rsi-deployments-v1" / "lock",
         "receipts_root": home / "rsi-deployments-v1" / "receipts",
         "backups_root": home / "rsi-deployments-v1" / "backups",
+        "authorities_root": home / "rsi-deployments-v1" / "authorities",
+        "active_authority_file": home / "rsi-deployments-v1" / "active.json",
     }
     if any(getattr(paths, name) != value for name, value in expected.items()):
         raise DeploymentError("deployment descriptor roots are not confined")
@@ -282,6 +296,14 @@ class _PublishedFile:
 
 
 @dataclass(frozen=True, slots=True)
+class _PublishedPointer:
+    prior_bytes: bytes | None
+    temporary: Path
+    active_identity: tuple[int, int]
+    old_identity: tuple[int, int] | None
+
+
+@dataclass(frozen=True, slots=True)
 class _BackupRecord:
     path: Path
     identity_payload: bytes
@@ -296,6 +318,62 @@ class _BackupRecord:
 class _CleanupLedger:
     root_identity: tuple[int, int]
     members: tuple[tuple[str, str, int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _OperationRequest:
+    operation_id: str
+    operation_kind: str
+    request_receipt_id: str | None
+    prior_state_backup_digest: str
+
+    def to_bytes(self) -> bytes:
+        return canonical_json_bytes(
+            {
+                "schemaVersion": 1,
+                "domain": "rsi-global-operation-request-v1",
+                "operationId": self.operation_id,
+                "operationKind": self.operation_kind,
+                "requestReceiptId": self.request_receipt_id,
+                "priorStateBackupDigest": self.prior_state_backup_digest,
+            }
+        )
+
+    @classmethod
+    def from_bytes(cls, payload: bytes) -> "_OperationRequest":
+        mapping = _canonical_mapping(payload, label="deployment operation request")
+        if set(mapping) != {
+            "schemaVersion",
+            "domain",
+            "operationId",
+            "operationKind",
+            "requestReceiptId",
+            "priorStateBackupDigest",
+        } or mapping.get("schemaVersion") != 1 or mapping.get(
+            "domain"
+        ) != "rsi-global-operation-request-v1":
+            raise DeploymentIntegrityError("deployment operation request schema is invalid")
+        operation_id = mapping.get("operationId")
+        operation_kind = mapping.get("operationKind")
+        request_receipt_id = mapping.get("requestReceiptId")
+        backup_digest = mapping.get("priorStateBackupDigest")
+        if type(operation_id) is not str:
+            raise DeploymentIntegrityError("operation request ID is invalid")
+        _validate_operation_id(operation_id)
+        if operation_kind not in {"deploy", "rollback"}:
+            raise DeploymentIntegrityError("operation request kind is invalid")
+        if request_receipt_id is not None:
+            if type(request_receipt_id) is not str:
+                raise DeploymentIntegrityError("operation request receipt ID is invalid")
+            _validate_operation_id(request_receipt_id)
+        if (
+            type(backup_digest) is not str
+            or len(backup_digest) != 71
+            or not backup_digest.startswith("sha256:")
+            or any(value not in "0123456789abcdef" for value in backup_digest[7:])
+        ):
+            raise DeploymentIntegrityError("operation request backup digest is invalid")
+        return cls(operation_id, operation_kind, request_receipt_id, backup_digest)
 
 
 def _sha256(payload: bytes) -> str:
@@ -364,6 +442,54 @@ def _ensure_lock_root(paths: DeploymentPaths) -> None:
 
     _ensure_directory(paths.codex_home, exact_private=False)
     _ensure_directory(paths.state_root, exact_private=True)
+
+
+class _RetainedRoots:
+    def __init__(self, paths: DeploymentPaths) -> None:
+        self._entries: list[tuple[Path, int, tuple[int, int]]] = []
+        for path in (
+            paths.codex_home,
+            paths.skills_root,
+            paths.state_root,
+            paths.receipts_root,
+            paths.backups_root,
+            paths.authorities_root,
+        ):
+            descriptor = _open_parent(path / ".")
+            metadata = os.fstat(descriptor)
+            self._entries.append((path, descriptor, _identity(metadata)))
+
+    def validate(self) -> None:
+        for path, descriptor, expected in self._entries:
+            opened = os.fstat(descriptor)
+            try:
+                named = os.lstat(path)
+            except OSError:
+                raise DeploymentAmbiguousError(
+                    "deployment root changed; retained evidence was preserved"
+                ) from None
+            if (
+                not stat.S_ISDIR(named.st_mode)
+                or _identity(opened) != expected
+                or _identity(named) != expected
+            ):
+                raise DeploymentAmbiguousError(
+                    "deployment root identity changed; retained evidence was preserved"
+                )
+
+    def guarded(self, injector: _FaultInjector | None) -> _FaultInjector:
+        def call(boundary: str) -> None:
+            self.validate()
+            if injector is not None:
+                injector(boundary)
+            self.validate()
+
+        return call
+
+    def close(self) -> None:
+        for _path, descriptor, _identity_value in reversed(self._entries):
+            os.close(descriptor)
+        self._entries.clear()
 
 
 @contextmanager
@@ -444,7 +570,13 @@ def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
         _ensure_directory(paths.skills_root, exact_private=False)
         _ensure_directory(paths.receipts_root, exact_private=True)
         _ensure_directory(paths.backups_root, exact_private=True)
-        yield
+        _ensure_directory(paths.authorities_root, exact_private=True)
+        roots = _RetainedRoots(paths)
+        try:
+            roots.validate()
+            yield roots
+        finally:
+            roots.close()
     finally:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -1051,6 +1183,156 @@ def _publish_immutable_file(
         raise
 
 
+def _authority_payload(
+    *,
+    state: str,
+    operation_id: str,
+    receipt: DeploymentReceipt,
+    request_receipt_id: str | None,
+) -> bytes:
+    if state not in {"present", "absent"}:
+        raise DeploymentIntegrityError("deployment authority state is invalid")
+    return canonical_json_bytes(
+        {
+            "schemaVersion": 1,
+            "domain": "rsi-global-deployment-authority-v1",
+            "state": state,
+            "operationId": operation_id,
+            "requestReceiptId": request_receipt_id,
+            "receiptDigest": _sha256(receipt.to_bytes()),
+            "manifestDigest": receipt.manifest_digest,
+        }
+    )
+
+
+def _active_pointer_payload(
+    *, state: str, operation_id: str, authority_digest: str
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "schemaVersion": 1,
+            "domain": "rsi-global-active-authority-v1",
+            "state": state,
+            "operationId": operation_id,
+            "authorityDigest": authority_digest,
+        }
+    )
+
+
+def _publish_active_pointer(
+    paths: DeploymentPaths,
+    payload: bytes,
+    *,
+    operation_id: str,
+    fault_injector: _FaultInjector | None = None,
+) -> _PublishedPointer:
+    path = paths.active_authority_file
+    temporary = _new_temporary(
+        path.parent, label="rsi-active-authority", operation_id=operation_id
+    )
+    identity = _write_new_file(
+        temporary,
+        payload,
+        mode=0o600,
+        fault_injector=fault_injector,
+        write_boundary="authority.pointer.write",
+        fsync_boundary="authority.pointer.fsync",
+    )
+    prior_bytes: bytes | None = None
+    old_identity: tuple[int, int] | None = None
+    try:
+        _cut(fault_injector, "authority.pointer.replace")
+        try:
+            prior_bytes, prior_stat = _read_regular_file(
+                path, label="prior active authority"
+            )
+        except DeploymentIntegrityError:
+            try:
+                dangling = os.lstat(path)
+            except FileNotFoundError:
+                dangling = None
+            if dangling is not None:
+                raise
+            active_identity = _rename_noreplace(temporary, path)
+        else:
+            active_identity, old_identity = _exchange(temporary, path)
+            if old_identity != _identity(prior_stat):
+                raise DeploymentAmbiguousError("active authority prior identity differs")
+        if active_identity != identity:
+            raise DeploymentAmbiguousError("active authority publication identity differs")
+        _cut(fault_injector, "authority.pointer.parent_fsync")
+        _fsync_directory(path.parent)
+        _cut(fault_injector, "authority.pointer.readback")
+        readback, stable = _read_regular_file(path, label="active authority")
+        if readback != payload or _identity(stable) != identity:
+            raise DeploymentAmbiguousError("active authority readback differs")
+        return _PublishedPointer(prior_bytes, temporary, identity, old_identity)
+    except Exception as original_error:
+        try:
+            current, current_stat = _read_regular_file(path, label="active authority")
+        except DeploymentIntegrityError:
+            _cleanup_created_file(temporary)
+            raise
+        if _identity(current_stat) == identity:
+            if prior_bytes is None:
+                _rename_noreplace(path, temporary)
+                _fsync_directory(path.parent)
+                _unlink_exact(temporary, identity)
+            elif old_identity is not None:
+                restored, displaced = _exchange(temporary, path)
+                if restored != old_identity or displaced != identity:
+                    raise DeploymentAmbiguousError("active authority rollback differs")
+                _fsync_directory(path.parent)
+                _unlink_exact(temporary, identity)
+        else:
+            raise DeploymentAmbiguousError(
+                "active authority failure is ambiguous; evidence was preserved"
+            ) from original_error
+        raise
+
+
+def _discard_pointer_prior(paths: DeploymentPaths, publication: _PublishedPointer) -> None:
+    if publication.old_identity is not None:
+        _unlink_exact(publication.temporary, publication.old_identity)
+
+
+def _publish_authority_transition(
+    paths: DeploymentPaths,
+    *,
+    state: str,
+    operation_id: str,
+    receipt: DeploymentReceipt,
+    request_receipt_id: str | None,
+    fault_injector: _FaultInjector | None = None,
+) -> tuple[_PublishedFile, _PublishedPointer]:
+    authority_bytes = _authority_payload(
+        state=state,
+        operation_id=operation_id,
+        receipt=receipt,
+        request_receipt_id=request_receipt_id,
+    )
+    authority = _publish_immutable_file(
+        paths.authorities_root / f"{operation_id}.{state}.json",
+        authority_bytes,
+        operation_id=operation_id,
+        kind="authority",
+        fault_injector=fault_injector,
+    )
+    pointer_bytes = _active_pointer_payload(
+        state=state,
+        operation_id=operation_id,
+        authority_digest=_sha256(authority_bytes),
+    )
+    pointer = _publish_active_pointer(
+        paths,
+        pointer_bytes,
+        operation_id=operation_id,
+        fault_injector=fault_injector,
+    )
+    _discard_pointer_prior(paths, pointer)
+    return authority, pointer
+
+
 def _validate_operation_id(operation_id: str) -> None:
     try:
         DeploymentReceipt(
@@ -1062,7 +1344,11 @@ def _validate_operation_id(operation_id: str) -> None:
         raise DeploymentError("deployment operation ID is invalid") from None
 
 
-def _manifest_for_source(admitted: _AdmittedSource, operation_id: str) -> DeploymentManifest:
+def _manifest_for_source(
+    admitted: _AdmittedSource,
+    operation_id: str,
+    operation_request_digest: str,
+) -> DeploymentManifest:
     installed_at = datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
     return DeploymentManifest(
         source_repository=os.fspath(admitted.repository),
@@ -1073,6 +1359,7 @@ def _manifest_for_source(admitted: _AdmittedSource, operation_id: str) -> Deploy
         source_tree_digest=admitted.snapshot.tree_digest,
         installed_tree_digest=admitted.snapshot.tree_digest,
         managed_instruction_block_digest=MANAGED_BLOCK_DIGEST,
+        operation_request_digest=operation_request_digest,
         installed_at=installed_at,
         operation_id=operation_id,
     )
@@ -1095,6 +1382,35 @@ def _active_receipt(paths: DeploymentPaths) -> tuple[DeploymentManifest, Deploym
     return DeploymentManifest.from_bytes(manifest_bytes), DeploymentReceipt.from_bytes(receipt_bytes)
 
 
+def _bound_operation_request(
+    paths: DeploymentPaths,
+    manifest: DeploymentManifest,
+) -> tuple[_OperationRequest, _BackupRecord]:
+    request_bytes, _ = _read_regular_file(
+        paths.receipts_root / f"{manifest.operation_id}.request.json",
+        label="deployment operation request",
+    )
+    if _sha256(request_bytes) != manifest.operation_request_digest:
+        raise DeploymentIntegrityError("operation request digest differs from manifest")
+    request = _OperationRequest.from_bytes(request_bytes)
+    if request.operation_id != manifest.operation_id:
+        raise DeploymentIntegrityError("operation request ID differs from manifest")
+    backup_path = paths.backups_root / request.prior_state_backup_digest
+    backup = _validate_backup(backup_path)
+    if backup.path.name != request.prior_state_backup_digest:
+        raise DeploymentIntegrityError("operation request backup path differs")
+    metadata = _canonical_mapping(
+        backup.identity_payload, label="deployment backup metadata"
+    )
+    if (
+        metadata.get("successorOperationId") != request.operation_id
+        or metadata.get("operationKind") != request.operation_kind
+        or metadata.get("requestReceiptId") != request.request_receipt_id
+    ):
+        raise DeploymentIntegrityError("operation request backup binding is invalid")
+    return request, backup
+
+
 def _operation_replay(
     paths: DeploymentPaths,
     admitted: _AdmittedSource,
@@ -1102,11 +1418,13 @@ def _operation_replay(
 ) -> DeploymentReceipt | None:
     marker = paths.receipts_root / f"{operation_id}.json"
     manifest_copy = paths.receipts_root / f"{operation_id}.manifest.json"
+    request_copy = paths.receipts_root / f"{operation_id}.request.json"
     marker_exists = marker.exists()
     manifest_exists = manifest_copy.exists()
-    if not marker_exists and not manifest_exists:
+    request_exists = request_copy.exists()
+    if not marker_exists and not manifest_exists and not request_exists:
         return None
-    if not marker_exists or not manifest_exists:
+    if not marker_exists or not manifest_exists or not request_exists:
         raise DeploymentAmbiguousError("operation has partial immutable authority")
     marker_bytes, _ = _read_regular_file(marker, label="existing deployment receipt")
     manifest_bytes, _ = _read_regular_file(manifest_copy, label="existing receipt manifest")
@@ -1121,14 +1439,10 @@ def _operation_replay(
     )
     if not request_matches:
         raise DeploymentOperationConflict("deployment operation ID conflicts with immutable authority")
-    request_backup = _find_backup_for_successor(paths, operation_id)
-    request_metadata = _canonical_mapping(
-        request_backup.identity_payload,
-        label="deployment replay backup metadata",
-    )
+    request, _request_backup = _bound_operation_request(paths, manifest)
     if (
-        request_metadata.get("operationKind") != "deploy"
-        or request_metadata.get("requestReceiptId") is not None
+        request.operation_kind != "deploy"
+        or request.request_receipt_id is not None
     ):
         raise DeploymentOperationConflict(
             "deployment replay operation kind conflicts with immutable authority"
@@ -1189,7 +1503,7 @@ def _backup_identity_payload(
     prior_manifest_bytes: bytes,
     prior_manifest: DeploymentManifest,
     agents: _AgentsFile,
-    successor_manifest: DeploymentManifest,
+    successor_operation_id: str,
     *,
     operation_kind: str = "deploy",
     request_receipt_id: str | None = None,
@@ -1214,8 +1528,7 @@ def _backup_identity_payload(
             "packageManifestByteLength": len(prior_manifest_bytes),
             "packageManifestDigest": _sha256(prior_manifest_bytes),
             "agents": agents_arm,
-            "successorOperationId": successor_manifest.operation_id,
-            "successorManifestDigest": _sha256(successor_manifest.to_bytes()),
+            "successorOperationId": successor_operation_id,
             "operationKind": operation_kind,
             "requestReceiptId": request_receipt_id,
         }
@@ -1224,7 +1537,7 @@ def _backup_identity_payload(
 
 def _absent_backup_identity_payload(
     agents: _AgentsFile,
-    successor_manifest: DeploymentManifest,
+    successor_operation_id: str,
 ) -> bytes:
     agents_arm: dict[str, object]
     if agents.data is None:
@@ -1244,8 +1557,7 @@ def _absent_backup_identity_payload(
             "domain": "rsi-global-deployment-backup-v1",
             "packageState": "absent",
             "agents": agents_arm,
-            "successorOperationId": successor_manifest.operation_id,
-            "successorManifestDigest": _sha256(successor_manifest.to_bytes()),
+            "successorOperationId": successor_operation_id,
             "operationKind": "deploy",
             "requestReceiptId": None,
         }
@@ -1276,7 +1588,6 @@ def _validate_backup(
         "packageState",
         "agents",
         "successorOperationId",
-        "successorManifestDigest",
         "operationKind",
         "requestReceiptId",
     }
@@ -1372,7 +1683,7 @@ def _create_backup(
     paths: DeploymentPaths,
     prior_manifest: DeploymentManifest,
     prior_agents: _AgentsFile,
-    successor_manifest: DeploymentManifest,
+    successor_operation_id: str,
     *,
     operation_kind: str = "deploy",
     request_receipt_id: str | None = None,
@@ -1388,7 +1699,7 @@ def _create_backup(
         prior_manifest_bytes,
         prior_manifest,
         prior_agents,
-        successor_manifest,
+        successor_operation_id,
         operation_kind=operation_kind,
         request_receipt_id=request_receipt_id,
     )
@@ -1404,7 +1715,7 @@ def _create_backup(
     temporary = _new_temporary(
         paths.backups_root,
         label="rsi-backup-stage",
-        operation_id=successor_manifest.operation_id,
+        operation_id=successor_operation_id,
     )
     _cut(fault_injector, "backup.staging.create")
     try:
@@ -1413,6 +1724,7 @@ def _create_backup(
     except OSError:
         raise DeploymentError("cannot create private backup staging directory") from None
     temporary_identity = _identity(_safe_directory(temporary, exact_private=True))
+    cleanup_ledger = _capture_cleanup_ledger(temporary)
     published = False
     try:
         active_snapshot = scan_package(paths.installed_root, exclude_manifest=True)
@@ -1435,6 +1747,7 @@ def _create_backup(
             fault_injector=fault_injector,
             boundary_prefix="backup.package",
         )
+        cleanup_ledger = _capture_cleanup_ledger(temporary)
         _write_new_file(
             temporary / "manifest.json",
             prior_manifest_bytes,
@@ -1443,6 +1756,7 @@ def _create_backup(
             write_boundary="backup.manifest.write",
             fsync_boundary="backup.manifest.fsync",
         )
+        cleanup_ledger = _capture_cleanup_ledger(temporary)
         if prior_agents.data is not None:
             _write_new_file(
                 temporary / "agents.bin",
@@ -1452,6 +1766,7 @@ def _create_backup(
                 write_boundary="backup.agents.write",
                 fsync_boundary="backup.agents.fsync",
             )
+            cleanup_ledger = _capture_cleanup_ledger(temporary)
         _write_new_file(
             temporary / "backup.json",
             identity_payload,
@@ -1460,6 +1775,7 @@ def _create_backup(
             write_boundary="backup.metadata.write",
             fsync_boundary="backup.metadata.fsync",
         )
+        cleanup_ledger = _capture_cleanup_ledger(temporary)
         _cut(fault_injector, "backup.directory.fsync")
         _fsync_directory(temporary)
         _cut(fault_injector, "backup.rename")
@@ -1478,6 +1794,7 @@ def _create_backup(
             _remove_tree_exact(
                 final if published else temporary,
                 temporary_identity,
+                cleanup_ledger,
             )
         except Exception:
             raise DeploymentAmbiguousError(
@@ -1498,11 +1815,13 @@ def _create_backup(
 def _create_absent_backup(
     paths: DeploymentPaths,
     prior_agents: _AgentsFile,
-    successor_manifest: DeploymentManifest,
+    successor_operation_id: str,
     *,
     fault_injector: _FaultInjector | None = None,
 ) -> _BackupRecord:
-    identity_payload = _absent_backup_identity_payload(prior_agents, successor_manifest)
+    identity_payload = _absent_backup_identity_payload(
+        prior_agents, successor_operation_id
+    )
     final = paths.backups_root / _sha256(identity_payload)
     try:
         os.lstat(final)
@@ -1513,7 +1832,7 @@ def _create_absent_backup(
     temporary = _new_temporary(
         paths.backups_root,
         label="rsi-backup-stage",
-        operation_id=successor_manifest.operation_id,
+        operation_id=successor_operation_id,
     )
     _cut(fault_injector, "backup.staging.create")
     try:
@@ -1522,6 +1841,7 @@ def _create_absent_backup(
     except OSError:
         raise DeploymentError("cannot create private backup staging directory") from None
     temporary_identity = _identity(_safe_directory(temporary, exact_private=True))
+    ledger = _capture_cleanup_ledger(temporary)
     published = False
     try:
         if prior_agents.data is not None:
@@ -1533,6 +1853,7 @@ def _create_absent_backup(
                 write_boundary="backup.agents.write",
                 fsync_boundary="backup.agents.fsync",
             )
+            ledger = _capture_cleanup_ledger(temporary)
         _write_new_file(
             temporary / "backup.json",
             identity_payload,
@@ -1541,9 +1862,9 @@ def _create_absent_backup(
             write_boundary="backup.metadata.write",
             fsync_boundary="backup.metadata.fsync",
         )
+        ledger = _capture_cleanup_ledger(temporary)
         _cut(fault_injector, "backup.directory.fsync")
         _fsync_directory(temporary)
-        ledger = _capture_cleanup_ledger(temporary)
         _cut(fault_injector, "backup.rename")
         if _rename_noreplace(temporary, final) != temporary_identity:
             raise DeploymentAmbiguousError("deployment backup publication identity differs")
@@ -1617,20 +1938,13 @@ def _exchange_transaction(
     current_agents: _AgentsFile,
     desired_agents: bytes,
     desired_agents_mode: int,
-    successor_manifest: DeploymentManifest,
+    operation_id: str,
     *,
     recheck_source: bool,
     operation_kind: str = "deploy",
     request_receipt_id: str | None = None,
     fault_injector: _FaultInjector | None = None,
 ) -> DeploymentReceipt:
-    operation_id = successor_manifest.operation_id
-    manifest_bytes = successor_manifest.to_bytes()
-    receipt = DeploymentReceipt(
-        operation_id=operation_id,
-        manifest_byte_length=len(manifest_bytes),
-        manifest_digest=_sha256(manifest_bytes),
-    )
     active_identity = _identity(os.lstat(paths.installed_root))
     active_cleanup_ledger = _capture_cleanup_ledger(paths.installed_root)
     stage = _new_temporary(
@@ -1642,10 +1956,43 @@ def _exchange_transaction(
     stage_cleanup_ledger: _CleanupLedger | None = None
     exchanged = False
     instruction_publication: _PublishedInstruction | None = None
+    request_publication: _PublishedFile | None = None
     receipt_manifest_publication: _PublishedFile | None = None
     backup: _BackupRecord | None = None
     marker_committed = False
     try:
+        current = _active_receipt(paths)
+        if current is None or current[0] != active_manifest:
+            raise DeploymentIntegrityError("active deployment drifted before backup")
+        latest_agents = _read_agents(paths.agents_file)
+        if latest_agents != current_agents:
+            raise DeploymentIntegrityError("global instructions drifted before backup")
+        _require_identity(paths.installed_root, active_identity, label="active package")
+        backup = _create_backup(
+            paths,
+            active_manifest,
+            current_agents,
+            operation_id,
+            operation_kind=operation_kind,
+            request_receipt_id=request_receipt_id,
+            fault_injector=fault_injector,
+        )
+        request = _OperationRequest(
+            operation_id,
+            operation_kind,
+            request_receipt_id,
+            backup.path.name,
+        )
+        request_bytes = request.to_bytes()
+        successor_manifest = _manifest_for_source(
+            source, operation_id, _sha256(request_bytes)
+        )
+        manifest_bytes = successor_manifest.to_bytes()
+        receipt = DeploymentReceipt(
+            operation_id=operation_id,
+            manifest_byte_length=len(manifest_bytes),
+            manifest_digest=_sha256(manifest_bytes),
+        )
         stage_identity = _stage_package(
             source,
             successor_manifest,
@@ -1662,15 +2009,6 @@ def _exchange_transaction(
         if latest_agents != current_agents:
             raise DeploymentIntegrityError("global instructions drifted during staging")
         _require_identity(paths.installed_root, active_identity, label="active package")
-        backup = _create_backup(
-            paths,
-            active_manifest,
-            current_agents,
-            successor_manifest,
-            operation_kind=operation_kind,
-            request_receipt_id=request_receipt_id,
-            fault_injector=fault_injector,
-        )
         _cut(fault_injector, "package.exchange")
         if recheck_source:
             _recheck_admitted_source(source)
@@ -1696,6 +2034,13 @@ def _exchange_transaction(
             successor_manifest,
             desired_agents,
         )
+        request_publication = _publish_immutable_file(
+            paths.receipts_root / f"{operation_id}.request.json",
+            request_bytes,
+            operation_id=operation_id,
+            kind="request",
+            fault_injector=fault_injector,
+        )
         receipt_manifest_publication = _publish_immutable_file(
             paths.receipts_root / f"{operation_id}.manifest.json",
             manifest_bytes,
@@ -1711,6 +2056,14 @@ def _exchange_transaction(
             fault_injector=fault_injector,
         )
         marker_committed = True
+        _publish_authority_transition(
+            paths,
+            state="present",
+            operation_id=operation_id,
+            receipt=receipt,
+            request_receipt_id=request_receipt_id,
+            fault_injector=fault_injector,
+        )
         final = _verified_status(paths)
         if not final.verified or final.operation_id != operation_id:
             raise DeploymentAmbiguousError(
@@ -1729,6 +2082,8 @@ def _exchange_transaction(
                     receipt_manifest_publication.path,
                     receipt_manifest_publication.identity,
                 )
+            if request_publication is not None:
+                _unlink_exact(request_publication.path, request_publication.identity)
             if instruction_publication is not None:
                 _restore_instruction(paths, instruction_publication)
             if exchanged:
@@ -1750,15 +2105,9 @@ def _exchange_transaction(
         raise
     else:
         if instruction_publication is not None:
-            try:
-                _discard_prior_instruction(paths, instruction_publication)
-            except (DeploymentError, OSError):
-                pass
+            _discard_prior_instruction(paths, instruction_publication)
         if stage_identity is not None:
-            try:
-                _remove_tree_exact(stage, active_identity, active_cleanup_ledger)
-            except (DeploymentError, OSError):
-                pass
+            _remove_tree_exact(stage, active_identity, active_cleanup_ledger)
         return receipt
 
 
@@ -2196,57 +2545,111 @@ def _verify_installed_modes(root: Path, manifest: DeploymentManifest) -> None:
             raise DeploymentIntegrityError(f"installed member is invalid: {relative}")
 
 
+def _validated_active_authority(
+    paths: DeploymentPaths,
+) -> tuple[str, str, str | None, DeploymentReceipt, DeploymentManifest]:
+    pointer_bytes, pointer_stat = _read_regular_file(
+        paths.active_authority_file, label="active deployment authority pointer"
+    )
+    if stat.S_IMODE(pointer_stat.st_mode) != 0o600:
+        raise DeploymentIntegrityError("active authority pointer mode is invalid")
+    pointer = _canonical_mapping(pointer_bytes, label="active authority pointer")
+    if set(pointer) != {
+        "schemaVersion",
+        "domain",
+        "state",
+        "operationId",
+        "authorityDigest",
+    } or pointer.get("schemaVersion") != 1 or pointer.get(
+        "domain"
+    ) != "rsi-global-active-authority-v1":
+        raise DeploymentIntegrityError("active authority pointer schema is invalid")
+    state = pointer.get("state")
+    operation_id = pointer.get("operationId")
+    authority_digest = pointer.get("authorityDigest")
+    if state not in {"present", "absent"} or type(operation_id) is not str:
+        raise DeploymentIntegrityError("active authority pointer identity is invalid")
+    authority_bytes, authority_stat = _read_regular_file(
+        paths.authorities_root / f"{operation_id}.{state}.json",
+        label="immutable deployment authority",
+    )
+    if stat.S_IMODE(authority_stat.st_mode) != 0o600 or _sha256(
+        authority_bytes
+    ) != authority_digest:
+        raise DeploymentIntegrityError("immutable deployment authority digest is invalid")
+    authority = _canonical_mapping(authority_bytes, label="deployment authority")
+    if set(authority) != {
+        "schemaVersion",
+        "domain",
+        "state",
+        "operationId",
+        "requestReceiptId",
+        "receiptDigest",
+        "manifestDigest",
+    } or authority.get("schemaVersion") != 1 or authority.get(
+        "domain"
+    ) != "rsi-global-deployment-authority-v1" or authority.get(
+        "state"
+    ) != state or authority.get("operationId") != operation_id:
+        raise DeploymentIntegrityError("immutable deployment authority schema is invalid")
+    request_receipt_id = authority.get("requestReceiptId")
+    if request_receipt_id is not None and type(request_receipt_id) is not str:
+        raise DeploymentIntegrityError("authority request receipt ID is invalid")
+    receipt_bytes, _ = _read_regular_file(
+        paths.receipts_root / f"{operation_id}.json",
+        label="authority deployment receipt",
+    )
+    manifest_bytes, _ = _read_regular_file(
+        paths.receipts_root / f"{operation_id}.manifest.json",
+        label="authority deployment manifest",
+    )
+    receipt = DeploymentReceipt.from_bytes(receipt_bytes)
+    manifest = DeploymentManifest.from_bytes(manifest_bytes)
+    if (
+        receipt.operation_id != operation_id
+        or manifest.operation_id != operation_id
+        or receipt.manifest_byte_length != len(manifest_bytes)
+        or receipt.manifest_digest != _sha256(manifest_bytes)
+        or authority.get("receiptDigest") != _sha256(receipt_bytes)
+        or authority.get("manifestDigest") != receipt.manifest_digest
+    ):
+        raise DeploymentIntegrityError("active authority receipt binding is invalid")
+    request, _backup = _bound_operation_request(paths, manifest)
+    if request.request_receipt_id != request_receipt_id:
+        raise DeploymentIntegrityError("active authority request binding is invalid")
+    return state, operation_id, request_receipt_id, receipt, manifest
+
+
 def _verified_status(paths: DeploymentPaths) -> DeploymentStatus:
     if not paths.installed_root.exists():
-        absent_marker = paths.state_root / "absent.json"
         try:
-            absent_bytes, _ = _read_regular_file(
-                absent_marker, label="absent deployment authority"
-            )
+            dangling = os.lstat(paths.installed_root)
         except FileNotFoundError:
-            absent_bytes = None
-        except (DeploymentIntegrityError, OSError):
-            absent_bytes = b""
-        if absent_bytes:
+            dangling = None
+        except OSError:
+            dangling = object()
+        if dangling is not None:
+            return DeploymentStatus(
+                state="invalid",
+                installed=False,
+                verified=False,
+                detail="installed package destination is not absent",
+            )
+        if paths.active_authority_file.exists():
             try:
-                absent = _canonical_mapping(
-                    absent_bytes, label="absent deployment authority"
+                state, operation_id, _request_id, receipt, _manifest = (
+                    _validated_active_authority(paths)
                 )
-                if set(absent) != {
-                    "schemaVersion",
-                    "domain",
-                    "operationId",
-                    "requestReceiptId",
-                    "receiptDigest",
-                } or absent.get("schemaVersion") != 1 or absent.get(
-                    "domain"
-                ) != "rsi-global-absent-authority-v1":
-                    raise DeploymentIntegrityError("absent deployment authority is invalid")
-                operation_id = absent.get("operationId")
-                if type(operation_id) is not str:
-                    raise DeploymentIntegrityError("absent operation identity is invalid")
-                marker_bytes, _ = _read_regular_file(
-                    paths.receipts_root / f"{operation_id}.json",
-                    label="absent rollback receipt",
-                )
-                manifest_bytes, _ = _read_regular_file(
-                    paths.receipts_root / f"{operation_id}.manifest.json",
-                    label="absent rollback manifest",
-                )
-                receipt = DeploymentReceipt.from_bytes(marker_bytes)
-                if (
-                    receipt.operation_id != operation_id
-                    or receipt.manifest_byte_length != len(manifest_bytes)
-                    or receipt.manifest_digest != _sha256(manifest_bytes)
-                    or absent.get("receiptDigest") != _sha256(marker_bytes)
-                ):
-                    raise DeploymentIntegrityError("absent receipt binding is invalid")
+                if state != "absent":
+                    raise DeploymentIntegrityError(
+                        "present authority exists without an installed package"
+                    )
                 return DeploymentStatus(
                     state="not-installed",
                     installed=False,
                     verified=False,
                     operation_id=operation_id,
-                    receipt_digest=_sha256(marker_bytes),
+                    receipt_digest=_sha256(receipt.to_bytes()),
                 )
             except (DeploymentError, DeploymentSchemaError, OSError, ValueError) as error:
                 return DeploymentStatus(
@@ -2318,6 +2721,12 @@ def _verified_status(paths: DeploymentPaths) -> DeploymentStatus:
             or receipt.manifest_digest != _sha256(manifest_bytes)
         ):
             raise DeploymentAmbiguousError("deployment receipt binding is invalid")
+        _bound_operation_request(paths, manifest)
+        authority_state, authority_operation, _request_id, _authority_receipt, _authority_manifest = (
+            _validated_active_authority(paths)
+        )
+        if authority_state != "present" or authority_operation != manifest.operation_id:
+            raise DeploymentIntegrityError("active present authority differs from package")
         agents = _read_agents(paths.agents_file)
         if agents.data is None:
             raise DeploymentIntegrityError("global instruction file is missing")
@@ -2364,6 +2773,23 @@ def _rollback_initial_to_absent(
     *,
     fault_injector: _FaultInjector | None = None,
 ) -> DeploymentReceipt:
+    current_agents = _read_agents(paths.agents_file)
+    operation_backup = _create_backup(
+        paths,
+        active_manifest,
+        current_agents,
+        operation_id,
+        operation_kind="rollback",
+        request_receipt_id=receipt_id,
+        fault_injector=fault_injector,
+    )
+    request = _OperationRequest(
+        operation_id,
+        "rollback",
+        receipt_id,
+        operation_backup.path.name,
+    )
+    request_bytes = request.to_bytes()
     successor = DeploymentManifest(
         source_repository=active_manifest.source_repository,
         source_commit=active_manifest.source_commit,
@@ -2373,6 +2799,7 @@ def _rollback_initial_to_absent(
         source_tree_digest=active_manifest.source_tree_digest,
         installed_tree_digest=active_manifest.installed_tree_digest,
         managed_instruction_block_digest=active_manifest.managed_instruction_block_digest,
+        operation_request_digest=_sha256(request_bytes),
         installed_at=datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
         operation_id=operation_id,
     )
@@ -2382,7 +2809,6 @@ def _rollback_initial_to_absent(
         manifest_byte_length=len(manifest_bytes),
         manifest_digest=_sha256(manifest_bytes),
     )
-    current_agents = _read_agents(paths.agents_file)
     active_identity = _identity(os.lstat(paths.installed_root))
     active_ledger = _capture_cleanup_ledger(paths.installed_root)
     retained = _new_temporary(
@@ -2393,11 +2819,14 @@ def _rollback_initial_to_absent(
     absent_agents_temp: Path | None = None
     absent_agents_identity: tuple[int, int] | None = None
     manifest_publication: _PublishedFile | None = None
+    request_publication: _PublishedFile | None = None
     marker_publication: _PublishedFile | None = None
     try:
+        _cut(fault_injector, "uninstall.package.rename")
         if _rename_noreplace(paths.installed_root, retained) != active_identity:
             raise DeploymentAmbiguousError("atomic uninstall package identity differs")
         package_moved = True
+        _cut(fault_injector, "uninstall.package.parent_fsync")
         _fsync_directory(paths.skills_root)
         if backup.agents.data is None:
             if current_agents.data is None or current_agents.device is None or current_agents.inode is None:
@@ -2405,12 +2834,15 @@ def _rollback_initial_to_absent(
             absent_agents_temp = _new_temporary(
                 paths.codex_home, label="rsi-agents-uninstall", operation_id=operation_id
             )
+            _cut(fault_injector, "uninstall.agents.rename")
             absent_agents_identity = _rename_noreplace(
                 paths.agents_file, absent_agents_temp
             )
             if absent_agents_identity != (current_agents.device, current_agents.inode):
                 raise DeploymentAmbiguousError("atomic instruction uninstall identity differs")
+            _cut(fault_injector, "uninstall.agents.parent_fsync")
             _fsync_directory(paths.codex_home)
+            _cut(fault_injector, "uninstall.agents.readback")
             if _read_agents(paths.agents_file).data is not None:
                 raise DeploymentAmbiguousError("global instruction absence did not verify")
         else:
@@ -2424,6 +2856,13 @@ def _rollback_initial_to_absent(
                 operation_id=operation_id,
                 fault_injector=fault_injector,
             )
+        request_publication = _publish_immutable_file(
+            paths.receipts_root / f"{operation_id}.request.json",
+            request_bytes,
+            operation_id=operation_id,
+            kind="request",
+            fault_injector=fault_injector,
+        )
         manifest_publication = _publish_immutable_file(
             paths.receipts_root / f"{operation_id}.manifest.json",
             manifest_bytes,
@@ -2438,20 +2877,12 @@ def _rollback_initial_to_absent(
             kind="marker",
             fault_injector=fault_injector,
         )
-        absent_payload = canonical_json_bytes(
-            {
-                "schemaVersion": 1,
-                "domain": "rsi-global-absent-authority-v1",
-                "operationId": operation_id,
-                "requestReceiptId": receipt_id,
-                "receiptDigest": _sha256(receipt.to_bytes()),
-            }
-        )
-        _publish_immutable_file(
-            paths.state_root / "absent.json",
-            absent_payload,
+        _publish_authority_transition(
+            paths,
+            state="absent",
             operation_id=operation_id,
-            kind="absent",
+            receipt=receipt,
+            request_receipt_id=receipt_id,
             fault_injector=fault_injector,
         )
     except Exception as original_error:
@@ -2460,6 +2891,8 @@ def _rollback_initial_to_absent(
                 _unlink_exact(marker_publication.path, marker_publication.identity)
             if manifest_publication is not None:
                 _unlink_exact(manifest_publication.path, manifest_publication.identity)
+            if request_publication is not None:
+                _unlink_exact(request_publication.path, request_publication.identity)
             if agents_publication is not None:
                 _restore_instruction(paths, agents_publication)
             if absent_agents_temp is not None and absent_agents_identity is not None:
@@ -2470,6 +2903,7 @@ def _rollback_initial_to_absent(
                 if _rename_noreplace(retained, paths.installed_root) != active_identity:
                     raise DeploymentAmbiguousError("package uninstall rollback differs")
                 _fsync_directory(paths.skills_root)
+            _remove_backup_if_created(operation_backup)
         except Exception:
             raise DeploymentAmbiguousError(
                 "initial rollback failed ambiguously; evidence was preserved"
@@ -2560,7 +2994,8 @@ class GlobalRsiDeployer:
             if preflight_status.state not in {"not-installed", "verified"}:
                 raise DeploymentIntegrityError("current deployment is not verified")
         _require_atomic_backend()
-        with _exclusive_lock(self.paths, timeout=self._lock_timeout):
+        with _exclusive_lock(self.paths, timeout=self._lock_timeout) as roots:
+            fault_injector = roots.guarded(self._fault_injector)
             admitted = _admit_source(source_repo)
             replay = _operation_replay(self.paths, admitted, operation_id)
             if replay is not None:
@@ -2580,7 +3015,6 @@ class GlobalRsiDeployer:
                     raise DeploymentIntegrityError(
                         "verified deployment global instructions are unavailable"
                     )
-                successor_manifest = _manifest_for_source(admitted, operation_id)
                 return _exchange_transaction(
                     self.paths,
                     admitted,
@@ -2588,9 +3022,9 @@ class GlobalRsiDeployer:
                     current_agents,
                     agents_update.after,
                     desired_mode,
-                    successor_manifest,
+                    operation_id,
                     recheck_source=True,
-                    fault_injector=self._fault_injector,
+                    fault_injector=fault_injector,
                 )
 
             prior_agents = _read_agents(self.paths.agents_file)
@@ -2603,18 +3037,27 @@ class GlobalRsiDeployer:
             )
             if desired_mode is None:
                 raise DeploymentIntegrityError("global instruction mode is unavailable")
-            manifest = _manifest_for_source(admitted, operation_id)
+            initial_backup = _create_absent_backup(
+                self.paths,
+                prior_agents,
+                operation_id,
+                fault_injector=fault_injector,
+            )
+            request = _OperationRequest(
+                operation_id,
+                "deploy",
+                None,
+                initial_backup.path.name,
+            )
+            request_bytes = request.to_bytes()
+            manifest = _manifest_for_source(
+                admitted, operation_id, _sha256(request_bytes)
+            )
             manifest_bytes = manifest.to_bytes()
             receipt = DeploymentReceipt(
                 operation_id=operation_id,
                 manifest_byte_length=len(manifest_bytes),
                 manifest_digest=_sha256(manifest_bytes),
-            )
-            initial_backup = _create_absent_backup(
-                self.paths,
-                prior_agents,
-                manifest,
-                fault_injector=self._fault_injector,
             )
             stage = _new_temporary(
                 self.paths.skills_root,
@@ -2625,6 +3068,7 @@ class GlobalRsiDeployer:
             stage_cleanup_ledger: _CleanupLedger | None = None
             package_published = False
             instruction_publication: _PublishedInstruction | None = None
+            request_publication: _PublishedFile | None = None
             receipt_manifest_publication: _PublishedFile | None = None
             marker_committed = False
             try:
@@ -2632,18 +3076,18 @@ class GlobalRsiDeployer:
                     admitted,
                     manifest,
                     stage,
-                    fault_injector=self._fault_injector,
+                    fault_injector=fault_injector,
                 )
                 stage_cleanup_ledger = _capture_cleanup_ledger(stage)
                 _recheck_admitted_source(admitted)
 
-                _cut(self._fault_injector, "package.rename")
+                _cut(fault_injector, "package.rename")
                 _recheck_admitted_source(admitted)
                 installed_identity = _rename_noreplace(stage, self.paths.installed_root)
                 if installed_identity != stage_identity:
                     raise DeploymentAmbiguousError("installed package publication differs")
                 package_published = True
-                _cut(self._fault_injector, "package.parent.fsync")
+                _cut(fault_injector, "package.parent.fsync")
                 _fsync_directory(self.paths.skills_root)
 
                 instruction_publication = _publish_instruction(
@@ -2652,7 +3096,7 @@ class GlobalRsiDeployer:
                     agents_update.after,
                     mode=desired_mode,
                     operation_id=operation_id,
-                    fault_injector=self._fault_injector,
+                    fault_injector=fault_injector,
                 )
                 _verify_active_before_receipt(
                     self.paths,
@@ -2660,21 +3104,37 @@ class GlobalRsiDeployer:
                     agents_update.after,
                 )
 
+                request_publication = _publish_immutable_file(
+                    self.paths.receipts_root / f"{operation_id}.request.json",
+                    request_bytes,
+                    operation_id=operation_id,
+                    kind="request",
+                    fault_injector=fault_injector,
+                )
+
                 receipt_manifest_publication = _publish_immutable_file(
                     self.paths.receipts_root / f"{operation_id}.manifest.json",
                     manifest_bytes,
                     operation_id=operation_id,
                     kind="manifest",
-                    fault_injector=self._fault_injector,
+                    fault_injector=fault_injector,
                 )
                 _publish_immutable_file(
                     self.paths.receipts_root / f"{operation_id}.json",
                     receipt.to_bytes(),
                     operation_id=operation_id,
                     kind="marker",
-                    fault_injector=self._fault_injector,
+                    fault_injector=fault_injector,
                 )
                 marker_committed = True
+                _publish_authority_transition(
+                    self.paths,
+                    state="present",
+                    operation_id=operation_id,
+                    receipt=receipt,
+                    request_receipt_id=None,
+                    fault_injector=fault_injector,
+                )
                 final = _verified_status(self.paths)
                 if not final.verified or final.operation_id != operation_id:
                     raise DeploymentAmbiguousError(
@@ -2692,6 +3152,11 @@ class GlobalRsiDeployer:
                         _unlink_exact(
                             receipt_manifest_publication.path,
                             receipt_manifest_publication.identity,
+                        )
+                    if request_publication is not None:
+                        _unlink_exact(
+                            request_publication.path,
+                            request_publication.identity,
                         )
                     if instruction_publication is not None:
                         _restore_instruction(self.paths, instruction_publication)
@@ -2715,10 +3180,7 @@ class GlobalRsiDeployer:
                 raise
             else:
                 if instruction_publication is not None:
-                    try:
-                        _discard_prior_instruction(self.paths, instruction_publication)
-                    except (DeploymentError, OSError):
-                        pass
+                    _discard_prior_instruction(self.paths, instruction_publication)
                 return receipt
 
     def rollback(self, receipt_id: str, operation_id: str) -> DeploymentReceipt:
@@ -2728,41 +3190,43 @@ class GlobalRsiDeployer:
         _validate_operation_id(receipt_id)
         _validate_operation_id(operation_id)
         _require_atomic_backend()
-        with _exclusive_lock(self.paths, timeout=self._lock_timeout):
+        with _exclusive_lock(self.paths, timeout=self._lock_timeout) as roots:
+            fault_injector = roots.guarded(self._fault_injector)
             active = _active_receipt(self.paths)
             if active is None:
-                absent_path = self.paths.state_root / "absent.json"
                 try:
-                    absent_bytes, _ = _read_regular_file(
-                        absent_path, label="absent deployment authority"
-                    )
-                    absent = _canonical_mapping(
-                        absent_bytes, label="absent deployment authority"
+                    state, active_operation, active_request, replay, _manifest = (
+                        _validated_active_authority(self.paths)
                     )
                 except (DeploymentError, OSError):
                     raise DeploymentIntegrityError("cannot rollback a missing deployment") from None
                 if (
-                    absent.get("operationId") != operation_id
-                    or absent.get("requestReceiptId") != receipt_id
+                    state != "absent"
+                    or active_operation != operation_id
+                    or active_request != receipt_id
                 ):
                     raise DeploymentOperationConflict(
                         "absent rollback replay conflicts with immutable authority"
                     )
-                replay_bytes, _ = _read_regular_file(
-                    self.paths.receipts_root / f"{operation_id}.json",
-                    label="absent rollback receipt",
-                )
-                replay = DeploymentReceipt.from_bytes(replay_bytes)
-                if absent.get("receiptDigest") != _sha256(replay_bytes):
-                    raise DeploymentIntegrityError("absent rollback receipt binding is invalid")
                 return replay
 
             requested_marker = self.paths.receipts_root / f"{operation_id}.json"
             requested_manifest = (
                 self.paths.receipts_root / f"{operation_id}.manifest.json"
             )
-            if requested_marker.exists() or requested_manifest.exists():
-                if not requested_marker.exists() or not requested_manifest.exists():
+            requested_request = (
+                self.paths.receipts_root / f"{operation_id}.request.json"
+            )
+            if (
+                requested_marker.exists()
+                or requested_manifest.exists()
+                or requested_request.exists()
+            ):
+                if (
+                    not requested_marker.exists()
+                    or not requested_manifest.exists()
+                    or not requested_request.exists()
+                ):
                     raise DeploymentAmbiguousError(
                         "rollback operation has partial immutable authority"
                     )
@@ -2774,10 +3238,8 @@ class GlobalRsiDeployer:
                 )
                 replay_receipt = DeploymentReceipt.from_bytes(receipt_bytes)
                 replay_manifest = DeploymentManifest.from_bytes(manifest_bytes)
-                replay_backup = _find_backup_for_successor(self.paths, operation_id)
-                replay_metadata = _canonical_mapping(
-                    replay_backup.identity_payload,
-                    label="rollback replay backup metadata",
+                replay_request, _replay_backup = _bound_operation_request(
+                    self.paths, replay_manifest
                 )
                 if (
                     active[0].operation_id == operation_id
@@ -2785,17 +3247,21 @@ class GlobalRsiDeployer:
                     and replay_receipt.operation_id == operation_id
                     and replay_receipt.manifest_byte_length == len(manifest_bytes)
                     and replay_receipt.manifest_digest == _sha256(manifest_bytes)
-                    and replay_metadata.get("operationKind") == "rollback"
-                    and replay_metadata.get("requestReceiptId") == receipt_id
+                    and replay_request.operation_kind == "rollback"
+                    and replay_request.request_receipt_id == receipt_id
                 ):
                     return replay_receipt
                 raise DeploymentOperationConflict(
                     "rollback operation ID conflicts with immutable authority"
                 )
 
-            backup = _find_backup_for_successor(
-                self.paths, active[0].operation_id
+            active_request, backup = _bound_operation_request(
+                self.paths, active[0]
             )
+            if active_request.operation_kind != "deploy":
+                raise DeploymentOperationConflict(
+                    "active operation is not a rollback source deployment"
+                )
             if backup.prior_manifest is None:
                 if receipt_id != active[0].operation_id:
                     raise DeploymentOperationConflict(
@@ -2807,7 +3273,7 @@ class GlobalRsiDeployer:
                     backup,
                     receipt_id,
                     operation_id,
-                    fault_injector=self._fault_injector,
+                    fault_injector=fault_injector,
                 )
             if receipt_id != active[0].operation_id:
                 if receipt_id != backup.prior_manifest.operation_id:
@@ -2837,16 +3303,6 @@ class GlobalRsiDeployer:
                     raise DeploymentIntegrityError(
                         "immediately preceding rollback receipt is invalid"
                     )
-            backup_metadata = _canonical_mapping(
-                backup.identity_payload,
-                label="deployment backup metadata",
-            )
-            if backup_metadata.get("successorManifestDigest") != _sha256(
-                active[0].to_bytes()
-            ):
-                raise DeploymentIntegrityError(
-                    "rollback backup is not bound to the selected receipt"
-                )
             if backup.agents.data is None or backup.agents.mode is None:
                 raise DeploymentUnsupported(
                     "rollback to an absent global instruction file is not available"
@@ -2881,20 +3337,6 @@ class GlobalRsiDeployer:
                 snapshot=snapshot,
                 allowlist_digest=backup.prior_manifest.production_allowlist_digest,
             )
-            successor_manifest = DeploymentManifest(
-                source_repository=backup.prior_manifest.source_repository,
-                source_commit=backup.prior_manifest.source_commit,
-                package_relative_path=PACKAGE_RELATIVE_PATH,
-                production_allowlist_digest=backup.prior_manifest.production_allowlist_digest,
-                file_entries=backup.prior_manifest.file_entries,
-                source_tree_digest=backup.prior_manifest.source_tree_digest,
-                installed_tree_digest=backup.prior_manifest.installed_tree_digest,
-                managed_instruction_block_digest=backup.prior_manifest.managed_instruction_block_digest,
-                installed_at=datetime.now(timezone.utc)
-                .replace(microsecond=0)
-                .strftime("%Y-%m-%dT%H:%M:%SZ"),
-                operation_id=operation_id,
-            )
             current_agents = _read_agents(self.paths.agents_file)
             if current_agents.data is None or current_agents.mode is None:
                 raise DeploymentIntegrityError(
@@ -2907,11 +3349,11 @@ class GlobalRsiDeployer:
                 current_agents,
                 backup.agents.data,
                 backup.agents.mode,
-                successor_manifest,
+                operation_id,
                 recheck_source=False,
                 operation_kind="rollback",
                 request_receipt_id=receipt_id,
-                fault_injector=self._fault_injector,
+                fault_injector=fault_injector,
             )
 
     def verify(self) -> DeploymentStatus:

@@ -49,6 +49,7 @@ _MANIFEST_KEYS = frozenset(
         "sourceTreeDigest",
         "installedTreeDigest",
         "managedInstructionBlockDigest",
+        "operationRequestDigest",
         "installedAt",
         "operationId",
     }
@@ -306,6 +307,7 @@ class DeploymentManifest:
     source_tree_digest: str
     installed_tree_digest: str
     managed_instruction_block_digest: str
+    operation_request_digest: str
     installed_at: str
     operation_id: str
     schema_version: int = 1
@@ -367,6 +369,7 @@ class DeploymentManifest:
             self.managed_instruction_block_digest,
             label="managed instruction block",
         )
+        _require_digest(self.operation_request_digest, label="operation request")
         _require_timestamp(self.installed_at)
         _require_operation_id(self.operation_id)
         if len(canonical_json_bytes(self.to_mapping())) > MAX_MANIFEST_BYTES:
@@ -393,6 +396,7 @@ class DeploymentManifest:
             source_tree_digest=mapping["sourceTreeDigest"],  # type: ignore[arg-type]
             installed_tree_digest=mapping["installedTreeDigest"],  # type: ignore[arg-type]
             managed_instruction_block_digest=mapping["managedInstructionBlockDigest"],  # type: ignore[arg-type]
+            operation_request_digest=mapping["operationRequestDigest"],  # type: ignore[arg-type]
             installed_at=mapping["installedAt"],  # type: ignore[arg-type]
             operation_id=mapping["operationId"],  # type: ignore[arg-type]
         )
@@ -418,6 +422,7 @@ class DeploymentManifest:
             "sourceTreeDigest": self.source_tree_digest,
             "installedTreeDigest": self.installed_tree_digest,
             "managedInstructionBlockDigest": self.managed_instruction_block_digest,
+            "operationRequestDigest": self.operation_request_digest,
             "installedAt": self.installed_at,
             "operationId": self.operation_id,
         }

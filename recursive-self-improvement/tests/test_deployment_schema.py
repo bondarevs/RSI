@@ -52,6 +52,7 @@ def manifest_fixture() -> dict[str, object]:
         "sourceTreeDigest": TREE_DIGEST,
         "installedTreeDigest": TREE_DIGEST,
         "managedInstructionBlockDigest": DIGEST_A,
+        "operationRequestDigest": DIGEST_D,
         "installedAt": "2026-08-13T10:11:12Z",
         "operationId": "deploy-20260813-101112",
     }
@@ -103,6 +104,7 @@ def test_manifest_has_exact_canonical_bytes_and_acyclic_membership() -> None:
         b'"installedTreeDigest":"sha256:216fe03013da28e67ed8062a49536f56b8e6e7e1405c2e80d6496b072e294f39",'
         b'"managedInstructionBlockDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
         b'"mode":"observe","operationId":"deploy-20260813-101112",'
+        b'"operationRequestDigest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",'
         b'"packageRelativePath":"recursive-self-improvement",'
         b'"productionAllowlistDigest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
         b'"productionAllowlistEntryCount":0,"schemaVersion":1,"sourceCommit":"1111111111111111111111111111111111111111",'

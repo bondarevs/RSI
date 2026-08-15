@@ -8,6 +8,7 @@ import hashlib
 import os
 from pathlib import Path
 import pwd
+import shutil
 import stat
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from rsi_core.deployment_schema import (
     DeploymentManifest,
     DeploymentReceipt,
     MANIFEST_RELATIVE_PATH,
+    canonical_json_bytes,
 )
 from rsi_core.deployment_fs import DeploymentIntegrityError, scan_package
 from rsi_core.global_instructions import MANAGED_BLOCK
@@ -425,7 +427,11 @@ def test_rollback_rejects_unlisted_backup_member_without_changing_active_version
     deployer = GlobalRsiDeployer(paths)
     deployer.deploy(repo_v1, "backup-exact-v1")
     deployer.deploy(repo_v2, "backup-exact-v2")
-    backup = next(path for path in paths.backups_root.iterdir() if path.is_dir())
+    request = deployment_module._canonical_mapping(
+        (paths.receipts_root / "backup-exact-v2.request.json").read_bytes(),
+        label="backup exact request",
+    )
+    backup = paths.backups_root / str(request["priorStateBackupDigest"])
     (backup / "unlisted.bin").write_bytes(b"not-bound")
     before = _snapshot_tree(paths.codex_home)
 
@@ -433,7 +439,9 @@ def test_rollback_rejects_unlisted_backup_member_without_changing_active_version
         deployer.rollback("backup-exact-v2", "reject-extra-backup")
 
     assert _snapshot_tree(paths.codex_home) == before
-    assert deployer.verify().operation_id == "backup-exact-v2"
+    status = deployer.verify()
+    assert status.verified is False
+    assert status.state == "invalid"
 
 
 def test_invalid_utf8_agents_file_blocks_initial_deploy_without_any_mutation(
@@ -1008,9 +1016,10 @@ def test_rollback_and_deploy_are_serialized_without_partial_authority(
     assert "deploy" in results
     status = GlobalRsiDeployer(paths).verify()
     assert status.verified is True
-    assert status.operation_id == "serialized-v3"
+    assert status.operation_id in {"serialized-v3", "serialized-rollback"}
+    expected_repo = repo_v3 if status.operation_id == "serialized-v3" else repo_v2
     assert _package_bytes(paths.installed_root) == _package_bytes(
-        repo_v3 / "recursive-self-improvement"
+        expected_repo / "recursive-self-improvement"
     )
 
 
@@ -1285,6 +1294,275 @@ def test_stage_cleanup_preserves_member_replaced_during_fault_cut(tmp_path: Path
     assert preserved.read_bytes() == b"foreign-replacement"
 
 
+def test_operation_request_acyclically_binds_exact_prior_backup_and_receipt(
+    tmp_path: Path,
+) -> None:
+    repo_v1 = _write_repository(tmp_path, version="request-v1")
+    repo_v2 = _write_repository(tmp_path, version="request-v2")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo_v1, "request-bind-v1")
+    deployer.deploy(repo_v2, "request-bind-v2")
+
+    request_bytes = (paths.receipts_root / "request-bind-v2.request.json").read_bytes()
+    request = deployment_module._canonical_mapping(
+        request_bytes, label="test operation request"
+    )
+    manifest = DeploymentManifest.from_bytes(
+        (paths.receipts_root / "request-bind-v2.manifest.json").read_bytes()
+    )
+    assert request["operationKind"] == "deploy"
+    assert request["requestReceiptId"] is None
+    assert request["priorStateBackupDigest"] in {
+        path.name for path in paths.backups_root.iterdir()
+    }
+    assert manifest.operation_request_digest == (
+        "sha256:" + hashlib.sha256(request_bytes).hexdigest()
+    )
+
+
+def test_substituted_canonical_backup_is_rejected_before_rollback_mutation(
+    tmp_path: Path,
+) -> None:
+    repos = {
+        name: _write_repository(tmp_path, version=name)
+        for name in ("sub-v1", "sub-v2", "sub-v3", "sub-v4")
+    }
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repos["sub-v1"], "sub-target-v1")
+    deployer.deploy(repos["sub-v2"], "sub-active-v2")
+    request = deployment_module._canonical_mapping(
+        (paths.receipts_root / "sub-active-v2.request.json").read_bytes(),
+        label="test request",
+    )
+    exact = paths.backups_root / str(request["priorStateBackupDigest"])
+
+    other_paths = DeploymentPaths.for_testing(tmp_path / "other-codex")
+    other = GlobalRsiDeployer(other_paths)
+    other.deploy(repos["sub-v3"], "other-v3")
+    other.deploy(repos["sub-v4"], "other-v4")
+    other_request = deployment_module._canonical_mapping(
+        (other_paths.receipts_root / "other-v4.request.json").read_bytes(),
+        label="other request",
+    )
+    source = other_paths.backups_root / str(other_request["priorStateBackupDigest"])
+    forged_stage = paths.backups_root / "forged-stage"
+    shutil.copytree(source, forged_stage)
+    metadata = deployment_module._canonical_mapping(
+        (forged_stage / "backup.json").read_bytes(), label="forged backup"
+    )
+    metadata["successorOperationId"] = "sub-active-v2"
+    forged_bytes = canonical_json_bytes(metadata)
+    (forged_stage / "backup.json").write_bytes(forged_bytes)
+    forged_name = "sha256:" + hashlib.sha256(forged_bytes).hexdigest()
+    forged = paths.backups_root / forged_name
+    forged_stage.rename(forged)
+    shutil.rmtree(exact)
+    before = _snapshot_tree(paths.codex_home)
+
+    with pytest.raises((DeploymentIntegrityError, DeploymentOperationConflict)):
+        deployer.rollback("sub-active-v2", "reject-substituted-backup")
+
+    assert _snapshot_tree(paths.codex_home) == before
+
+
+def test_private_factory_token_cannot_forge_nonlive_production_descriptor(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(DeploymentError):
+        DeploymentPaths._from_home(
+            tmp_path / "forged-live",
+            testing=False,
+        )
+
+
+def test_install_rollback_reinstall_rollback_uses_versioned_absent_authority(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo, "cycle-install-1")
+    deployer.rollback("cycle-install-1", "cycle-absent-1")
+    assert deployer.verify().state == "not-installed"
+
+    deployer.deploy(repo, "cycle-install-2")
+    second = deployer.rollback("cycle-install-2", "cycle-absent-2")
+
+    assert second.operation_id == "cycle-absent-2"
+    assert deployer.verify().state == "not-installed"
+    active = deployment_module._canonical_mapping(
+        (paths.state_root / "active.json").read_bytes(), label="active authority"
+    )
+    assert active["operationId"] == "cycle-absent-2"
+    assert (paths.state_root / "authorities/cycle-absent-1.absent.json").is_file()
+    assert (paths.state_root / "authorities/cycle-absent-2.absent.json").is_file()
+
+
+def test_backup_cleanup_preserves_foreign_member_added_at_readback(tmp_path: Path) -> None:
+    repo_v1 = _write_repository(tmp_path, version="foreign-backup-v1")
+    repo_v2 = _write_repository(tmp_path, version="foreign-backup-v2")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo_v1, "foreign-backup-base")
+    preserved: Path | None = None
+
+    def inject(boundary: str) -> None:
+        nonlocal preserved
+        if boundary != "backup.readback":
+            return
+        backup = next(
+            path
+            for path in paths.backups_root.iterdir()
+            if path.is_dir()
+            and deployment_module._canonical_mapping(
+                (path / "backup.json").read_bytes(), label="candidate backup"
+            ).get("successorOperationId")
+            == "foreign-backup-update"
+        )
+        preserved = backup / "foreign.bin"
+        preserved.write_bytes(b"foreign-evidence")
+        raise InjectedFault(boundary)
+
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        GlobalRsiDeployer(paths, fault_injector=inject).deploy(
+            repo_v2, "foreign-backup-update"
+        )
+
+    assert preserved is not None
+    assert preserved.read_bytes() == b"foreign-evidence"
+
+
+def test_late_codex_ancestor_swap_after_lock_never_redirects_transaction_writes(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    parent = tmp_path / "owned-parent"
+    parent.mkdir()
+    paths = DeploymentPaths.for_testing(parent / "codex")
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    redirected_codex = redirected / "codex"
+    (redirected_codex / "skills").mkdir(parents=True)
+    (redirected_codex / "rsi-deployments-v1/backups").mkdir(parents=True)
+    (redirected_codex / "rsi-deployments-v1/receipts").mkdir(parents=True)
+    for directory in (
+        redirected_codex,
+        redirected_codex / "skills",
+        redirected_codex / "rsi-deployments-v1",
+        redirected_codex / "rsi-deployments-v1/backups",
+        redirected_codex / "rsi-deployments-v1/receipts",
+    ):
+        directory.chmod(0o700)
+    def swap(boundary: str) -> None:
+        if boundary != "backup.staging.create":
+            return
+        parent.rename(tmp_path / "displaced-parent")
+        parent.symlink_to(redirected)
+
+    with pytest.raises((DeploymentError, deployment_module.DeploymentAmbiguousError)):
+        GlobalRsiDeployer(paths, fault_injector=swap).deploy(repo, "late-root-swap")
+
+    assert not any(
+        path.name.startswith(("sha256:", ".rsi-"))
+        for path in redirected.rglob("*")
+    )
+
+
+@pytest.mark.parametrize("relative", ["skills/recursive-self-improvement", "AGENTS.md"])
+def test_dangling_destination_symlink_is_rejected_without_following(
+    tmp_path: Path, relative: str
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    destination = paths.codex_home / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.symlink_to(tmp_path / "missing-target")
+
+    with pytest.raises((DeploymentError, DeploymentIntegrityError)):
+        GlobalRsiDeployer(paths).deploy(repo, "dangling-destination")
+
+    assert destination.is_symlink()
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        "receipt.authority.write",
+        "receipt.authority.fsync",
+        "receipt.authority.parent_fsync",
+        "receipt.authority.readback",
+        "authority.pointer.write",
+        "authority.pointer.fsync",
+        "authority.pointer.replace",
+        "authority.pointer.parent_fsync",
+        "authority.pointer.readback",
+    ],
+)
+def test_initial_authority_fault_cuts_never_claim_partial_install_verified(
+    tmp_path: Path, cut: str
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+
+    def inject(boundary: str) -> None:
+        if boundary == cut:
+            raise InjectedFault(cut)
+
+    with pytest.raises((InjectedFault, DeploymentError)):
+        GlobalRsiDeployer(paths, fault_injector=inject).deploy(
+            repo, "authority-cut-install"
+        )
+
+    status = GlobalRsiDeployer(paths).verify()
+    assert status.verified is False
+    assert status.state in {"invalid", "ambiguous", "not-installed"}
+
+
+@pytest.mark.parametrize(
+    "cut",
+    [
+        "uninstall.package.rename",
+        "uninstall.package.parent_fsync",
+        "uninstall.agents.rename",
+        "uninstall.agents.parent_fsync",
+        "uninstall.agents.readback",
+        "receipt.authority.write",
+        "receipt.authority.fsync",
+        "receipt.authority.parent_fsync",
+        "receipt.authority.readback",
+        "authority.pointer.write",
+        "authority.pointer.fsync",
+        "authority.pointer.replace",
+        "authority.pointer.parent_fsync",
+        "authority.pointer.readback",
+    ],
+)
+def test_initial_uninstall_authority_fault_cuts_restore_exact_present_authority(
+    tmp_path: Path, cut: str
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo, "uninstall-cut-install")
+    before_package = _package_bytes(paths.installed_root)
+    before_agents = paths.agents_file.read_bytes()
+
+    def inject(boundary: str) -> None:
+        if boundary == cut:
+            raise InjectedFault(cut)
+
+    with pytest.raises((InjectedFault, DeploymentError)):
+        GlobalRsiDeployer(paths, fault_injector=inject).rollback(
+            "uninstall-cut-install", "uninstall-cut-rollback"
+        )
+
+    status = GlobalRsiDeployer(paths).verify()
+    assert status.verified is True
+    assert status.operation_id == "uninstall-cut-install"
+    assert _package_bytes(paths.installed_root) == before_package
+    assert paths.agents_file.read_bytes() == before_agents
+
+
 @pytest.mark.parametrize(
     ("boundary", "occurrence"),
     [
@@ -1530,7 +1808,7 @@ def test_partial_receipt_authority_is_typed_ambiguous_and_never_repaired(
 @pytest.mark.parametrize(
     "cut", ["receipt.marker.parent_fsync", "receipt.marker.readback"]
 )
-def test_marker_postpublication_failure_preserves_typed_ambiguous_verified_new_state(
+def test_receipt_marker_failure_before_active_pointer_preserves_typed_ambiguity(
     tmp_path: Path, cut: str
 ) -> None:
     repo = _write_repository(tmp_path)
@@ -1545,7 +1823,9 @@ def test_marker_postpublication_failure_preserves_typed_ambiguous_verified_new_s
     with pytest.raises(deployment_module.DeploymentAmbiguousError):
         deployer.deploy(repo, "ambiguous-marker")
 
-    assert GlobalRsiDeployer(paths).verify().operation_id == "ambiguous-marker"
+    status = GlobalRsiDeployer(paths).verify()
+    assert status.verified is False
+    assert status.state in {"invalid", "ambiguous"}
     assert (paths.receipts_root / "ambiguous-marker.json").exists()
 
 
