@@ -441,15 +441,170 @@ def _ensure_directory(path: Path, *, exact_private: bool) -> None:
         raise DeploymentIntegrityError(f"private deployment directory mode is invalid: {path.name}")
 
 
-def _ensure_lock_root(paths: DeploymentPaths) -> None:
-    """Create only the ancestry required to publish and acquire the lock."""
+def _validate_open_directory(
+    descriptor: int, *, exact_private: bool, label: str
+) -> tuple[int, int]:
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+        raise DeploymentIntegrityError(f"deployment directory is unsafe: {label}")
+    mode = stat.S_IMODE(metadata.st_mode)
+    if metadata.st_mode & (
+        stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+    ):
+        raise DeploymentIntegrityError(f"deployment directory mode is unsafe: {label}")
+    if exact_private and mode != 0o700:
+        raise DeploymentIntegrityError(
+            f"private deployment directory mode is invalid: {label}"
+        )
+    return _identity(metadata)
 
-    _ensure_directory(paths.codex_home, exact_private=False)
-    _ensure_directory(paths.state_root, exact_private=True)
+
+def _open_exact_codex_home(path: Path) -> int:
+    if not path.is_absolute() or path == Path("/"):
+        raise DeploymentIntegrityError("Codex home path is invalid")
+    descriptor = os.open(
+        "/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC
+    )
+    try:
+        components = path.parts[1:]
+        for index, component in enumerate(components):
+            if component in {"", ".", ".."} or "/" in component or "\x00" in component:
+                raise DeploymentIntegrityError("Codex home component is unsafe")
+            final = index == len(components) - 1
+            if final:
+                child = _ensure_child_directory_fd(
+                    descriptor, component, exact_private=False
+                )
+                os.close(descriptor)
+                descriptor = child
+                continue
+            try:
+                child = os.open(
+                    component,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | _NOFOLLOW
+                    | _CLOEXEC,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                raise DeploymentError("Codex home ancestry is unavailable") from None
+            except OSError:
+                raise DeploymentIntegrityError("cannot open Codex home ancestry safely") from None
+            os.close(descriptor)
+            descriptor = child
+        expected = _validate_open_directory(
+            descriptor, exact_private=False, label=path.name
+        )
+        try:
+            named = os.lstat(path)
+        except OSError:
+            raise DeploymentAmbiguousError("Codex home changed during bootstrap") from None
+        if not stat.S_ISDIR(named.st_mode) or _identity(named) != expected:
+            raise DeploymentAmbiguousError("Codex home identity changed during bootstrap")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _ensure_child_directory_fd(
+    parent_fd: int, name: str, *, exact_private: bool
+) -> int:
+    if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+        raise DeploymentIntegrityError("deployment child name is unsafe")
+    child: int | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        child = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+            created_metadata = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if not stat.S_ISDIR(created_metadata.st_mode):
+                raise DeploymentAmbiguousError(
+                    "created deployment directory changed type"
+                )
+            created_identity = _identity(created_metadata)
+            child = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | _NOFOLLOW
+                | _CLOEXEC,
+                dir_fd=parent_fd,
+            )
+        except DeploymentAmbiguousError:
+            raise
+        except OSError as original_error:
+            if created_identity is not None:
+                try:
+                    named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    if (
+                        not stat.S_ISDIR(named.st_mode)
+                        or _identity(named) != created_identity
+                    ):
+                        raise DeploymentAmbiguousError(
+                            "created deployment directory changed before cleanup"
+                        )
+                    os.rmdir(name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                except DeploymentAmbiguousError:
+                    raise
+                except OSError:
+                    raise DeploymentAmbiguousError(
+                        "created deployment directory cleanup is ambiguous"
+                    ) from original_error
+            raise DeploymentError(f"cannot create deployment directory: {name}") from None
+    except OSError:
+        raise DeploymentIntegrityError(f"cannot open deployment directory: {name}") from None
+    try:
+        assert child is not None
+        if created_identity is not None:
+            if _identity(os.fstat(child)) != created_identity:
+                raise DeploymentAmbiguousError(
+                    "created deployment directory changed while opening"
+                )
+            os.fchmod(child, 0o700)
+            os.fsync(child)
+            os.fsync(parent_fd)
+        _validate_open_directory(child, exact_private=exact_private, label=name)
+        return child
+    except Exception as original_error:
+        os.close(child)
+        if created_identity is not None:
+            try:
+                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(named.st_mode)
+                    or _identity(named) != created_identity
+                ):
+                    raise DeploymentAmbiguousError(
+                        "created deployment directory changed before cleanup"
+                    )
+                os.rmdir(name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except DeploymentAmbiguousError:
+                raise
+            except OSError:
+                raise DeploymentAmbiguousError(
+                    "created deployment directory cleanup is ambiguous"
+                ) from original_error
+        raise
 
 
 class _RetainedRoots:
-    def __init__(self, paths: DeploymentPaths) -> None:
+    def __init__(
+        self,
+        paths: DeploymentPaths,
+        retained: dict[Path, int] | None = None,
+    ) -> None:
         self._entries: list[tuple[Path, int, tuple[int, int]]] = []
         try:
             for path in (
@@ -460,7 +615,11 @@ class _RetainedRoots:
                 paths.backups_root,
                 paths.authorities_root,
             ):
-                descriptor = _open_parent(path)
+                descriptor = (
+                    os.dup(retained[path])
+                    if retained is not None and path in retained
+                    else _open_parent(path)
+                )
                 metadata = os.fstat(descriptor)
                 self._entries.append((path, descriptor, _identity(metadata)))
         except Exception:
@@ -539,43 +698,55 @@ class _RetainedRoots:
 
 
 @contextmanager
-def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
-    _ensure_lock_root(paths)
+def _exclusive_lock(
+    paths: DeploymentPaths,
+    *,
+    timeout: float = 5.0,
+    fault_injector: _FaultInjector | None = None,
+):
+    codex_fd = _open_exact_codex_home(paths.codex_home)
+    state_fd: int | None = None
+    child_fds: list[int] = []
+    descriptor: int | None = None
     flags = os.O_RDWR | os.O_CLOEXEC | _NOFOLLOW
     created = False
     try:
-        named = os.lstat(paths.lock_file)
-    except FileNotFoundError:
+        state_fd = _ensure_child_directory_fd(
+            codex_fd, paths.state_root.name, exact_private=True
+        )
         try:
-            descriptor = os.open(paths.lock_file, flags | os.O_CREAT | os.O_EXCL, 0o600)
-            created = True
-        except FileExistsError:
+            named = os.stat(
+                paths.lock_file.name, dir_fd=state_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
             try:
-                named = os.lstat(paths.lock_file)
-                if (
-                    not stat.S_ISREG(named.st_mode)
-                    or named.st_uid != os.geteuid()
-                    or named.st_nlink != 1
-                    or stat.S_IMODE(named.st_mode) != 0o600
-                ):
-                    raise DeploymentIntegrityError("deployment lock identity is unsafe")
-                descriptor = os.open(paths.lock_file, flags)
-            except DeploymentIntegrityError:
-                raise
+                descriptor = os.open(
+                    paths.lock_file.name,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=state_fd,
+                )
+                created = True
+                named = os.fstat(descriptor)
+            except FileExistsError:
+                named = os.stat(
+                    paths.lock_file.name, dir_fd=state_fd, follow_symlinks=False
+                )
+                descriptor = os.open(
+                    paths.lock_file.name, flags, dir_fd=state_fd
+                )
             except OSError:
-                raise DeploymentError("cannot open the raced deployment lock safely") from None
-        except OSError:
-            raise DeploymentError("cannot create the deployment lock safely") from None
-        if created:
-            try:
+                raise DeploymentError("cannot create deployment lock safely") from None
+            if created:
                 os.fsync(descriptor)
-                _fsync_directory(paths.state_root)
-            except Exception:
-                os.close(descriptor)
-                raise
-    except OSError:
-        raise DeploymentIntegrityError("cannot inspect the deployment lock safely") from None
-    else:
+                os.fsync(state_fd)
+        except OSError:
+            raise DeploymentIntegrityError("cannot inspect deployment lock safely") from None
+        else:
+            try:
+                descriptor = os.open(paths.lock_file.name, flags, dir_fd=state_fd)
+            except OSError:
+                raise DeploymentError("cannot open deployment lock safely") from None
         if (
             not stat.S_ISREG(named.st_mode)
             or named.st_uid != os.geteuid()
@@ -583,17 +754,14 @@ def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
             or stat.S_IMODE(named.st_mode) != 0o600
         ):
             raise DeploymentIntegrityError("deployment lock identity is unsafe")
-        try:
-            descriptor = os.open(paths.lock_file, flags)
-        except OSError:
-            raise DeploymentError("cannot open the deployment lock safely") from None
-    try:
+        assert descriptor is not None
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) != 0o600
+            or _identity(metadata) != _identity(named)
         ):
             raise DeploymentIntegrityError("deployment lock identity is unsafe")
         deadline = time.monotonic() + timeout
@@ -607,17 +775,46 @@ def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
                 time.sleep(0.01)
             except InterruptedError:
                 continue
-        try:
-            named_after = os.lstat(paths.lock_file)
-        except OSError:
-            raise DeploymentIntegrityError("deployment lock disappeared after locking") from None
+        _cut(fault_injector, "bootstrap.after_flock")
+        named_after = os.stat(
+            paths.lock_file.name, dir_fd=state_fd, follow_symlinks=False
+        )
         if _identity(named_after) != _identity(metadata) or named_after.st_mode != metadata.st_mode:
             raise DeploymentIntegrityError("deployment lock changed after locking")
-        _ensure_directory(paths.skills_root, exact_private=False)
-        _ensure_directory(paths.receipts_root, exact_private=True)
-        _ensure_directory(paths.backups_root, exact_private=True)
-        _ensure_directory(paths.authorities_root, exact_private=True)
-        roots = _RetainedRoots(paths)
+        try:
+            named_home = os.lstat(paths.codex_home)
+        except OSError:
+            raise DeploymentAmbiguousError(
+                "Codex home changed after locking; retained evidence was preserved"
+            ) from None
+        if _identity(named_home) != _identity(os.fstat(codex_fd)):
+            raise DeploymentAmbiguousError(
+                "Codex home identity changed after locking; retained evidence was preserved"
+            )
+        skills_fd = _ensure_child_directory_fd(
+            codex_fd, paths.skills_root.name, exact_private=False
+        )
+        receipts_fd = _ensure_child_directory_fd(
+            state_fd, paths.receipts_root.name, exact_private=True
+        )
+        backups_fd = _ensure_child_directory_fd(
+            state_fd, paths.backups_root.name, exact_private=True
+        )
+        authorities_fd = _ensure_child_directory_fd(
+            state_fd, paths.authorities_root.name, exact_private=True
+        )
+        child_fds.extend([skills_fd, receipts_fd, backups_fd, authorities_fd])
+        roots = _RetainedRoots(
+            paths,
+            {
+                paths.codex_home: codex_fd,
+                paths.skills_root: skills_fd,
+                paths.state_root: state_fd,
+                paths.receipts_root: receipts_fd,
+                paths.backups_root: backups_fd,
+                paths.authorities_root: authorities_fd,
+            },
+        )
         token: Token[_RetainedRoots | None] | None = None
         try:
             roots.validate()
@@ -629,10 +826,17 @@ def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
             roots.close()
     finally:
         try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            if descriptor is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
         except OSError:
             pass
-        os.close(descriptor)
+        if descriptor is not None:
+            os.close(descriptor)
+        for child_fd in reversed(child_fds):
+            os.close(child_fd)
+        if state_fd is not None:
+            os.close(state_fd)
+        os.close(codex_fd)
 
 
 @contextmanager
@@ -1286,7 +1490,12 @@ def _unlink_exact(path: Path, expected_identity: tuple[int, int]) -> None:
         os.close(parent_fd)
 
 
-def _cleanup_created_file(path: Path) -> None:
+def _cleanup_created_file(
+    path: Path,
+    expected_identity: tuple[int, int],
+    expected_mode: int,
+    expected_nlink: int = 1,
+) -> None:
     parent_fd, name = _descriptor_parent(path)
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1296,10 +1505,25 @@ def _cleanup_created_file(path: Path) -> None:
     try:
         if (
             not stat.S_ISREG(metadata.st_mode)
+            or _identity(metadata) != expected_identity
             or metadata.st_uid != os.geteuid()
-            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+            or metadata.st_nlink != expected_nlink
         ):
-            raise DeploymentAmbiguousError("private transaction file is unsafe to clean")
+            raise DeploymentAmbiguousError(
+                "private transaction file changed before exact cleanup"
+            )
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or _identity(metadata) != expected_identity
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+            or metadata.st_nlink != expected_nlink
+        ):
+            raise DeploymentAmbiguousError(
+                "private transaction file changed immediately before cleanup"
+            )
         os.unlink(name, dir_fd=parent_fd)
         os.fsync(parent_fd)
     finally:
@@ -1318,6 +1542,7 @@ def _publish_instruction(
     if prior.data == desired and prior.mode == mode:
         return _PublishedInstruction(False, prior, None, None, None)
     temporary = _new_temporary(paths.codex_home, label="rsi-agents", operation_id=operation_id)
+    new_identity: tuple[int, int] | None = None
     active_identity: tuple[int, int] | None = None
     old_identity: tuple[int, int] | None = None
     try:
@@ -1369,7 +1594,8 @@ def _publish_instruction(
                     ),
                 )
             else:
-                _cleanup_created_file(temporary)
+                if new_identity is not None:
+                    _cleanup_created_file(temporary, new_identity, mode)
         except Exception:
             raise DeploymentAmbiguousError(
                 "global instruction publication rollback failed; evidence was preserved"
@@ -1432,7 +1658,6 @@ def _publish_immutable_file(
             fsync_boundary=f"receipt.{kind}.fsync",
         )
     except Exception:
-        _cleanup_created_file(temporary)
         raise
     try:
         published_identity = _rename_noreplace(temporary, path)
@@ -1560,7 +1785,7 @@ def _publish_active_pointer(
         try:
             current, current_stat = _read_regular_file(path, label="active authority")
         except DeploymentIntegrityError:
-            _cleanup_created_file(temporary)
+            _cleanup_created_file(temporary, identity, 0o600)
             raise original_error
         if _identity(current_stat) == identity:
             if prior_bytes is None:
@@ -1633,9 +1858,20 @@ def _rollback_authority_transition(
 
 
 def _finalize_authority_transition(
-    paths: DeploymentPaths, transition: _AuthorityTransition
+    paths: DeploymentPaths,
+    transition: _AuthorityTransition,
+    *,
+    fault_injector: _FaultInjector | None = None,
 ) -> None:
-    _discard_pointer_prior(paths, transition.pointer)
+    try:
+        _cut(fault_injector, "finalize.pointer")
+        _discard_pointer_prior(paths, transition.pointer)
+    except DeploymentAmbiguousError:
+        raise
+    except Exception as error:
+        raise DeploymentAmbiguousError(
+            "committed authority finalization is ambiguous; evidence was preserved"
+        ) from error
 
 
 def _publish_authority_transition(
@@ -2449,12 +2685,23 @@ def _exchange_transaction(
             ) from original_error
         raise
     else:
-        if authority_transition is not None:
-            _finalize_authority_transition(paths, authority_transition)
-        if instruction_publication is not None:
-            _discard_prior_instruction(paths, instruction_publication)
-        if stage_identity is not None:
-            _remove_tree_exact(stage, active_identity, active_cleanup_ledger)
+        try:
+            if authority_transition is not None:
+                _finalize_authority_transition(
+                    paths,
+                    authority_transition,
+                    fault_injector=fault_injector,
+                )
+            if instruction_publication is not None:
+                _discard_prior_instruction(paths, instruction_publication)
+            if stage_identity is not None:
+                _remove_tree_exact(stage, active_identity, active_cleanup_ledger)
+        except DeploymentAmbiguousError:
+            raise
+        except Exception as error:
+            raise DeploymentAmbiguousError(
+                "committed exchange cleanup is ambiguous; evidence was preserved"
+            ) from error
         return receipt
 
 
@@ -3332,13 +3579,24 @@ def _rollback_initial_to_absent(
                 "initial rollback failed ambiguously; evidence was preserved"
             ) from original_error
         raise
-    if authority_transition is not None:
-        _finalize_authority_transition(paths, authority_transition)
-    if agents_publication is not None:
-        _discard_prior_instruction(paths, agents_publication)
-    if absent_agents_temp is not None and absent_agents_identity is not None:
-        _unlink_exact(absent_agents_temp, absent_agents_identity)
-    _remove_tree_exact(retained, active_identity, active_ledger)
+    try:
+        if authority_transition is not None:
+            _finalize_authority_transition(
+                paths,
+                authority_transition,
+                fault_injector=fault_injector,
+            )
+        if agents_publication is not None:
+            _discard_prior_instruction(paths, agents_publication)
+        if absent_agents_temp is not None and absent_agents_identity is not None:
+            _unlink_exact(absent_agents_temp, absent_agents_identity)
+        _remove_tree_exact(retained, active_identity, active_ledger)
+    except DeploymentAmbiguousError:
+        raise
+    except Exception as error:
+        raise DeploymentAmbiguousError(
+            "committed rollback cleanup is ambiguous; evidence was preserved"
+        ) from error
     return receipt
 
 
@@ -3419,7 +3677,11 @@ class GlobalRsiDeployer:
             if preflight_status.state not in {"not-installed", "verified"}:
                 raise DeploymentIntegrityError("current deployment is not verified")
         _require_atomic_backend()
-        with _exclusive_lock(self.paths, timeout=self._lock_timeout) as roots:
+        with _exclusive_lock(
+            self.paths,
+            timeout=self._lock_timeout,
+            fault_injector=self._fault_injector,
+        ) as roots:
             fault_injector = roots.guarded(self._fault_injector)
             admitted = _admit_source(source_repo)
             replay = _operation_replay(self.paths, admitted, operation_id)
@@ -3609,12 +3871,23 @@ class GlobalRsiDeployer:
                     ) from original_error
                 raise
             else:
-                if authority_transition is not None:
-                    _finalize_authority_transition(
-                        self.paths, authority_transition
-                    )
-                if instruction_publication is not None:
-                    _discard_prior_instruction(self.paths, instruction_publication)
+                try:
+                    if authority_transition is not None:
+                        _finalize_authority_transition(
+                            self.paths,
+                            authority_transition,
+                            fault_injector=fault_injector,
+                        )
+                    if instruction_publication is not None:
+                        _discard_prior_instruction(
+                            self.paths, instruction_publication
+                        )
+                except DeploymentAmbiguousError:
+                    raise
+                except Exception as error:
+                    raise DeploymentAmbiguousError(
+                        "committed deployment cleanup is ambiguous; evidence was preserved"
+                    ) from error
                 return receipt
 
     def rollback(self, receipt_id: str, operation_id: str) -> DeploymentReceipt:
@@ -3624,7 +3897,11 @@ class GlobalRsiDeployer:
         _validate_operation_id(receipt_id)
         _validate_operation_id(operation_id)
         _require_atomic_backend()
-        with _exclusive_lock(self.paths, timeout=self._lock_timeout) as roots:
+        with _exclusive_lock(
+            self.paths,
+            timeout=self._lock_timeout,
+            fault_injector=self._fault_injector,
+        ) as roots:
             fault_injector = roots.guarded(self._fault_injector)
             active = _active_receipt(self.paths)
             if active is None:

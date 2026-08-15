@@ -1255,19 +1255,24 @@ def test_lock_is_acquired_before_transaction_layout_is_created(
 ) -> None:
     repo = _write_repository(tmp_path)
     paths = DeploymentPaths.for_testing(tmp_path / "codex")
-    real_ensure = deployment_module._ensure_directory
+    real_ensure = deployment_module._ensure_child_directory_fd
     observed: list[str] = []
 
-    def checked(path: Path, *, exact_private: bool) -> None:
-        if path in {paths.skills_root, paths.receipts_root, paths.backups_root}:
+    def checked(parent_fd: int, name: str, *, exact_private: bool) -> int:
+        if name in {
+            paths.skills_root.name,
+            paths.receipts_root.name,
+            paths.backups_root.name,
+            paths.authorities_root.name,
+        }:
             assert paths.lock_file.exists()
-            observed.append(path.name)
-        real_ensure(path, exact_private=exact_private)
+            observed.append(name)
+        return real_ensure(parent_fd, name, exact_private=exact_private)
 
-    monkeypatch.setattr(deployment_module, "_ensure_directory", checked)
+    monkeypatch.setattr(deployment_module, "_ensure_child_directory_fd", checked)
     GlobalRsiDeployer(paths).deploy(repo, "lock-before-layout")
 
-    assert set(observed) == {"skills", "receipts", "backups"}
+    assert set(observed) == {"skills", "receipts", "backups", "authorities"}
 
 
 def test_stage_cleanup_preserves_member_replaced_during_fault_cut(tmp_path: Path) -> None:
@@ -1577,7 +1582,9 @@ def test_receipt_marker_is_strictly_after_durable_authority_pointer(
     assert observed.index("authority.pointer.readback") < observed.index(
         "receipt.marker.write"
     )
-    assert observed[-1] == "receipt.marker.readback"
+    assert observed.index("receipt.marker.readback") < observed.index(
+        "finalize.pointer"
+    )
 
 
 def test_receipt_marker_prepublication_failure_rolls_back_authority_and_state(
@@ -1802,6 +1809,145 @@ def test_each_mutation_helper_stays_on_retained_descriptor_after_ancestor_swap(
         assert (original_skills / "destination").read_bytes() == b"source"
     elif mutation == "unlink":
         assert not (original_skills / "remove").exists()
+
+
+def test_bootstrap_children_never_redirect_after_ancestor_swap_immediately_after_flock(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    anchor = tmp_path / "bootstrap-anchor"
+    displaced = tmp_path / "bootstrap-displaced"
+    redirect = tmp_path / "bootstrap-redirect"
+    (anchor / "codex").mkdir(parents=True)
+    (redirect / "codex").mkdir(parents=True)
+    paths = DeploymentPaths.for_testing(anchor / "codex")
+    observed = False
+
+    def swap(boundary: str) -> None:
+        nonlocal observed
+        if boundary != "bootstrap.after_flock":
+            return
+        observed = True
+        anchor.rename(displaced)
+        anchor.symlink_to(redirect)
+
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        GlobalRsiDeployer(paths, fault_injector=swap).deploy(
+            repo, "bootstrap-swap"
+        )
+
+    assert observed is True
+    assert not (redirect / "codex" / "skills").exists()
+    assert not (redirect / "codex" / "rsi-deployments-v1").exists()
+
+
+def test_bootstrap_child_creation_uses_retained_home_after_ancestor_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _write_repository(tmp_path)
+    anchor = tmp_path / "child-anchor"
+    displaced = tmp_path / "child-displaced"
+    redirect = tmp_path / "child-redirect"
+    (anchor / "codex").mkdir(parents=True)
+    (redirect / "codex").mkdir(parents=True)
+    paths = DeploymentPaths.for_testing(anchor / "codex")
+    real_mkdir = os.mkdir
+    swapped = False
+
+    def swap_mkdir(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        if path == paths.skills_root.name and not swapped:
+            swapped = True
+            anchor.rename(displaced)
+            anchor.symlink_to(redirect)
+        real_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "mkdir", swap_mkdir)
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        GlobalRsiDeployer(paths).deploy(repo, "bootstrap-child-swap")
+
+    assert swapped is True
+    assert not (redirect / "codex" / "skills").exists()
+    assert not (redirect / "codex" / "rsi-deployments-v1").exists()
+    assert (displaced / "codex" / "skills").is_dir()
+
+
+@pytest.mark.parametrize("caller", ["instruction", "active-pointer"])
+def test_single_file_cleanup_preserves_replaced_temp_for_each_caller(
+    tmp_path: Path, caller: str
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    preserved: Path | None = None
+
+    def replace(boundary: str) -> None:
+        nonlocal preserved
+        expected = (
+            "instruction.replace"
+            if caller == "instruction"
+            else "authority.pointer.replace"
+        )
+        if boundary != expected:
+            return
+        parent = paths.codex_home if caller == "instruction" else paths.state_root
+        prefix = ".rsi-agents." if caller == "instruction" else ".rsi-active-authority."
+        candidates = [path for path in parent.iterdir() if path.name.startswith(prefix)]
+        assert len(candidates) == 1
+        preserved = candidates[0]
+        preserved.unlink()
+        preserved.write_bytes(b"foreign-cleanup-evidence")
+        raise InjectedFault(boundary)
+
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        GlobalRsiDeployer(paths, fault_injector=replace).deploy(
+            repo, f"cleanup-{caller}"
+        )
+
+    assert preserved is not None
+    assert preserved.read_bytes() == b"foreign-cleanup-evidence"
+
+
+def test_cleanup_created_file_requires_exact_recorded_file_identity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "temporary"
+    path.write_bytes(b"owned")
+    expected = deployment_module._identity(os.lstat(path))
+    path.unlink()
+    path.write_bytes(b"foreign")
+
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        deployment_module._cleanup_created_file(path, expected, 0o644)
+
+    assert path.read_bytes() == b"foreign"
+
+
+@pytest.mark.parametrize("operation", ["deploy", "update", "rollback"])
+def test_post_marker_finalization_fault_is_ambiguous_but_new_state_verifies(
+    tmp_path: Path, operation: str
+) -> None:
+    repo_v1 = _write_repository(tmp_path, version=f"finalize-{operation}-v1")
+    repo_v2 = _write_repository(tmp_path, version=f"finalize-{operation}-v2")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    if operation != "deploy":
+        GlobalRsiDeployer(paths).deploy(repo_v1, f"finalize-{operation}-base")
+
+    def inject(boundary: str) -> None:
+        if boundary == "finalize.pointer":
+            raise OSError("finalization fault")
+
+    deployer = GlobalRsiDeployer(paths, fault_injector=inject)
+    operation_id = f"finalize-{operation}-new"
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        if operation == "rollback":
+            deployer.rollback(f"finalize-{operation}-base", operation_id)
+        else:
+            deployer.deploy(repo_v1 if operation == "deploy" else repo_v2, operation_id)
+
+    status = GlobalRsiDeployer(paths).verify()
+    assert status.operation_id == operation_id
+    assert status.verified is (operation != "rollback")
+    assert status.state == ("not-installed" if operation == "rollback" else "verified")
 
 
 @pytest.mark.parametrize(
