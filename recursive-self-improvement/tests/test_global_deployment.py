@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -126,6 +127,19 @@ def _trap_writes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         return real_open(file, mode, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", checked_open)
+
+    real_os_open = os.open
+
+    def checked_os_open(path: object, flags: int, *args: object, **kwargs: object):
+        writable = flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+        if writable:
+            calls.append("writable-os-open")
+            raise AssertionError("read-only deployment operation called writable os.open")
+        return real_os_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", checked_os_open)
+    for name in ("fchmod", "write", "fsync"):
+        monkeypatch.setattr(os, name, forbidden(name))
     return calls
 
 
@@ -1026,6 +1040,342 @@ def test_live_paths_ignore_ambient_home_and_only_factories_can_construct(
             backups_root=tmp_path / "backups",
             testing=False,
         )
+
+
+def test_test_path_factory_rejects_private_bypass_live_alias_and_symlink_ancestor(
+    tmp_path: Path,
+) -> None:
+    live = Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".codex"
+    alias_parent = tmp_path / "alias-parent"
+    alias_parent.symlink_to(tmp_path)
+
+    with pytest.raises(DeploymentError):
+        DeploymentPaths._from_home(tmp_path / "direct", testing=True)
+    with pytest.raises(DeploymentError):
+        DeploymentPaths.for_testing(live / "nested")
+    with pytest.raises(DeploymentError):
+        DeploymentPaths.for_testing(alias_parent / "codex")
+
+
+def test_deployer_rejects_forged_descriptor_roots(tmp_path: Path) -> None:
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    object.__setattr__(paths, "receipts_root", tmp_path / "escaped-receipts")
+
+    with pytest.raises(DeploymentError):
+        GlobalRsiDeployer(paths)
+
+
+def test_source_admission_ignores_git_environment_and_compares_head_blob_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = _write_repository(tmp_path, version="trusted")
+    other = _write_repository(tmp_path, version="other")
+    monkeypatch.setenv("GIT_DIR", os.fspath(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", os.fspath(trusted))
+    planned = GlobalRsiDeployer(
+        DeploymentPaths.for_testing(tmp_path / "codex")
+    ).plan(trusted)
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_WORK_TREE")
+    assert planned.source_commit == _git(trusted, "rev-parse", "HEAD")
+
+    payload = trusted / "recursive-self-improvement/payload.txt"
+    _git(trusted, "update-index", "--assume-unchanged", payload.relative_to(trusted).as_posix())
+    payload.write_text("forged-working-tree\n", encoding="utf-8")
+    with pytest.raises(
+        (deployment_module.DeploymentSourceError, DeploymentIntegrityError),
+        match="drift|HEAD blob",
+    ):
+        GlobalRsiDeployer(DeploymentPaths.for_testing(tmp_path / "codex-2")).plan(trusted)
+
+
+def test_plan_and_deploy_share_exact_noop_request_equivalence(tmp_path: Path) -> None:
+    repo_v1 = _write_repository(tmp_path, version="same")
+    repo_copy = tmp_path / "copy-root"
+    repo_copy.mkdir()
+    copied = _write_repository(repo_copy, version="same")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo_v1, "exact-noop-v1")
+
+    assert deployer.plan(repo_v1).action == "no-op"
+    assert deployer.plan(copied).action == "update"
+
+
+def test_cleanup_preserves_replaced_member_against_closed_identity_ledger(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "private"
+    root.mkdir(mode=0o700)
+    member = root / "member"
+    member.write_bytes(b"ours")
+    ledger = deployment_module._capture_cleanup_ledger(root)
+    member.unlink()
+    member.write_bytes(b"foreign")
+
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        deployment_module._remove_tree_exact(root, ledger.root_identity, ledger)
+
+    assert member.read_bytes() == b"foreign"
+
+
+@pytest.mark.parametrize("prior_agents", [None, b"exact prior bytes\n"])
+def test_initial_deployment_can_rollback_to_exact_absent_package_and_agents(
+    tmp_path: Path, prior_agents: bytes | None
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    if prior_agents is not None:
+        paths.codex_home.mkdir(mode=0o700)
+        paths.agents_file.write_bytes(prior_agents)
+        paths.agents_file.chmod(0o640)
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo, "initial-rollback-source")
+
+    receipt = deployer.rollback("initial-rollback-source", "initial-rollback-op")
+
+    assert receipt.operation_id == "initial-rollback-op"
+    assert not paths.installed_root.exists()
+    assert deployer.verify().state == "not-installed"
+    assert deployer.rollback("initial-rollback-source", "initial-rollback-op") == receipt
+    with pytest.raises(DeploymentOperationConflict):
+        deployer.rollback("different-receipt", "initial-rollback-op")
+    if prior_agents is None:
+        assert not paths.agents_file.exists()
+    else:
+        assert paths.agents_file.read_bytes() == prior_agents
+        assert stat.S_IMODE(os.lstat(paths.agents_file).st_mode) == 0o640
+
+
+def test_rollback_replay_binds_requested_receipt_id(tmp_path: Path) -> None:
+    repo_v1 = _write_repository(tmp_path, version="replay-v1")
+    repo_v2 = _write_repository(tmp_path, version="replay-v2")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo_v1, "replay-bind-v1")
+    deployer.deploy(repo_v2, "replay-bind-v2")
+    first = deployer.rollback("replay-bind-v2", "replay-bind-rollback")
+
+    assert deployer.rollback("replay-bind-v2", "replay-bind-rollback") == first
+
+    with pytest.raises(DeploymentOperationConflict):
+        deployer.rollback("replay-bind-v1", "replay-bind-rollback")
+
+
+def test_missing_lock_is_invalid_once_receipt_authority_exists(tmp_path: Path) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo, "missing-lock-authority")
+    paths.lock_file.unlink()
+
+    status = deployer.verify()
+
+    assert status.verified is False
+    assert status.state in {"invalid", "ambiguous"}
+
+
+def test_source_head_bytes_are_rechecked_immediately_before_publication(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    payload = repo / "recursive-self-improvement/payload.txt"
+    _git(repo, "update-index", "--assume-unchanged", payload.relative_to(repo).as_posix())
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+
+    def drift(boundary: str) -> None:
+        if boundary == "package.rename":
+            payload.write_text("late-source-drift\n", encoding="utf-8")
+
+    with pytest.raises(
+        (deployment_module.DeploymentSourceError, DeploymentIntegrityError),
+        match="drift|HEAD blob",
+    ):
+        GlobalRsiDeployer(paths, fault_injector=drift).deploy(repo, "late-head-drift")
+
+    assert not paths.installed_root.exists()
+    assert not list(paths.skills_root.glob(".rsi-package-stage*"))
+    assert not list(paths.backups_root.glob("sha256:*"))
+
+
+def test_late_symlink_ancestor_is_rejected_before_operation(tmp_path: Path) -> None:
+    repo = _write_repository(tmp_path)
+    alias = tmp_path / "late-alias"
+    paths = DeploymentPaths.for_testing(alias / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    target = tmp_path / "late-target"
+    target.mkdir()
+    alias.symlink_to(target)
+
+    with pytest.raises(DeploymentError, match="symlink"):
+        deployer.plan(repo)
+
+
+def test_lock_name_replacement_after_flock_is_rejected_and_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    real_flock = fcntl.flock
+    replaced = False
+
+    def replace_after_lock(descriptor: int, operation: int) -> None:
+        nonlocal replaced
+        real_flock(descriptor, operation)
+        if replaced or not (operation & fcntl.LOCK_EX) or (operation & fcntl.LOCK_UN):
+            return
+        replaced = True
+        displaced = paths.state_root / "displaced-lock"
+        os.rename(paths.lock_file, displaced)
+        replacement = os.open(paths.lock_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(replacement)
+
+    monkeypatch.setattr(deployment_module.fcntl, "flock", replace_after_lock)
+
+    with pytest.raises(DeploymentIntegrityError, match="changed after locking"):
+        GlobalRsiDeployer(paths).deploy(repo, "replaced-lock")
+
+    assert replaced is True
+    assert paths.lock_file.exists()
+    assert (paths.state_root / "displaced-lock").exists()
+    assert not paths.installed_root.exists()
+
+
+def test_lock_is_acquired_before_transaction_layout_is_created(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    real_ensure = deployment_module._ensure_directory
+    observed: list[str] = []
+
+    def checked(path: Path, *, exact_private: bool) -> None:
+        if path in {paths.skills_root, paths.receipts_root, paths.backups_root}:
+            assert paths.lock_file.exists()
+            observed.append(path.name)
+        real_ensure(path, exact_private=exact_private)
+
+    monkeypatch.setattr(deployment_module, "_ensure_directory", checked)
+    GlobalRsiDeployer(paths).deploy(repo, "lock-before-layout")
+
+    assert set(observed) == {"skills", "receipts", "backups"}
+
+
+def test_stage_cleanup_preserves_member_replaced_during_fault_cut(tmp_path: Path) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    preserved: Path | None = None
+
+    def replace(boundary: str) -> None:
+        nonlocal preserved
+        if boundary != "package.staging.readback":
+            return
+        stage = next(paths.skills_root.glob(".rsi-package-stage*"))
+        preserved = stage / "payload.txt"
+        preserved.unlink()
+        preserved.write_bytes(b"foreign-replacement")
+        raise InjectedFault(boundary)
+
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        GlobalRsiDeployer(paths, fault_injector=replace).deploy(
+            repo, "preserve-foreign-stage"
+        )
+
+    assert preserved is not None
+    assert preserved.read_bytes() == b"foreign-replacement"
+
+
+@pytest.mark.parametrize(
+    ("boundary", "occurrence"),
+    [
+        *(("backup.package.file.write", number) for number in range(1, 7)),
+        *(("backup.package.file.fsync", number) for number in range(1, 7)),
+        *(("backup.package.directory.fsync", number) for number in range(1, 5)),
+    ],
+)
+def test_each_repeated_backup_write_and_fsync_cut_preserves_active_authority(
+    tmp_path: Path, boundary: str, occurrence: int
+) -> None:
+    repo_v1 = _write_repository(tmp_path, version="backup-repeat-v1")
+    repo_v2 = _write_repository(tmp_path, version="backup-repeat-v2")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo_v1, "backup-repeat-base")
+    before = _snapshot_tree(paths.codex_home)
+    count = 0
+
+    def inject(observed: str) -> None:
+        nonlocal count
+        if observed == boundary:
+            count += 1
+            if count == occurrence:
+                raise InjectedFault(f"{boundary}:{occurrence}")
+
+    with pytest.raises((InjectedFault, DeploymentError)):
+        GlobalRsiDeployer(paths, fault_injector=inject).deploy(
+            repo_v2, "backup-repeat-update"
+        )
+
+    assert count == occurrence
+    assert _snapshot_tree(paths.codex_home) == before
+    assert GlobalRsiDeployer(paths).verify().operation_id == "backup-repeat-base"
+
+
+@pytest.mark.parametrize("first", ["rollback", "deploy"])
+def test_rollback_and_deploy_serialize_correctly_in_both_lock_orders(
+    tmp_path: Path, first: str
+) -> None:
+    repo_v1 = _write_repository(tmp_path, version=f"ordered-{first}-v1")
+    repo_v2 = _write_repository(tmp_path, version=f"ordered-{first}-v2")
+    repo_v3 = _write_repository(tmp_path, version=f"ordered-{first}-v3")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    base = GlobalRsiDeployer(paths)
+    base.deploy(repo_v1, f"ordered-{first}-v1")
+    base.deploy(repo_v2, f"ordered-{first}-v2")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def pause(boundary: str) -> None:
+        if boundary == "package.staging.readback":
+            entered.set()
+            assert release.wait(timeout=5)
+
+    rollback_deployer = GlobalRsiDeployer(
+        paths, fault_injector=pause if first == "rollback" else None
+    )
+    deploy_deployer = GlobalRsiDeployer(
+        paths, fault_injector=pause if first == "deploy" else None
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        if first == "rollback":
+            first_future = executor.submit(
+                rollback_deployer.rollback,
+                f"ordered-{first}-v2",
+                f"ordered-{first}-rollback",
+            )
+            assert entered.wait(timeout=5)
+            second_future = executor.submit(
+                deploy_deployer.deploy, repo_v3, f"ordered-{first}-v3"
+            )
+        else:
+            first_future = executor.submit(
+                deploy_deployer.deploy, repo_v3, f"ordered-{first}-v3"
+            )
+            assert entered.wait(timeout=5)
+            second_future = executor.submit(
+                rollback_deployer.rollback,
+                f"ordered-{first}-v2",
+                f"ordered-{first}-rollback",
+            )
+        time.sleep(0.05)
+        assert not second_future.done()
+        release.set()
+        first_future.result(timeout=10)
+        second_future.result(timeout=10)
+
+    status = GlobalRsiDeployer(paths).verify()
+    assert status.verified is True
+    expected = f"ordered-{first}-v3" if first == "rollback" else f"ordered-{first}-rollback"
+    assert status.operation_id == expected
 
 
 def test_deployment_service_is_exported_from_rsi_core_without_eager_storage_import() -> None:

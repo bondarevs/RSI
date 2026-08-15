@@ -75,6 +75,7 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _ALLOWLIST_DOMAIN = "rsi-global-production-allowlist-v1"
 _FaultInjector = Callable[[str], None]
+_PATH_FACTORY_TOKEN = object()
 
 
 def _cut(fault_injector: _FaultInjector | None, boundary: str) -> None:
@@ -106,6 +107,7 @@ class DeploymentPaths:
     receipts_root: Path
     backups_root: Path
     testing: bool
+    _factory_provenance: object
 
     def __init__(self, *_args: object, **_kwargs: object) -> None:
         raise DeploymentError(
@@ -113,7 +115,15 @@ class DeploymentPaths:
         )
 
     @classmethod
-    def _from_home(cls, codex_home: Path, *, testing: bool) -> "DeploymentPaths":
+    def _from_home(
+        cls,
+        codex_home: Path,
+        *,
+        testing: bool,
+        _factory_token: object | None = None,
+    ) -> "DeploymentPaths":
+        if _factory_token is not _PATH_FACTORY_TOKEN:
+            raise DeploymentError("deployment paths require an approved factory")
         if not isinstance(codex_home, Path) or not codex_home.is_absolute():
             raise DeploymentError("Codex home must be an absolute Path")
         skills_root = codex_home / "skills"
@@ -129,6 +139,7 @@ class DeploymentPaths:
             "receipts_root": state_root / "receipts",
             "backups_root": state_root / "backups",
             "testing": testing,
+            "_factory_provenance": _PATH_FACTORY_TOKEN,
         }
         for name, value in values.items():
             object.__setattr__(instance, name, value)
@@ -138,7 +149,11 @@ class DeploymentPaths:
     def live(cls) -> "DeploymentPaths":
         """Return fixed live paths; ``HOME`` and deployment env vars are ignored."""
 
-        return cls._from_home(_actual_user_home() / ".codex", testing=False)
+        return cls._from_home(
+            _actual_user_home() / ".codex",
+            testing=False,
+            _factory_token=_PATH_FACTORY_TOKEN,
+        )
 
     @classmethod
     def for_testing(cls, codex_home: Path) -> "DeploymentPaths":
@@ -146,10 +161,66 @@ class DeploymentPaths:
 
         if not isinstance(codex_home, Path):
             raise DeploymentError("test Codex home must be a Path")
-        injected = codex_home.absolute()
-        if injected == _actual_user_home() / ".codex":
-            raise DeploymentError("test path injection cannot target the live Codex home")
-        return cls._from_home(injected, testing=True)
+        injected = Path(os.path.abspath(codex_home))
+        if injected != codex_home:
+            raise DeploymentError("test Codex home must be lexically canonical")
+        live = _actual_user_home() / ".codex"
+        try:
+            injected.relative_to(live)
+        except ValueError:
+            pass
+        else:
+            raise DeploymentError("test path injection cannot target the live Codex tree")
+        current = injected
+        while True:
+            try:
+                metadata = os.lstat(current)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                raise DeploymentError("test Codex home ancestry is unavailable") from None
+            else:
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise DeploymentError("test Codex home ancestry contains a symlink")
+            if current.parent == current:
+                break
+            current = current.parent
+        return cls._from_home(
+            injected,
+            testing=True,
+            _factory_token=_PATH_FACTORY_TOKEN,
+        )
+
+
+def _validate_deployment_paths(paths: DeploymentPaths) -> None:
+    if paths._factory_provenance is not _PATH_FACTORY_TOKEN:
+        raise DeploymentError("deployment path provenance is invalid")
+    home = paths.codex_home
+    expected = {
+        "skills_root": home / "skills",
+        "installed_root": home / "skills" / PACKAGE_RELATIVE_PATH,
+        "agents_file": home / "AGENTS.md",
+        "state_root": home / "rsi-deployments-v1",
+        "lock_file": home / "rsi-deployments-v1" / "lock",
+        "receipts_root": home / "rsi-deployments-v1" / "receipts",
+        "backups_root": home / "rsi-deployments-v1" / "backups",
+    }
+    if any(getattr(paths, name) != value for name, value in expected.items()):
+        raise DeploymentError("deployment descriptor roots are not confined")
+    current = home
+    while True:
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise DeploymentError("deployment root ancestry is unavailable") from None
+        else:
+            if stat.S_ISLNK(metadata.st_mode):
+                raise DeploymentError("deployment root ancestry contains a symlink")
+        if current.parent == current:
+            break
+        current = current.parent
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,8 +287,15 @@ class _BackupRecord:
     identity_payload: bytes
     root_identity: tuple[int, int]
     created: bool
-    prior_manifest: DeploymentManifest
+    prior_manifest: DeploymentManifest | None
     agents: _AgentsFile
+    cleanup_ledger: "_CleanupLedger | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CleanupLedger:
+    root_identity: tuple[int, int]
+    members: tuple[tuple[str, str, int, int], ...]
 
 
 def _sha256(payload: bytes) -> str:
@@ -281,27 +359,63 @@ def _ensure_directory(path: Path, *, exact_private: bool) -> None:
         raise DeploymentIntegrityError(f"private deployment directory mode is invalid: {path.name}")
 
 
-def _ensure_layout(paths: DeploymentPaths) -> None:
+def _ensure_lock_root(paths: DeploymentPaths) -> None:
+    """Create only the ancestry required to publish and acquire the lock."""
+
     _ensure_directory(paths.codex_home, exact_private=False)
-    _ensure_directory(paths.skills_root, exact_private=False)
     _ensure_directory(paths.state_root, exact_private=True)
-    _ensure_directory(paths.receipts_root, exact_private=True)
-    _ensure_directory(paths.backups_root, exact_private=True)
 
 
 @contextmanager
 def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
-    _ensure_layout(paths)
-    flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | _NOFOLLOW
+    _ensure_lock_root(paths)
+    flags = os.O_RDWR | os.O_CLOEXEC | _NOFOLLOW
+    created = False
     try:
-        descriptor = os.open(paths.lock_file, flags, 0o600)
-    except OSError:
-        raise DeploymentError("cannot open the deployment lock safely") from None
-    try:
+        named = os.lstat(paths.lock_file)
+    except FileNotFoundError:
         try:
-            os.fchmod(descriptor, 0o600)
+            descriptor = os.open(paths.lock_file, flags | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+        except FileExistsError:
+            try:
+                named = os.lstat(paths.lock_file)
+                if (
+                    not stat.S_ISREG(named.st_mode)
+                    or named.st_uid != os.geteuid()
+                    or named.st_nlink != 1
+                    or stat.S_IMODE(named.st_mode) != 0o600
+                ):
+                    raise DeploymentIntegrityError("deployment lock identity is unsafe")
+                descriptor = os.open(paths.lock_file, flags)
+            except DeploymentIntegrityError:
+                raise
+            except OSError:
+                raise DeploymentError("cannot open the raced deployment lock safely") from None
         except OSError:
-            raise DeploymentError("cannot make the deployment lock private") from None
+            raise DeploymentError("cannot create the deployment lock safely") from None
+        if created:
+            try:
+                os.fsync(descriptor)
+                _fsync_directory(paths.state_root)
+            except Exception:
+                os.close(descriptor)
+                raise
+    except OSError:
+        raise DeploymentIntegrityError("cannot inspect the deployment lock safely") from None
+    else:
+        if (
+            not stat.S_ISREG(named.st_mode)
+            or named.st_uid != os.geteuid()
+            or named.st_nlink != 1
+            or stat.S_IMODE(named.st_mode) != 0o600
+        ):
+            raise DeploymentIntegrityError("deployment lock identity is unsafe")
+        try:
+            descriptor = os.open(paths.lock_file, flags)
+        except OSError:
+            raise DeploymentError("cannot open the deployment lock safely") from None
+    try:
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
@@ -321,6 +435,15 @@ def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
                 time.sleep(0.01)
             except InterruptedError:
                 continue
+        try:
+            named_after = os.lstat(paths.lock_file)
+        except OSError:
+            raise DeploymentIntegrityError("deployment lock disappeared after locking") from None
+        if _identity(named_after) != _identity(metadata) or named_after.st_mode != metadata.st_mode:
+            raise DeploymentIntegrityError("deployment lock changed after locking")
+        _ensure_directory(paths.skills_root, exact_private=False)
+        _ensure_directory(paths.receipts_root, exact_private=True)
+        _ensure_directory(paths.backups_root, exact_private=True)
         yield
     finally:
         try:
@@ -337,6 +460,16 @@ def _shared_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
     try:
         named = os.lstat(paths.lock_file)
     except FileNotFoundError:
+        authority = paths.installed_root.exists()
+        if not authority:
+            try:
+                authority = any(os.scandir(paths.receipts_root))
+            except FileNotFoundError:
+                authority = False
+            except OSError:
+                authority = True
+        if authority:
+            raise DeploymentIntegrityError("deployment lock is missing with authority")
         yield
         return
     except OSError:
@@ -367,6 +500,12 @@ def _shared_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
                 time.sleep(0.01)
             except InterruptedError:
                 continue
+        try:
+            named_after = os.lstat(paths.lock_file)
+        except OSError:
+            raise DeploymentIntegrityError("deployment lock disappeared after locking") from None
+        if _identity(named_after) != _identity(opened) or named_after.st_mode != opened.st_mode:
+            raise DeploymentIntegrityError("deployment lock changed after locking")
         yield
     finally:
         try:
@@ -407,6 +546,7 @@ def _write_new_file(
     except OSError:
         raise DeploymentError(f"cannot create private deployment file: {path.name}") from None
     try:
+        opened_identity = _identity(os.fstat(descriptor))
         if write_boundary is not None:
             _cut(fault_injector, write_boundary)
         _write_all(descriptor, payload)
@@ -418,8 +558,30 @@ def _write_new_file(
         if metadata.st_uid != os.geteuid() or metadata.st_nlink != 1:
             raise DeploymentIntegrityError(f"new deployment file identity is unsafe: {path.name}")
         return _identity(metadata)
-    except OSError:
-        raise DeploymentError(f"cannot durably write deployment file: {path.name}") from None
+    except Exception as original_error:
+        try:
+            named = os.lstat(path)
+            if (
+                not stat.S_ISREG(named.st_mode)
+                or _identity(named) != opened_identity
+                or named.st_uid != os.geteuid()
+                or named.st_nlink != 1
+            ):
+                raise DeploymentAmbiguousError(
+                    f"new deployment file changed before cleanup: {path.name}"
+                )
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except DeploymentAmbiguousError:
+            raise
+        except OSError:
+            raise DeploymentAmbiguousError(
+                f"new deployment file cleanup failed: {path.name}"
+            ) from original_error
+        if isinstance(original_error, OSError):
+            raise DeploymentError(f"cannot durably write deployment file: {path.name}") from None
+        raise
     finally:
         os.close(descriptor)
 
@@ -540,6 +702,7 @@ def _stage_package(
     except OSError:
         raise DeploymentError("cannot create private package staging directory") from None
     root_identity = _identity(_safe_directory(destination, exact_private=True))
+    ledger_members: dict[str, tuple[str, int, int]] = {}
     try:
         created_directories: set[Path] = {destination}
         for entry in admitted.snapshot.entries:
@@ -556,13 +719,19 @@ def _stage_package(
                 except OSError:
                     raise DeploymentError("cannot create private package staging member") from None
                 created_directories.add(parent)
+                parent_identity = _identity(os.lstat(parent))
+                ledger_members[parent.relative_to(destination).as_posix()] = (
+                    "directory",
+                    parent_identity[0],
+                    parent_identity[1],
+                )
             payload, _ = _read_regular_file(
                 admitted.package_root / entry.relative_path,
                 label=f"source package member {entry.relative_path}",
             )
             if len(payload) != entry.byte_length or _sha256(payload) != entry.digest:
                 raise DeploymentSourceError("source package changed during staging")
-            _write_new_file(
+            file_identity = _write_new_file(
                 target,
                 payload,
                 mode=0o700 if entry.executable else 0o600,
@@ -570,15 +739,25 @@ def _stage_package(
                 write_boundary=f"{boundary_prefix}.file.write",
                 fsync_boundary=f"{boundary_prefix}.file.fsync",
             )
+            ledger_members[entry.relative_path] = (
+                "file",
+                file_identity[0],
+                file_identity[1],
+            )
 
         manifest_path = destination / MANIFEST_RELATIVE_PATH
-        _write_new_file(
+        manifest_identity = _write_new_file(
             manifest_path,
             manifest.to_bytes(),
             mode=0o600,
             fault_injector=fault_injector,
             write_boundary=f"{boundary_prefix}.manifest.write",
             fsync_boundary=f"{boundary_prefix}.manifest.fsync",
+        )
+        ledger_members[MANIFEST_RELATIVE_PATH] = (
+            "file",
+            manifest_identity[0],
+            manifest_identity[1],
         )
         for directory in sorted(
             created_directories,
@@ -598,7 +777,16 @@ def _stage_package(
         return root_identity
     except Exception as original_error:
         try:
-            _remove_tree_exact(destination, root_identity)
+            ledger = _CleanupLedger(
+                root_identity,
+                tuple(
+                    (relative, *value)
+                    for relative, value in sorted(
+                        ledger_members.items(), key=lambda item: os.fsencode(item[0])
+                    )
+                ),
+            )
+            _remove_tree_exact(destination, root_identity, ledger)
         except Exception:
             raise DeploymentAmbiguousError(
                 "package staging cleanup failed; evidence was preserved"
@@ -606,7 +794,39 @@ def _stage_package(
         raise
 
 
-def _remove_tree_exact(path: Path, expected_identity: tuple[int, int]) -> None:
+def _capture_cleanup_ledger(path: Path) -> _CleanupLedger:
+    root = os.lstat(path)
+    if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.geteuid():
+        raise DeploymentAmbiguousError("private transaction root is unsafe")
+    members: list[tuple[str, str, int, int]] = []
+    for member in sorted(path.rglob("*"), key=lambda item: os.fsencode(item)):
+        metadata = os.lstat(member)
+        if metadata.st_uid != os.geteuid() or stat.S_ISLNK(metadata.st_mode):
+            raise DeploymentAmbiguousError("private transaction member is unsafe")
+        if stat.S_ISREG(metadata.st_mode):
+            kind = "file"
+            if metadata.st_nlink != 1:
+                raise DeploymentAmbiguousError("private transaction file topology is unsafe")
+        elif stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+        else:
+            raise DeploymentAmbiguousError("private transaction member type is unsafe")
+        members.append(
+            (
+                member.relative_to(path).as_posix(),
+                kind,
+                metadata.st_dev,
+                metadata.st_ino,
+            )
+        )
+    return _CleanupLedger(_identity(root), tuple(members))
+
+
+def _remove_tree_exact(
+    path: Path,
+    expected_identity: tuple[int, int],
+    ledger: _CleanupLedger | None = None,
+) -> None:
     try:
         root = os.lstat(path)
     except FileNotFoundError:
@@ -615,6 +835,12 @@ def _remove_tree_exact(path: Path, expected_identity: tuple[int, int]) -> None:
         raise DeploymentAmbiguousError("cannot inspect private transaction evidence") from None
     if not stat.S_ISDIR(root.st_mode) or _identity(root) != expected_identity:
         raise DeploymentAmbiguousError("private transaction evidence changed identity")
+    if ledger is not None:
+        actual = _capture_cleanup_ledger(path)
+        if actual != ledger or ledger.root_identity != expected_identity:
+            raise DeploymentAmbiguousError(
+                "private transaction membership changed; evidence was preserved"
+            )
     for current_root, directory_names, file_names in os.walk(path, topdown=False, followlinks=False):
         current = Path(current_root)
         for name in file_names:
@@ -891,19 +1117,44 @@ def _operation_replay(
         and manifest.operation_id == operation_id
         and receipt.manifest_byte_length == len(manifest_bytes)
         and receipt.manifest_digest == _sha256(manifest_bytes)
-        and manifest.source_repository == os.fspath(admitted.repository)
-        and manifest.source_commit == admitted.commit
-        and manifest.source_tree_digest == admitted.snapshot.tree_digest
-        and manifest.file_entries == admitted.snapshot.entries
-        and manifest.production_allowlist_digest == admitted.allowlist_digest
-        and manifest.managed_instruction_block_digest == MANAGED_BLOCK_DIGEST
+        and _active_matches_deploy_request(manifest, admitted)
     )
     if not request_matches:
         raise DeploymentOperationConflict("deployment operation ID conflicts with immutable authority")
+    request_backup = _find_backup_for_successor(paths, operation_id)
+    request_metadata = _canonical_mapping(
+        request_backup.identity_payload,
+        label="deployment replay backup metadata",
+    )
+    if (
+        request_metadata.get("operationKind") != "deploy"
+        or request_metadata.get("requestReceiptId") is not None
+    ):
+        raise DeploymentOperationConflict(
+            "deployment replay operation kind conflicts with immutable authority"
+        )
     active = _active_receipt(paths)
     if active is None or active[0].operation_id != operation_id or active[1] != receipt:
         raise DeploymentOperationConflict("replayed operation is not the active verified deployment")
     return receipt
+
+
+def _active_matches_deploy_request(
+    manifest: DeploymentManifest,
+    admitted: _AdmittedSource,
+) -> bool:
+    return (
+        manifest.source_repository == os.fspath(admitted.repository)
+        and manifest.source_commit == admitted.commit
+        and manifest.source_tree_digest == admitted.snapshot.tree_digest
+        and manifest.installed_tree_digest == admitted.snapshot.tree_digest
+        and manifest.file_entries == admitted.snapshot.entries
+        and manifest.production_allowlist_digest == admitted.allowlist_digest
+        and manifest.production_allowlist_entry_count == 0
+        and manifest.managed_instruction_block_digest == MANAGED_BLOCK_DIGEST
+        and manifest.mode == "observe"
+        and manifest.hook_mode == "late-review"
+    )
 
 
 def _verify_active_before_receipt(
@@ -939,6 +1190,9 @@ def _backup_identity_payload(
     prior_manifest: DeploymentManifest,
     agents: _AgentsFile,
     successor_manifest: DeploymentManifest,
+    *,
+    operation_kind: str = "deploy",
+    request_receipt_id: str | None = None,
 ) -> bytes:
     if agents.data is None:
         agents_arm: dict[str, object] = {"state": "absent"}
@@ -962,6 +1216,38 @@ def _backup_identity_payload(
             "agents": agents_arm,
             "successorOperationId": successor_manifest.operation_id,
             "successorManifestDigest": _sha256(successor_manifest.to_bytes()),
+            "operationKind": operation_kind,
+            "requestReceiptId": request_receipt_id,
+        }
+    )
+
+
+def _absent_backup_identity_payload(
+    agents: _AgentsFile,
+    successor_manifest: DeploymentManifest,
+) -> bytes:
+    agents_arm: dict[str, object]
+    if agents.data is None:
+        agents_arm = {"state": "absent"}
+    else:
+        if agents.mode is None:
+            raise DeploymentIntegrityError("present global instruction mode is missing")
+        agents_arm = {
+            "state": "present",
+            "byteLength": len(agents.data),
+            "digest": _sha256(agents.data),
+            "mode": agents.mode,
+        }
+    return canonical_json_bytes(
+        {
+            "schemaVersion": 1,
+            "domain": "rsi-global-deployment-backup-v1",
+            "packageState": "absent",
+            "agents": agents_arm,
+            "successorOperationId": successor_manifest.operation_id,
+            "successorManifestDigest": _sha256(successor_manifest.to_bytes()),
+            "operationKind": "deploy",
+            "requestReceiptId": None,
         }
     )
 
@@ -976,13 +1262,6 @@ def _validate_backup(
         root_members = {entry.name for entry in os.scandir(path)}
     except OSError:
         raise DeploymentIntegrityError("cannot enumerate deployment backup") from None
-    if not {"backup.json", "manifest.json", "package"}.issubset(root_members) or not root_members <= {
-        "backup.json",
-        "manifest.json",
-        "package",
-        "agents.bin",
-    }:
-        raise DeploymentIntegrityError("deployment backup contains an unlisted member")
     metadata_bytes, metadata_stat = _read_regular_file(
         path / "backup.json", label="deployment backup metadata"
     )
@@ -991,46 +1270,65 @@ def _validate_backup(
     metadata = _canonical_mapping(metadata_bytes, label="deployment backup metadata")
     if expected_payload is not None and metadata_bytes != expected_payload:
         raise DeploymentIntegrityError("deployment backup identity payload differs")
-    expected_keys = {
+    common_keys = {
         "schemaVersion",
         "domain",
         "packageState",
-        "packageTreeDigest",
-        "packageManifestByteLength",
-        "packageManifestDigest",
         "agents",
         "successorOperationId",
         "successorManifestDigest",
+        "operationKind",
+        "requestReceiptId",
     }
-    if set(metadata) != expected_keys or metadata.get("schemaVersion") != 1 or metadata.get(
-        "domain"
-    ) != "rsi-global-deployment-backup-v1" or metadata.get("packageState") != "present":
+    present_keys = common_keys | {
+        "packageTreeDigest",
+        "packageManifestByteLength",
+        "packageManifestDigest",
+    }
+    package_state = metadata.get("packageState")
+    if (
+        set(metadata) != (present_keys if package_state == "present" else common_keys)
+        or metadata.get("schemaVersion") != 1
+        or metadata.get("domain") != "rsi-global-deployment-backup-v1"
+        or package_state not in {"present", "absent"}
+        or metadata.get("operationKind") not in {"deploy", "rollback"}
+        or (
+            metadata.get("requestReceiptId") is not None
+            and type(metadata.get("requestReceiptId")) is not str
+        )
+    ):
         raise DeploymentIntegrityError("deployment backup metadata schema is invalid")
     if path.name != _sha256(metadata_bytes):
         raise DeploymentIntegrityError("deployment backup directory digest is invalid")
-    manifest_bytes, manifest_stat = _read_regular_file(
-        path / "manifest.json", label="deployment backup manifest"
-    )
-    if stat.S_IMODE(manifest_stat.st_mode) != 0o600:
-        raise DeploymentIntegrityError("deployment backup manifest mode is invalid")
-    manifest = DeploymentManifest.from_bytes(manifest_bytes)
-    if (
-        metadata.get("packageTreeDigest") != manifest.installed_tree_digest
-        or metadata.get("packageManifestByteLength") != len(manifest_bytes)
-        or metadata.get("packageManifestDigest") != _sha256(manifest_bytes)
-    ):
-        raise DeploymentIntegrityError("deployment backup package binding is invalid")
-    package = path / "package"
-    snapshot = scan_package(package, exclude_manifest=True)
-    if snapshot.entries != manifest.file_entries or snapshot.tree_digest != manifest.installed_tree_digest:
-        raise DeploymentIntegrityError("deployment backup package differs from its manifest")
-    package_manifest_bytes, _ = _read_regular_file(
-        package / MANIFEST_RELATIVE_PATH,
-        label="deployment backup package manifest",
-    )
-    if package_manifest_bytes != manifest_bytes:
-        raise DeploymentIntegrityError("deployment backup manifest copies differ")
-    _verify_installed_modes(package, manifest)
+    expected_members = {"backup.json", "agents.bin"} if (path / "agents.bin").exists() else {"backup.json"}
+    manifest: DeploymentManifest | None = None
+    if package_state == "present":
+        expected_members |= {"manifest.json", "package"}
+        manifest_bytes, manifest_stat = _read_regular_file(
+            path / "manifest.json", label="deployment backup manifest"
+        )
+        if stat.S_IMODE(manifest_stat.st_mode) != 0o600:
+            raise DeploymentIntegrityError("deployment backup manifest mode is invalid")
+        manifest = DeploymentManifest.from_bytes(manifest_bytes)
+        if (
+            metadata.get("packageTreeDigest") != manifest.installed_tree_digest
+            or metadata.get("packageManifestByteLength") != len(manifest_bytes)
+            or metadata.get("packageManifestDigest") != _sha256(manifest_bytes)
+        ):
+            raise DeploymentIntegrityError("deployment backup package binding is invalid")
+        package = path / "package"
+        snapshot = scan_package(package, exclude_manifest=True)
+        if snapshot.entries != manifest.file_entries or snapshot.tree_digest != manifest.installed_tree_digest:
+            raise DeploymentIntegrityError("deployment backup package differs from its manifest")
+        package_manifest_bytes, _ = _read_regular_file(
+            package / MANIFEST_RELATIVE_PATH,
+            label="deployment backup package manifest",
+        )
+        if package_manifest_bytes != manifest_bytes:
+            raise DeploymentIntegrityError("deployment backup manifest copies differ")
+        _verify_installed_modes(package, manifest)
+    if root_members != expected_members:
+        raise DeploymentIntegrityError("deployment backup contains an unlisted member")
     agents_value = metadata.get("agents")
     if not isinstance(agents_value, dict):
         raise DeploymentIntegrityError("deployment backup AGENTS arm is invalid")
@@ -1066,6 +1364,7 @@ def _validate_backup(
         created=False,
         prior_manifest=manifest,
         agents=agents,
+        cleanup_ledger=_capture_cleanup_ledger(path),
     )
 
 
@@ -1075,6 +1374,8 @@ def _create_backup(
     prior_agents: _AgentsFile,
     successor_manifest: DeploymentManifest,
     *,
+    operation_kind: str = "deploy",
+    request_receipt_id: str | None = None,
     fault_injector: _FaultInjector | None = None,
 ) -> _BackupRecord:
     prior_manifest_bytes, _ = _read_regular_file(
@@ -1088,6 +1389,8 @@ def _create_backup(
         prior_manifest,
         prior_agents,
         successor_manifest,
+        operation_kind=operation_kind,
+        request_receipt_id=request_receipt_id,
     )
     final = paths.backups_root / _sha256(identity_payload)
     try:
@@ -1188,6 +1491,86 @@ def _create_backup(
         created=True,
         prior_manifest=record.prior_manifest,
         agents=record.agents,
+        cleanup_ledger=record.cleanup_ledger,
+    )
+
+
+def _create_absent_backup(
+    paths: DeploymentPaths,
+    prior_agents: _AgentsFile,
+    successor_manifest: DeploymentManifest,
+    *,
+    fault_injector: _FaultInjector | None = None,
+) -> _BackupRecord:
+    identity_payload = _absent_backup_identity_payload(prior_agents, successor_manifest)
+    final = paths.backups_root / _sha256(identity_payload)
+    try:
+        os.lstat(final)
+    except FileNotFoundError:
+        pass
+    else:
+        return _validate_backup(final, expected_payload=identity_payload)
+    temporary = _new_temporary(
+        paths.backups_root,
+        label="rsi-backup-stage",
+        operation_id=successor_manifest.operation_id,
+    )
+    _cut(fault_injector, "backup.staging.create")
+    try:
+        os.mkdir(temporary, 0o700)
+        os.chmod(temporary, 0o700, follow_symlinks=False)
+    except OSError:
+        raise DeploymentError("cannot create private backup staging directory") from None
+    temporary_identity = _identity(_safe_directory(temporary, exact_private=True))
+    published = False
+    try:
+        if prior_agents.data is not None:
+            _write_new_file(
+                temporary / "agents.bin",
+                prior_agents.data,
+                mode=0o600,
+                fault_injector=fault_injector,
+                write_boundary="backup.agents.write",
+                fsync_boundary="backup.agents.fsync",
+            )
+        _write_new_file(
+            temporary / "backup.json",
+            identity_payload,
+            mode=0o600,
+            fault_injector=fault_injector,
+            write_boundary="backup.metadata.write",
+            fsync_boundary="backup.metadata.fsync",
+        )
+        _cut(fault_injector, "backup.directory.fsync")
+        _fsync_directory(temporary)
+        ledger = _capture_cleanup_ledger(temporary)
+        _cut(fault_injector, "backup.rename")
+        if _rename_noreplace(temporary, final) != temporary_identity:
+            raise DeploymentAmbiguousError("deployment backup publication identity differs")
+        published = True
+        _cut(fault_injector, "backup.parent.fsync")
+        _fsync_directory(paths.backups_root)
+        _cut(fault_injector, "backup.readback")
+        record = _validate_backup(final, expected_payload=identity_payload)
+    except DeploymentAmbiguousError:
+        raise
+    except Exception as original_error:
+        try:
+            target = final if published else temporary
+            _remove_tree_exact(target, temporary_identity, ledger if "ledger" in locals() else None)
+        except Exception:
+            raise DeploymentAmbiguousError(
+                "absent backup cleanup failed; evidence was preserved"
+            ) from original_error
+        raise
+    return _BackupRecord(
+        path=record.path,
+        identity_payload=record.identity_payload,
+        root_identity=record.root_identity,
+        created=True,
+        prior_manifest=None,
+        agents=record.agents,
+        cleanup_ledger=record.cleanup_ledger,
     )
 
 
@@ -1215,7 +1598,7 @@ def _find_backup_for_successor(paths: DeploymentPaths, operation_id: str) -> _Ba
 
 def _remove_backup_if_created(record: _BackupRecord | None) -> None:
     if record is not None and record.created:
-        _remove_tree_exact(record.path, record.root_identity)
+        _remove_tree_exact(record.path, record.root_identity, record.cleanup_ledger)
 
 
 def _require_identity(path: Path, expected: tuple[int, int], *, label: str) -> None:
@@ -1237,6 +1620,8 @@ def _exchange_transaction(
     successor_manifest: DeploymentManifest,
     *,
     recheck_source: bool,
+    operation_kind: str = "deploy",
+    request_receipt_id: str | None = None,
     fault_injector: _FaultInjector | None = None,
 ) -> DeploymentReceipt:
     operation_id = successor_manifest.operation_id
@@ -1247,12 +1632,14 @@ def _exchange_transaction(
         manifest_digest=_sha256(manifest_bytes),
     )
     active_identity = _identity(os.lstat(paths.installed_root))
+    active_cleanup_ledger = _capture_cleanup_ledger(paths.installed_root)
     stage = _new_temporary(
         paths.skills_root,
         label="rsi-package-stage",
         operation_id=operation_id,
     )
     stage_identity: tuple[int, int] | None = None
+    stage_cleanup_ledger: _CleanupLedger | None = None
     exchanged = False
     instruction_publication: _PublishedInstruction | None = None
     receipt_manifest_publication: _PublishedFile | None = None
@@ -1265,10 +1652,9 @@ def _exchange_transaction(
             stage,
             fault_injector=fault_injector,
         )
+        stage_cleanup_ledger = _capture_cleanup_ledger(stage)
         if recheck_source:
-            if _require_clean_git(source.repository) != source.commit:
-                raise DeploymentSourceError("source commit drifted during staging")
-            verify_package_snapshot(source.package_root, source.snapshot)
+            _recheck_admitted_source(source)
         current = _active_receipt(paths)
         if current is None or current[0] != active_manifest:
             raise DeploymentIntegrityError("active deployment drifted during staging")
@@ -1281,9 +1667,13 @@ def _exchange_transaction(
             active_manifest,
             current_agents,
             successor_manifest,
+            operation_kind=operation_kind,
+            request_receipt_id=request_receipt_id,
             fault_injector=fault_injector,
         )
         _cut(fault_injector, "package.exchange")
+        if recheck_source:
+            _recheck_admitted_source(source)
         _require_identity(paths.installed_root, active_identity, label="active package")
 
         new_identity, old_identity = _exchange(stage, paths.installed_root)
@@ -1349,7 +1739,7 @@ def _exchange_transaction(
                     raise DeploymentAmbiguousError("reverse package exchange identity differs")
                 _fsync_directory(paths.skills_root)
             if stage_identity is not None:
-                _remove_tree_exact(stage, stage_identity)
+                _remove_tree_exact(stage, stage_identity, stage_cleanup_ledger)
             _remove_backup_if_created(backup)
         except DeploymentAmbiguousError:
             raise
@@ -1366,7 +1756,7 @@ def _exchange_transaction(
                 pass
         if stage_identity is not None:
             try:
-                _remove_tree_exact(stage, active_identity)
+                _remove_tree_exact(stage, active_identity, active_cleanup_ledger)
             except (DeploymentError, OSError):
                 pass
         return receipt
@@ -1469,7 +1859,7 @@ def _read_agents(path: Path) -> _AgentsFile:
 
 def _run_git(repo: Path, *arguments: str) -> bytes:
     environment = {
-        **os.environ,
+        **{key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_OPTIONAL_LOCKS": "0",
         "LC_ALL": "C",
@@ -1513,7 +1903,7 @@ def _require_clean_git(repo: Path) -> str:
     return commit
 
 
-def _tracked_package(repo: Path, commit: str) -> dict[str, bool]:
+def _tracked_package(repo: Path, commit: str) -> dict[str, tuple[bool, str]]:
     raw = _run_git(
         repo,
         "ls-tree",
@@ -1524,14 +1914,14 @@ def _tracked_package(repo: Path, commit: str) -> dict[str, bool]:
         "--",
         PACKAGE_RELATIVE_PATH,
     )
-    result: dict[str, bool] = {}
+    result: dict[str, tuple[bool, str]] = {}
     prefix = PACKAGE_RELATIVE_PATH + "/"
     for record in raw.split(b"\x00"):
         if not record:
             continue
         try:
             header, encoded_path = record.split(b"\t", 1)
-            mode, kind, _object_id = header.split(b" ", 2)
+            mode, kind, object_id = header.split(b" ", 2)
             path = encoded_path.decode("utf-8", "strict")
         except (ValueError, UnicodeDecodeError):
             raise DeploymentSourceError("tracked package identity is malformed") from None
@@ -1540,10 +1930,51 @@ def _tracked_package(repo: Path, commit: str) -> dict[str, bool]:
         relative = path[len(prefix) :]
         if not relative or relative in result:
             raise DeploymentSourceError("tracked package membership is ambiguous")
-        result[relative] = mode == b"100755"
+        try:
+            object_text = object_id.decode("ascii", "strict")
+        except UnicodeDecodeError:
+            raise DeploymentSourceError("tracked package object identity is malformed") from None
+        if len(object_text) != 40 or any(value not in "0123456789abcdef" for value in object_text):
+            raise DeploymentSourceError("tracked package object identity is malformed")
+        result[relative] = (mode == b"100755", object_text)
     if not result:
         raise DeploymentSourceError("tracked package is empty")
     return result
+
+
+def _verify_head_package_bytes(
+    repository: Path,
+    commit: str,
+    package_root: Path,
+    snapshot: PackageSnapshot,
+) -> None:
+    tracked = _tracked_package(repository, commit)
+    if set(tracked) != set(snapshot.relative_paths):
+        raise DeploymentSourceError("tracked package membership does not match the source tree")
+    entries = {entry.relative_path: entry for entry in snapshot.entries}
+    for relative, (executable, object_id) in tracked.items():
+        entry = entries[relative]
+        if executable is not entry.executable:
+            raise DeploymentSourceError("tracked package executable identity does not match")
+        head_bytes = _run_git(repository, "cat-file", "blob", object_id)
+        working_bytes, _ = _read_regular_file(
+            package_root / relative,
+            label=f"source package member {relative}",
+        )
+        if head_bytes != working_bytes:
+            raise DeploymentSourceError("source package differs from exact HEAD blob bytes")
+
+
+def _recheck_admitted_source(admitted: _AdmittedSource) -> None:
+    if _require_clean_git(admitted.repository) != admitted.commit:
+        raise DeploymentSourceError("source HEAD changed during admission")
+    verify_package_snapshot(admitted.package_root, admitted.snapshot)
+    _verify_head_package_bytes(
+        admitted.repository,
+        admitted.commit,
+        admitted.package_root,
+        admitted.snapshot,
+    )
 
 
 def _strict_json(payload: bytes, *, label: str) -> object:
@@ -1730,23 +2161,17 @@ def _admit_source(source_repo: Path) -> _AdmittedSource:
     commit = _require_clean_git(repository)
     package_root = repository / PACKAGE_RELATIVE_PATH
     snapshot = scan_package(package_root, exclude_manifest=True)
-    tracked = _tracked_package(repository, commit)
-    if set(tracked) != set(snapshot.relative_paths):
-        raise DeploymentSourceError("tracked package membership does not match the source tree")
-    for entry in snapshot.entries:
-        if tracked[entry.relative_path] is not entry.executable:
-            raise DeploymentSourceError("tracked package executable identity does not match")
+    _verify_head_package_bytes(repository, commit, package_root, snapshot)
     allowlist_digest = _validate_package_documents(package_root, snapshot)
-    if _require_clean_git(repository) != commit:
-        raise DeploymentSourceError("source HEAD changed during admission")
-    verify_package_snapshot(package_root, snapshot)
-    return _AdmittedSource(
+    admitted = _AdmittedSource(
         repository=repository,
         commit=commit,
         package_root=package_root,
         snapshot=snapshot,
         allowlist_digest=allowlist_digest,
     )
+    _recheck_admitted_source(admitted)
+    return admitted
 
 
 def _verify_installed_modes(root: Path, manifest: DeploymentManifest) -> None:
@@ -1773,6 +2198,63 @@ def _verify_installed_modes(root: Path, manifest: DeploymentManifest) -> None:
 
 def _verified_status(paths: DeploymentPaths) -> DeploymentStatus:
     if not paths.installed_root.exists():
+        absent_marker = paths.state_root / "absent.json"
+        try:
+            absent_bytes, _ = _read_regular_file(
+                absent_marker, label="absent deployment authority"
+            )
+        except FileNotFoundError:
+            absent_bytes = None
+        except (DeploymentIntegrityError, OSError):
+            absent_bytes = b""
+        if absent_bytes:
+            try:
+                absent = _canonical_mapping(
+                    absent_bytes, label="absent deployment authority"
+                )
+                if set(absent) != {
+                    "schemaVersion",
+                    "domain",
+                    "operationId",
+                    "requestReceiptId",
+                    "receiptDigest",
+                } or absent.get("schemaVersion") != 1 or absent.get(
+                    "domain"
+                ) != "rsi-global-absent-authority-v1":
+                    raise DeploymentIntegrityError("absent deployment authority is invalid")
+                operation_id = absent.get("operationId")
+                if type(operation_id) is not str:
+                    raise DeploymentIntegrityError("absent operation identity is invalid")
+                marker_bytes, _ = _read_regular_file(
+                    paths.receipts_root / f"{operation_id}.json",
+                    label="absent rollback receipt",
+                )
+                manifest_bytes, _ = _read_regular_file(
+                    paths.receipts_root / f"{operation_id}.manifest.json",
+                    label="absent rollback manifest",
+                )
+                receipt = DeploymentReceipt.from_bytes(marker_bytes)
+                if (
+                    receipt.operation_id != operation_id
+                    or receipt.manifest_byte_length != len(manifest_bytes)
+                    or receipt.manifest_digest != _sha256(manifest_bytes)
+                    or absent.get("receiptDigest") != _sha256(marker_bytes)
+                ):
+                    raise DeploymentIntegrityError("absent receipt binding is invalid")
+                return DeploymentStatus(
+                    state="not-installed",
+                    installed=False,
+                    verified=False,
+                    operation_id=operation_id,
+                    receipt_digest=_sha256(marker_bytes),
+                )
+            except (DeploymentError, DeploymentSchemaError, OSError, ValueError) as error:
+                return DeploymentStatus(
+                    state="ambiguous",
+                    installed=False,
+                    verified=False,
+                    detail=str(error)[:240],
+                )
         try:
             orphaned = any(
                 entry.name.endswith((".json", ".manifest.json"))
@@ -1873,6 +2355,134 @@ def _verified_status(paths: DeploymentPaths) -> DeploymentStatus:
         )
 
 
+def _rollback_initial_to_absent(
+    paths: DeploymentPaths,
+    active_manifest: DeploymentManifest,
+    backup: _BackupRecord,
+    receipt_id: str,
+    operation_id: str,
+    *,
+    fault_injector: _FaultInjector | None = None,
+) -> DeploymentReceipt:
+    successor = DeploymentManifest(
+        source_repository=active_manifest.source_repository,
+        source_commit=active_manifest.source_commit,
+        package_relative_path=PACKAGE_RELATIVE_PATH,
+        production_allowlist_digest=active_manifest.production_allowlist_digest,
+        file_entries=active_manifest.file_entries,
+        source_tree_digest=active_manifest.source_tree_digest,
+        installed_tree_digest=active_manifest.installed_tree_digest,
+        managed_instruction_block_digest=active_manifest.managed_instruction_block_digest,
+        installed_at=datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        operation_id=operation_id,
+    )
+    manifest_bytes = successor.to_bytes()
+    receipt = DeploymentReceipt(
+        operation_id=operation_id,
+        manifest_byte_length=len(manifest_bytes),
+        manifest_digest=_sha256(manifest_bytes),
+    )
+    current_agents = _read_agents(paths.agents_file)
+    active_identity = _identity(os.lstat(paths.installed_root))
+    active_ledger = _capture_cleanup_ledger(paths.installed_root)
+    retained = _new_temporary(
+        paths.skills_root, label="rsi-uninstall", operation_id=operation_id
+    )
+    package_moved = False
+    agents_publication: _PublishedInstruction | None = None
+    absent_agents_temp: Path | None = None
+    absent_agents_identity: tuple[int, int] | None = None
+    manifest_publication: _PublishedFile | None = None
+    marker_publication: _PublishedFile | None = None
+    try:
+        if _rename_noreplace(paths.installed_root, retained) != active_identity:
+            raise DeploymentAmbiguousError("atomic uninstall package identity differs")
+        package_moved = True
+        _fsync_directory(paths.skills_root)
+        if backup.agents.data is None:
+            if current_agents.data is None or current_agents.device is None or current_agents.inode is None:
+                raise DeploymentIntegrityError("current global instructions are unavailable")
+            absent_agents_temp = _new_temporary(
+                paths.codex_home, label="rsi-agents-uninstall", operation_id=operation_id
+            )
+            absent_agents_identity = _rename_noreplace(
+                paths.agents_file, absent_agents_temp
+            )
+            if absent_agents_identity != (current_agents.device, current_agents.inode):
+                raise DeploymentAmbiguousError("atomic instruction uninstall identity differs")
+            _fsync_directory(paths.codex_home)
+            if _read_agents(paths.agents_file).data is not None:
+                raise DeploymentAmbiguousError("global instruction absence did not verify")
+        else:
+            if backup.agents.mode is None:
+                raise DeploymentIntegrityError("backup global instruction mode is missing")
+            agents_publication = _publish_instruction(
+                paths,
+                current_agents,
+                backup.agents.data,
+                mode=backup.agents.mode,
+                operation_id=operation_id,
+                fault_injector=fault_injector,
+            )
+        manifest_publication = _publish_immutable_file(
+            paths.receipts_root / f"{operation_id}.manifest.json",
+            manifest_bytes,
+            operation_id=operation_id,
+            kind="manifest",
+            fault_injector=fault_injector,
+        )
+        marker_publication = _publish_immutable_file(
+            paths.receipts_root / f"{operation_id}.json",
+            receipt.to_bytes(),
+            operation_id=operation_id,
+            kind="marker",
+            fault_injector=fault_injector,
+        )
+        absent_payload = canonical_json_bytes(
+            {
+                "schemaVersion": 1,
+                "domain": "rsi-global-absent-authority-v1",
+                "operationId": operation_id,
+                "requestReceiptId": receipt_id,
+                "receiptDigest": _sha256(receipt.to_bytes()),
+            }
+        )
+        _publish_immutable_file(
+            paths.state_root / "absent.json",
+            absent_payload,
+            operation_id=operation_id,
+            kind="absent",
+            fault_injector=fault_injector,
+        )
+    except Exception as original_error:
+        try:
+            if marker_publication is not None:
+                _unlink_exact(marker_publication.path, marker_publication.identity)
+            if manifest_publication is not None:
+                _unlink_exact(manifest_publication.path, manifest_publication.identity)
+            if agents_publication is not None:
+                _restore_instruction(paths, agents_publication)
+            if absent_agents_temp is not None and absent_agents_identity is not None:
+                if _rename_noreplace(absent_agents_temp, paths.agents_file) != absent_agents_identity:
+                    raise DeploymentAmbiguousError("instruction uninstall rollback differs")
+                _fsync_directory(paths.codex_home)
+            if package_moved:
+                if _rename_noreplace(retained, paths.installed_root) != active_identity:
+                    raise DeploymentAmbiguousError("package uninstall rollback differs")
+                _fsync_directory(paths.skills_root)
+        except Exception:
+            raise DeploymentAmbiguousError(
+                "initial rollback failed ambiguously; evidence was preserved"
+            ) from original_error
+        raise
+    if agents_publication is not None:
+        _discard_prior_instruction(paths, agents_publication)
+    if absent_agents_temp is not None and absent_agents_identity is not None:
+        _unlink_exact(absent_agents_temp, absent_agents_identity)
+    _remove_tree_exact(retained, active_identity, active_ledger)
+    return receipt
+
+
 class GlobalRsiDeployer:
     """Plan and verify one fixed global RSI deployment."""
 
@@ -1886,6 +2496,7 @@ class GlobalRsiDeployer:
         self.paths = DeploymentPaths.live() if paths is None else paths
         if type(self.paths) is not DeploymentPaths:
             raise DeploymentError("deployment paths are invalid")
+        _validate_deployment_paths(self.paths)
         if fault_injector is not None and not self.paths.testing:
             raise DeploymentError("fault injection is available only with explicit test paths")
         if fault_injector is not None and not callable(fault_injector):
@@ -1903,6 +2514,7 @@ class GlobalRsiDeployer:
         self._lock_timeout = float(lock_timeout)
 
     def plan(self, source_repo: Path) -> DeploymentPlan:
+        _validate_deployment_paths(self.paths)
         admitted = _admit_source(source_repo)
         with _shared_lock(self.paths, timeout=self._lock_timeout):
             agents = _read_agents(self.paths.agents_file)
@@ -1912,10 +2524,14 @@ class GlobalRsiDeployer:
                 action = "install"
             elif not current.verified:
                 raise DeploymentIntegrityError("current deployment is not verified")
-            elif current.tree_digest == admitted.snapshot.tree_digest:
-                action = "no-op"
             else:
-                action = "update"
+                active = _active_receipt(self.paths)
+                action = (
+                    "no-op"
+                    if active is not None
+                    and _active_matches_deploy_request(active[0], admitted)
+                    else "update"
+                )
         return DeploymentPlan(
             eligible=True,
             action=action,
@@ -1928,6 +2544,7 @@ class GlobalRsiDeployer:
     def deploy(self, source_repo: Path, operation_id: str) -> DeploymentReceipt:
         """Install one clean source commit and publish immutable authority last."""
 
+        _validate_deployment_paths(self.paths)
         _validate_operation_id(operation_id)
         # A read-only preflight prevents invalid source/instruction input from
         # creating even the private lock layout.  Every identity is repeated
@@ -1951,12 +2568,7 @@ class GlobalRsiDeployer:
 
             active = _active_receipt(self.paths)
             if active is not None:
-                if (
-                    active[0].source_repository == os.fspath(admitted.repository)
-                    and active[0].source_commit == admitted.commit
-                    and active[0].source_tree_digest == admitted.snapshot.tree_digest
-                    and active[0].file_entries == admitted.snapshot.entries
-                ):
+                if _active_matches_deploy_request(active[0], admitted):
                     return active[1]
                 current_agents = _read_agents(self.paths.agents_file)
                 try:
@@ -1998,12 +2610,19 @@ class GlobalRsiDeployer:
                 manifest_byte_length=len(manifest_bytes),
                 manifest_digest=_sha256(manifest_bytes),
             )
+            initial_backup = _create_absent_backup(
+                self.paths,
+                prior_agents,
+                manifest,
+                fault_injector=self._fault_injector,
+            )
             stage = _new_temporary(
                 self.paths.skills_root,
                 label="rsi-package-stage",
                 operation_id=operation_id,
             )
             stage_identity: tuple[int, int] | None = None
+            stage_cleanup_ledger: _CleanupLedger | None = None
             package_published = False
             instruction_publication: _PublishedInstruction | None = None
             receipt_manifest_publication: _PublishedFile | None = None
@@ -2015,11 +2634,11 @@ class GlobalRsiDeployer:
                     stage,
                     fault_injector=self._fault_injector,
                 )
-                if _require_clean_git(admitted.repository) != admitted.commit:
-                    raise DeploymentSourceError("source commit drifted during staging")
-                verify_package_snapshot(admitted.package_root, admitted.snapshot)
+                stage_cleanup_ledger = _capture_cleanup_ledger(stage)
+                _recheck_admitted_source(admitted)
 
                 _cut(self._fault_injector, "package.rename")
+                _recheck_admitted_source(admitted)
                 installed_identity = _rename_noreplace(stage, self.paths.installed_root)
                 if installed_identity != stage_identity:
                     raise DeploymentAmbiguousError("installed package publication differs")
@@ -2083,9 +2702,10 @@ class GlobalRsiDeployer:
                                 "package rollback identity differs; evidence was preserved"
                             )
                         _fsync_directory(self.paths.skills_root)
-                        _remove_tree_exact(stage, stage_identity)
+                        _remove_tree_exact(stage, stage_identity, stage_cleanup_ledger)
                     elif stage_identity is not None:
-                        _remove_tree_exact(stage, stage_identity)
+                        _remove_tree_exact(stage, stage_identity, stage_cleanup_ledger)
+                    _remove_backup_if_created(initial_backup)
                 except DeploymentAmbiguousError:
                     raise
                 except Exception:
@@ -2104,13 +2724,38 @@ class GlobalRsiDeployer:
     def rollback(self, receipt_id: str, operation_id: str) -> DeploymentReceipt:
         """Restore the exact backup selected by the active deployment receipt."""
 
+        _validate_deployment_paths(self.paths)
         _validate_operation_id(receipt_id)
         _validate_operation_id(operation_id)
         _require_atomic_backend()
         with _exclusive_lock(self.paths, timeout=self._lock_timeout):
             active = _active_receipt(self.paths)
             if active is None:
-                raise DeploymentIntegrityError("cannot rollback a missing deployment")
+                absent_path = self.paths.state_root / "absent.json"
+                try:
+                    absent_bytes, _ = _read_regular_file(
+                        absent_path, label="absent deployment authority"
+                    )
+                    absent = _canonical_mapping(
+                        absent_bytes, label="absent deployment authority"
+                    )
+                except (DeploymentError, OSError):
+                    raise DeploymentIntegrityError("cannot rollback a missing deployment") from None
+                if (
+                    absent.get("operationId") != operation_id
+                    or absent.get("requestReceiptId") != receipt_id
+                ):
+                    raise DeploymentOperationConflict(
+                        "absent rollback replay conflicts with immutable authority"
+                    )
+                replay_bytes, _ = _read_regular_file(
+                    self.paths.receipts_root / f"{operation_id}.json",
+                    label="absent rollback receipt",
+                )
+                replay = DeploymentReceipt.from_bytes(replay_bytes)
+                if absent.get("receiptDigest") != _sha256(replay_bytes):
+                    raise DeploymentIntegrityError("absent rollback receipt binding is invalid")
+                return replay
 
             requested_marker = self.paths.receipts_root / f"{operation_id}.json"
             requested_manifest = (
@@ -2129,12 +2774,19 @@ class GlobalRsiDeployer:
                 )
                 replay_receipt = DeploymentReceipt.from_bytes(receipt_bytes)
                 replay_manifest = DeploymentManifest.from_bytes(manifest_bytes)
+                replay_backup = _find_backup_for_successor(self.paths, operation_id)
+                replay_metadata = _canonical_mapping(
+                    replay_backup.identity_payload,
+                    label="rollback replay backup metadata",
+                )
                 if (
                     active[0].operation_id == operation_id
                     and replay_manifest.operation_id == operation_id
                     and replay_receipt.operation_id == operation_id
                     and replay_receipt.manifest_byte_length == len(manifest_bytes)
                     and replay_receipt.manifest_digest == _sha256(manifest_bytes)
+                    and replay_metadata.get("operationKind") == "rollback"
+                    and replay_metadata.get("requestReceiptId") == receipt_id
                 ):
                     return replay_receipt
                 raise DeploymentOperationConflict(
@@ -2144,6 +2796,19 @@ class GlobalRsiDeployer:
             backup = _find_backup_for_successor(
                 self.paths, active[0].operation_id
             )
+            if backup.prior_manifest is None:
+                if receipt_id != active[0].operation_id:
+                    raise DeploymentOperationConflict(
+                        "initial rollback receipt does not select the active deployment"
+                    )
+                return _rollback_initial_to_absent(
+                    self.paths,
+                    active[0],
+                    backup,
+                    receipt_id,
+                    operation_id,
+                    fault_injector=self._fault_injector,
+                )
             if receipt_id != active[0].operation_id:
                 if receipt_id != backup.prior_manifest.operation_id:
                     raise DeploymentOperationConflict(
@@ -2244,10 +2909,13 @@ class GlobalRsiDeployer:
                 backup.agents.mode,
                 successor_manifest,
                 recheck_source=False,
+                operation_kind="rollback",
+                request_receipt_id=receipt_id,
                 fault_injector=self._fault_injector,
             )
 
     def verify(self) -> DeploymentStatus:
+        _validate_deployment_paths(self.paths)
         try:
             with _shared_lock(self.paths, timeout=self._lock_timeout):
                 return _verified_status(self.paths)
@@ -2257,6 +2925,13 @@ class GlobalRsiDeployer:
                 installed=self.paths.installed_root.exists(),
                 verified=False,
                 detail=str(error),
+            )
+        except DeploymentIntegrityError as error:
+            return DeploymentStatus(
+                state="invalid",
+                installed=self.paths.installed_root.exists(),
+                verified=False,
+                detail=str(error)[:240],
             )
 
     def status(self) -> DeploymentStatus:
