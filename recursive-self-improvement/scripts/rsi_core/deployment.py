@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from typing import Callable
 
 from .deployment_fs import (
@@ -75,6 +76,9 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _ALLOWLIST_DOMAIN = "rsi-global-production-allowlist-v1"
 _FaultInjector = Callable[[str], None]
+_ACTIVE_ROOTS: ContextVar["_RetainedRoots | None"] = ContextVar(
+    "rsi_deployment_roots", default=None
+)
 
 
 def _cut(fault_injector: _FaultInjector | None, boundary: str) -> None:
@@ -304,6 +308,12 @@ class _PublishedPointer:
 
 
 @dataclass(frozen=True, slots=True)
+class _AuthorityTransition:
+    authority: _PublishedFile
+    pointer: _PublishedPointer
+
+
+@dataclass(frozen=True, slots=True)
 class _BackupRecord:
     path: Path
     identity_payload: bytes
@@ -400,13 +410,7 @@ def _safe_directory(path: Path, *, exact_private: bool) -> os.stat_result:
 
 
 def _fsync_directory(path: Path) -> None:
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC,
-        )
-    except OSError:
-        raise DeploymentIntegrityError(f"cannot open directory for durability: {path.name}") from None
+    descriptor = _descriptor_directory(path)
     try:
         os.fsync(descriptor)
     except OSError:
@@ -447,17 +451,21 @@ def _ensure_lock_root(paths: DeploymentPaths) -> None:
 class _RetainedRoots:
     def __init__(self, paths: DeploymentPaths) -> None:
         self._entries: list[tuple[Path, int, tuple[int, int]]] = []
-        for path in (
-            paths.codex_home,
-            paths.skills_root,
-            paths.state_root,
-            paths.receipts_root,
-            paths.backups_root,
-            paths.authorities_root,
-        ):
-            descriptor = _open_parent(path / ".")
-            metadata = os.fstat(descriptor)
-            self._entries.append((path, descriptor, _identity(metadata)))
+        try:
+            for path in (
+                paths.codex_home,
+                paths.skills_root,
+                paths.state_root,
+                paths.receipts_root,
+                paths.backups_root,
+                paths.authorities_root,
+            ):
+                descriptor = _open_parent(path)
+                metadata = os.fstat(descriptor)
+                self._entries.append((path, descriptor, _identity(metadata)))
+        except Exception:
+            self.close()
+            raise
 
     def validate(self) -> None:
         for path, descriptor, expected in self._entries:
@@ -485,6 +493,44 @@ class _RetainedRoots:
             self.validate()
 
         return call
+
+    def open_directory(self, path: Path) -> int:
+        candidates = [
+            entry for entry in self._entries if path == entry[0] or entry[0] in path.parents
+        ]
+        if not candidates:
+            raise DeploymentIntegrityError("path is outside retained deployment roots")
+        root_path, root_fd, _root_identity = max(
+            candidates, key=lambda entry: len(entry[0].parts)
+        )
+        descriptor = os.dup(root_fd)
+        try:
+            for component in path.relative_to(root_path).parts:
+                if component in {"", ".", ".."} or "/" in component or "\x00" in component:
+                    raise DeploymentIntegrityError("descriptor-relative component is unsafe")
+                child = os.open(
+                    component,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | _NOFOLLOW
+                    | _CLOEXEC,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = child
+            return descriptor
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def handles(self, path: Path) -> bool:
+        return any(path == root or root in path.parents for root, _fd, _identity in self._entries)
+
+    def open_parent(self, path: Path) -> tuple[int, str]:
+        name = path.name
+        if not name or name in {".", ".."} or "/" in name or "\x00" in name:
+            raise DeploymentIntegrityError("descriptor-relative basename is unsafe")
+        return self.open_directory(path.parent), name
 
     def close(self) -> None:
         for _path, descriptor, _identity_value in reversed(self._entries):
@@ -572,10 +618,14 @@ def _exclusive_lock(paths: DeploymentPaths, *, timeout: float = 5.0):
         _ensure_directory(paths.backups_root, exact_private=True)
         _ensure_directory(paths.authorities_root, exact_private=True)
         roots = _RetainedRoots(paths)
+        token: Token[_RetainedRoots | None] | None = None
         try:
             roots.validate()
+            token = _ACTIVE_ROOTS.set(roots)
             yield roots
         finally:
+            if token is not None:
+                _ACTIVE_ROOTS.reset(token)
             roots.close()
     finally:
         try:
@@ -669,13 +719,16 @@ def _write_new_file(
     write_boundary: str | None = None,
     fsync_boundary: str | None = None,
 ) -> tuple[int, int]:
+    parent_fd, name = _descriptor_parent(path)
     try:
         descriptor = os.open(
-            path,
+            name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC,
             0o600,
+            dir_fd=parent_fd,
         )
     except OSError:
+        os.close(parent_fd)
         raise DeploymentError(f"cannot create private deployment file: {path.name}") from None
     try:
         opened_identity = _identity(os.fstat(descriptor))
@@ -692,7 +745,7 @@ def _write_new_file(
         return _identity(metadata)
     except Exception as original_error:
         try:
-            named = os.lstat(path)
+            named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if (
                 not stat.S_ISREG(named.st_mode)
                 or _identity(named) != opened_identity
@@ -702,7 +755,7 @@ def _write_new_file(
                 raise DeploymentAmbiguousError(
                     f"new deployment file changed before cleanup: {path.name}"
                 )
-            os.unlink(path)
+            os.unlink(name, dir_fd=parent_fd)
         except FileNotFoundError:
             pass
         except DeploymentAmbiguousError:
@@ -716,6 +769,7 @@ def _write_new_file(
         raise
     finally:
         os.close(descriptor)
+        os.close(parent_fd)
 
 
 def _open_parent(path: Path) -> int:
@@ -726,6 +780,20 @@ def _open_parent(path: Path) -> int:
         )
     except OSError:
         raise DeploymentIntegrityError(f"cannot retain deployment parent: {path.name}") from None
+
+
+def _descriptor_parent(path: Path) -> tuple[int, str]:
+    roots = _ACTIVE_ROOTS.get()
+    if roots is not None and roots.handles(path):
+        return roots.open_parent(path)
+    return _open_parent(path.parent), path.name
+
+
+def _descriptor_directory(path: Path) -> int:
+    roots = _ACTIVE_ROOTS.get()
+    if roots is not None and roots.handles(path):
+        return roots.open_directory(path)
+    return _open_parent(path)
 
 
 def _renameatx(parent_fd: int, source: str, destination: str, flags: int) -> None:
@@ -763,7 +831,7 @@ def _require_atomic_backend() -> None:
 def _rename_noreplace(source: Path, destination: Path) -> tuple[int, int]:
     if source.parent != destination.parent:
         raise DeploymentUnsupported("atomic publication requires one parent directory")
-    parent_fd = _open_parent(source.parent)
+    parent_fd = _descriptor_directory(source.parent)
     try:
         before = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
         try:
@@ -795,7 +863,7 @@ def _rename_noreplace(source: Path, destination: Path) -> tuple[int, int]:
 def _exchange(source: Path, destination: Path) -> tuple[tuple[int, int], tuple[int, int]]:
     if source.parent != destination.parent:
         raise DeploymentUnsupported("atomic exchange requires one parent directory")
-    parent_fd = _open_parent(source.parent)
+    parent_fd = _descriptor_directory(source.parent)
     try:
         source_before = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
         destination_before = os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -819,6 +887,55 @@ def _new_temporary(parent: Path, *, label: str, operation_id: str) -> Path:
     return parent / f".{label}.{operation_id}.{secrets.token_hex(12)}"
 
 
+def _mkdir_private(path: Path) -> tuple[int, int]:
+    parent_fd, name = _descriptor_parent(path)
+    descriptor: int | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        created_identity = _identity(
+            os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        )
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        if _identity(os.fstat(descriptor)) != created_identity:
+            raise DeploymentAmbiguousError(
+                "private transaction directory changed while opening"
+            )
+        os.fchmod(descriptor, 0o700)
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise DeploymentIntegrityError("private transaction directory is unsafe")
+        return _identity(metadata)
+    except Exception as original_error:
+        if created_identity is not None:
+            try:
+                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(named.st_mode) or _identity(named) != created_identity:
+                    raise DeploymentAmbiguousError(
+                        "private transaction directory changed before cleanup"
+                    )
+                os.rmdir(name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except DeploymentAmbiguousError:
+                raise
+            except OSError:
+                raise DeploymentAmbiguousError(
+                    "private transaction directory cleanup failed"
+                ) from original_error
+        if isinstance(original_error, OSError):
+            raise DeploymentError("cannot create private transaction directory") from None
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def _stage_package(
     admitted: _AdmittedSource,
     manifest: DeploymentManifest,
@@ -828,12 +945,7 @@ def _stage_package(
     boundary_prefix: str = "package",
 ) -> tuple[int, int]:
     _cut(fault_injector, f"{boundary_prefix}.staging.create")
-    try:
-        os.mkdir(destination, 0o700)
-        os.chmod(destination, 0o700, follow_symlinks=False)
-    except OSError:
-        raise DeploymentError("cannot create private package staging directory") from None
-    root_identity = _identity(_safe_directory(destination, exact_private=True))
+    root_identity = _mkdir_private(destination)
     ledger_members: dict[str, tuple[str, int, int]] = {}
     try:
         created_directories: set[Path] = {destination}
@@ -845,13 +957,8 @@ def _stage_package(
                 parents.append(current)
                 current = current.parent
             for parent in reversed(parents):
-                try:
-                    os.mkdir(parent, 0o700)
-                    os.chmod(parent, 0o700, follow_symlinks=False)
-                except OSError:
-                    raise DeploymentError("cannot create private package staging member") from None
+                parent_identity = _mkdir_private(parent)
                 created_directories.add(parent)
-                parent_identity = _identity(os.lstat(parent))
                 ledger_members[parent.relative_to(destination).as_posix()] = (
                     "directory",
                     parent_identity[0],
@@ -926,97 +1033,277 @@ def _stage_package(
         raise
 
 
-def _capture_cleanup_ledger(path: Path) -> _CleanupLedger:
-    root = os.lstat(path)
-    if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.geteuid():
-        raise DeploymentAmbiguousError("private transaction root is unsafe")
+def _cleanup_member_kind(metadata: os.stat_result) -> str:
+    if metadata.st_uid != os.geteuid() or stat.S_ISLNK(metadata.st_mode):
+        raise DeploymentAmbiguousError("private transaction member is unsafe")
+    if stat.S_ISREG(metadata.st_mode):
+        if metadata.st_nlink != 1:
+            raise DeploymentAmbiguousError("private transaction file topology is unsafe")
+        return "file"
+    if stat.S_ISDIR(metadata.st_mode):
+        return "directory"
+    raise DeploymentAmbiguousError("private transaction member type is unsafe")
+
+
+def _capture_cleanup_members(
+    directory_fd: int, prefix: str = ""
+) -> list[tuple[str, str, int, int]]:
     members: list[tuple[str, str, int, int]] = []
-    for member in sorted(path.rglob("*"), key=lambda item: os.fsencode(item)):
-        metadata = os.lstat(member)
-        if metadata.st_uid != os.geteuid() or stat.S_ISLNK(metadata.st_mode):
-            raise DeploymentAmbiguousError("private transaction member is unsafe")
-        if stat.S_ISREG(metadata.st_mode):
-            kind = "file"
-            if metadata.st_nlink != 1:
-                raise DeploymentAmbiguousError("private transaction file topology is unsafe")
-        elif stat.S_ISDIR(metadata.st_mode):
-            kind = "directory"
-        else:
-            raise DeploymentAmbiguousError("private transaction member type is unsafe")
-        members.append(
-            (
-                member.relative_to(path).as_posix(),
-                kind,
-                metadata.st_dev,
-                metadata.st_ino,
+    try:
+        names = sorted(os.listdir(directory_fd), key=os.fsencode)
+    except OSError:
+        raise DeploymentAmbiguousError("cannot enumerate private transaction evidence") from None
+    for name in names:
+        if name in {"", ".", ".."} or "/" in name or "\x00" in name:
+            raise DeploymentAmbiguousError("private transaction member name is unsafe")
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            raise DeploymentAmbiguousError("private transaction member changed during scan") from None
+        kind = _cleanup_member_kind(metadata)
+        relative = f"{prefix}/{name}" if prefix else name
+        members.append((relative, kind, metadata.st_dev, metadata.st_ino))
+        if kind == "directory":
+            child_fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC,
+                dir_fd=directory_fd,
             )
+            try:
+                members.extend(_capture_cleanup_members(child_fd, relative))
+            finally:
+                os.close(child_fd)
+    return members
+
+
+def _capture_cleanup_ledger(path: Path) -> _CleanupLedger:
+    parent_fd, name = _descriptor_parent(path)
+    root_fd: int | None = None
+    try:
+        root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.geteuid():
+            raise DeploymentAmbiguousError("private transaction root is unsafe")
+        root_fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC,
+            dir_fd=parent_fd,
         )
-    return _CleanupLedger(_identity(root), tuple(members))
+        return _CleanupLedger(
+            _identity(root), tuple(_capture_cleanup_members(root_fd))
+        )
+    except OSError:
+        raise DeploymentAmbiguousError("cannot inspect private transaction evidence") from None
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
 
 
 def _remove_tree_exact(
     path: Path,
     expected_identity: tuple[int, int],
     ledger: _CleanupLedger | None = None,
+    *,
+    cleanup_injector: _FaultInjector | None = None,
 ) -> None:
+    parent_fd, name = _descriptor_parent(path)
+    root_fd: int | None = None
     try:
-        root = os.lstat(path)
+        root = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
+        os.close(parent_fd)
         return
     except OSError:
+        os.close(parent_fd)
         raise DeploymentAmbiguousError("cannot inspect private transaction evidence") from None
     if not stat.S_ISDIR(root.st_mode) or _identity(root) != expected_identity:
+        os.close(parent_fd)
         raise DeploymentAmbiguousError("private transaction evidence changed identity")
-    if ledger is not None:
-        actual = _capture_cleanup_ledger(path)
+    try:
+        root_fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        actual = _CleanupLedger(
+            _identity(os.fstat(root_fd)), tuple(_capture_cleanup_members(root_fd))
+        )
+        if ledger is None:
+            ledger = actual
         if actual != ledger or ledger.root_identity != expected_identity:
             raise DeploymentAmbiguousError(
                 "private transaction membership changed; evidence was preserved"
             )
-    for current_root, directory_names, file_names in os.walk(path, topdown=False, followlinks=False):
-        current = Path(current_root)
-        for name in file_names:
-            member = current / name
-            metadata = os.lstat(member)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
-                raise DeploymentAmbiguousError("private transaction file changed identity")
-            os.unlink(member)
-        for name in directory_names:
-            member = current / name
-            metadata = os.lstat(member)
-            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
-                raise DeploymentAmbiguousError("private transaction directory changed identity")
-            os.rmdir(member)
-    if _identity(os.lstat(path)) != expected_identity:
-        raise DeploymentAmbiguousError("private transaction root changed before cleanup")
-    os.rmdir(path)
-    _fsync_directory(path.parent)
+
+        expected = {
+            relative: (kind, device, inode)
+            for relative, kind, device, inode in ledger.members
+        }
+
+        def validate_members(directory_fd: int, prefix: str = "") -> None:
+            names = sorted(os.listdir(directory_fd), key=os.fsencode)
+            expected_names = {
+                relative[len(prefix) + 1 :].split("/", 1)[0]
+                if prefix
+                else relative.split("/", 1)[0]
+                for relative in expected
+                if (prefix and relative.startswith(prefix + "/")) or not prefix
+            }
+            if set(names) != expected_names:
+                raise DeploymentAmbiguousError(
+                    "private transaction membership changed; evidence was preserved"
+                )
+            for child_name in names:
+                relative = f"{prefix}/{child_name}" if prefix else child_name
+                kind, device, inode = expected[relative]
+                if kind == "directory":
+                    child_fd = os.open(
+                        child_name,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | _NOFOLLOW
+                        | _CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        validate_members(child_fd, relative)
+                    finally:
+                        os.close(child_fd)
+                    boundary = "cleanup.directory.before_rmdir"
+                else:
+                    boundary = "cleanup.file.before_unlink"
+                _cut(cleanup_injector, boundary)
+                metadata = os.stat(
+                    child_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if _cleanup_member_kind(metadata) != kind or _identity(metadata) != (
+                    device,
+                    inode,
+                ):
+                    raise DeploymentAmbiguousError(
+                        "private transaction member changed before cleanup; evidence was preserved"
+                    )
+
+        validate_members(root_fd)
+        _cut(cleanup_injector, "cleanup.root.before_rmdir")
+        root_validated = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(root_validated.st_mode) or _identity(
+            root_validated
+        ) != expected_identity:
+            raise DeploymentAmbiguousError(
+                "private transaction root changed before cleanup; evidence was preserved"
+            )
+
+        def remove_members(directory_fd: int, prefix: str = "") -> None:
+            names = sorted(os.listdir(directory_fd), key=os.fsencode)
+            expected_names = {
+                relative[len(prefix) + 1 :].split("/", 1)[0]
+                if prefix
+                else relative.split("/", 1)[0]
+                for relative in expected
+                if (prefix and relative.startswith(prefix + "/"))
+                or (not prefix and "/" not in relative or not prefix)
+            }
+            if set(names) != expected_names:
+                raise DeploymentAmbiguousError(
+                    "private transaction membership changed; evidence was preserved"
+                )
+            for child_name in names:
+                relative = f"{prefix}/{child_name}" if prefix else child_name
+                kind, device, inode = expected[relative]
+                metadata = os.stat(
+                    child_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if _cleanup_member_kind(metadata) != kind or _identity(metadata) != (
+                    device,
+                    inode,
+                ):
+                    raise DeploymentAmbiguousError(
+                        "private transaction member changed identity; evidence was preserved"
+                    )
+                if kind == "directory":
+                    child_fd = os.open(
+                        child_name,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | _NOFOLLOW
+                        | _CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        remove_members(child_fd, relative)
+                    finally:
+                        os.close(child_fd)
+                    metadata = os.stat(
+                        child_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if not stat.S_ISDIR(metadata.st_mode) or _identity(metadata) != (
+                        device,
+                        inode,
+                    ):
+                        raise DeploymentAmbiguousError(
+                            "private transaction directory changed before cleanup"
+                        )
+                    os.rmdir(child_name, dir_fd=directory_fd)
+                else:
+                    metadata = os.stat(
+                        child_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != (
+                        device,
+                        inode,
+                    ):
+                        raise DeploymentAmbiguousError(
+                            "private transaction file changed before cleanup"
+                        )
+                    os.unlink(child_name, dir_fd=directory_fd)
+
+        remove_members(root_fd)
+        root_now = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(root_now.st_mode) or _identity(root_now) != expected_identity:
+            raise DeploymentAmbiguousError("private transaction root changed before cleanup")
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
+        os.close(parent_fd)
 
 
 def _unlink_exact(path: Path, expected_identity: tuple[int, int]) -> None:
+    parent_fd, name = _descriptor_parent(path)
     try:
-        metadata = os.lstat(path)
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
+        os.close(parent_fd)
         return
-    if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != expected_identity:
-        raise DeploymentAmbiguousError("transaction file changed before cleanup")
-    os.unlink(path)
-    _fsync_directory(path.parent)
+    try:
+        if not stat.S_ISREG(metadata.st_mode) or _identity(metadata) != expected_identity:
+            raise DeploymentAmbiguousError("transaction file changed before cleanup")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _cleanup_created_file(path: Path) -> None:
+    parent_fd, name = _descriptor_parent(path)
     try:
-        metadata = os.lstat(path)
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
+        os.close(parent_fd)
         return
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
-    ):
-        raise DeploymentAmbiguousError("private transaction file is unsafe to clean")
-    os.unlink(path)
-    _fsync_directory(path.parent)
+    try:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise DeploymentAmbiguousError("private transaction file is unsafe to clean")
+        os.unlink(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _publish_instruction(
@@ -1241,7 +1528,6 @@ def _publish_active_pointer(
     prior_bytes: bytes | None = None
     old_identity: tuple[int, int] | None = None
     try:
-        _cut(fault_injector, "authority.pointer.replace")
         try:
             prior_bytes, prior_stat = _read_regular_file(
                 path, label="prior active authority"
@@ -1253,10 +1539,13 @@ def _publish_active_pointer(
                 dangling = None
             if dangling is not None:
                 raise
+            _cut(fault_injector, "authority.pointer.replace")
             active_identity = _rename_noreplace(temporary, path)
         else:
-            active_identity, old_identity = _exchange(temporary, path)
-            if old_identity != _identity(prior_stat):
+            old_identity = _identity(prior_stat)
+            _cut(fault_injector, "authority.pointer.replace")
+            active_identity, displaced_identity = _exchange(temporary, path)
+            if displaced_identity != old_identity:
                 raise DeploymentAmbiguousError("active authority prior identity differs")
         if active_identity != identity:
             raise DeploymentAmbiguousError("active authority publication identity differs")
@@ -1272,7 +1561,7 @@ def _publish_active_pointer(
             current, current_stat = _read_regular_file(path, label="active authority")
         except DeploymentIntegrityError:
             _cleanup_created_file(temporary)
-            raise
+            raise original_error
         if _identity(current_stat) == identity:
             if prior_bytes is None:
                 _rename_noreplace(path, temporary)
@@ -1284,6 +1573,13 @@ def _publish_active_pointer(
                     raise DeploymentAmbiguousError("active authority rollback differs")
                 _fsync_directory(path.parent)
                 _unlink_exact(temporary, identity)
+        elif (
+            prior_bytes is not None
+            and old_identity is not None
+            and _identity(current_stat) == old_identity
+            and current == prior_bytes
+        ):
+            _unlink_exact(temporary, identity)
         else:
             raise DeploymentAmbiguousError(
                 "active authority failure is ambiguous; evidence was preserved"
@@ -1296,6 +1592,52 @@ def _discard_pointer_prior(paths: DeploymentPaths, publication: _PublishedPointe
         _unlink_exact(publication.temporary, publication.old_identity)
 
 
+def _rollback_authority_transition(
+    paths: DeploymentPaths, transition: _AuthorityTransition
+) -> None:
+    publication = transition.pointer
+    _current_bytes, current_stat = _read_regular_file(
+        paths.active_authority_file, label="active authority during rollback"
+    )
+    if _identity(current_stat) != publication.active_identity:
+        raise DeploymentAmbiguousError(
+            "active authority changed before transition rollback; evidence was preserved"
+        )
+    if publication.prior_bytes is None:
+        restored = _rename_noreplace(
+            paths.active_authority_file, publication.temporary
+        )
+        if restored != publication.active_identity:
+            raise DeploymentAmbiguousError("active authority absence rollback differs")
+        _fsync_directory(paths.state_root)
+        _unlink_exact(publication.temporary, publication.active_identity)
+    else:
+        if publication.old_identity is None:
+            raise DeploymentAmbiguousError("prior active authority identity is missing")
+        restored, displaced = _exchange(
+            publication.temporary, paths.active_authority_file
+        )
+        if restored != publication.old_identity or displaced != publication.active_identity:
+            raise DeploymentAmbiguousError("active authority reverse exchange differs")
+        _fsync_directory(paths.state_root)
+        readback, restored_stat = _read_regular_file(
+            paths.active_authority_file, label="restored active authority"
+        )
+        if (
+            readback != publication.prior_bytes
+            or _identity(restored_stat) != publication.old_identity
+        ):
+            raise DeploymentAmbiguousError("restored active authority differs")
+        _unlink_exact(publication.temporary, publication.active_identity)
+    _unlink_exact(transition.authority.path, transition.authority.identity)
+
+
+def _finalize_authority_transition(
+    paths: DeploymentPaths, transition: _AuthorityTransition
+) -> None:
+    _discard_pointer_prior(paths, transition.pointer)
+
+
 def _publish_authority_transition(
     paths: DeploymentPaths,
     *,
@@ -1304,7 +1646,7 @@ def _publish_authority_transition(
     receipt: DeploymentReceipt,
     request_receipt_id: str | None,
     fault_injector: _FaultInjector | None = None,
-) -> tuple[_PublishedFile, _PublishedPointer]:
+) -> _AuthorityTransition:
     authority_bytes = _authority_payload(
         state=state,
         operation_id=operation_id,
@@ -1323,14 +1665,24 @@ def _publish_authority_transition(
         operation_id=operation_id,
         authority_digest=_sha256(authority_bytes),
     )
-    pointer = _publish_active_pointer(
-        paths,
-        pointer_bytes,
-        operation_id=operation_id,
-        fault_injector=fault_injector,
-    )
-    _discard_pointer_prior(paths, pointer)
-    return authority, pointer
+    try:
+        pointer = _publish_active_pointer(
+            paths,
+            pointer_bytes,
+            operation_id=operation_id,
+            fault_injector=fault_injector,
+        )
+    except DeploymentAmbiguousError:
+        raise
+    except Exception as original_error:
+        try:
+            _unlink_exact(authority.path, authority.identity)
+        except Exception:
+            raise DeploymentAmbiguousError(
+                "authority cleanup is ambiguous; evidence was preserved"
+            ) from original_error
+        raise
+    return _AuthorityTransition(authority, pointer)
 
 
 def _validate_operation_id(operation_id: str) -> None:
@@ -1718,12 +2070,7 @@ def _create_backup(
         operation_id=successor_operation_id,
     )
     _cut(fault_injector, "backup.staging.create")
-    try:
-        os.mkdir(temporary, 0o700)
-        os.chmod(temporary, 0o700, follow_symlinks=False)
-    except OSError:
-        raise DeploymentError("cannot create private backup staging directory") from None
-    temporary_identity = _identity(_safe_directory(temporary, exact_private=True))
+    temporary_identity = _mkdir_private(temporary)
     cleanup_ledger = _capture_cleanup_ledger(temporary)
     published = False
     try:
@@ -1835,12 +2182,7 @@ def _create_absent_backup(
         operation_id=successor_operation_id,
     )
     _cut(fault_injector, "backup.staging.create")
-    try:
-        os.mkdir(temporary, 0o700)
-        os.chmod(temporary, 0o700, follow_symlinks=False)
-    except OSError:
-        raise DeploymentError("cannot create private backup staging directory") from None
-    temporary_identity = _identity(_safe_directory(temporary, exact_private=True))
+    temporary_identity = _mkdir_private(temporary)
     ledger = _capture_cleanup_ledger(temporary)
     published = False
     try:
@@ -1959,6 +2301,7 @@ def _exchange_transaction(
     request_publication: _PublishedFile | None = None
     receipt_manifest_publication: _PublishedFile | None = None
     backup: _BackupRecord | None = None
+    authority_transition: _AuthorityTransition | None = None
     marker_committed = False
     try:
         current = _active_receipt(paths)
@@ -2048,6 +2391,14 @@ def _exchange_transaction(
             kind="manifest",
             fault_injector=fault_injector,
         )
+        authority_transition = _publish_authority_transition(
+            paths,
+            state="present",
+            operation_id=operation_id,
+            receipt=receipt,
+            request_receipt_id=request_receipt_id,
+            fault_injector=fault_injector,
+        )
         _publish_immutable_file(
             paths.receipts_root / f"{operation_id}.json",
             receipt.to_bytes(),
@@ -2056,14 +2407,6 @@ def _exchange_transaction(
             fault_injector=fault_injector,
         )
         marker_committed = True
-        _publish_authority_transition(
-            paths,
-            state="present",
-            operation_id=operation_id,
-            receipt=receipt,
-            request_receipt_id=request_receipt_id,
-            fault_injector=fault_injector,
-        )
         final = _verified_status(paths)
         if not final.verified or final.operation_id != operation_id:
             raise DeploymentAmbiguousError(
@@ -2077,6 +2420,8 @@ def _exchange_transaction(
                 raise DeploymentAmbiguousError(
                     "exchange transaction failed after marker publication"
                 )
+            if authority_transition is not None:
+                _rollback_authority_transition(paths, authority_transition)
             if receipt_manifest_publication is not None:
                 _unlink_exact(
                     receipt_manifest_publication.path,
@@ -2104,6 +2449,8 @@ def _exchange_transaction(
             ) from original_error
         raise
     else:
+        if authority_transition is not None:
+            _finalize_authority_transition(paths, authority_transition)
         if instruction_publication is not None:
             _discard_prior_instruction(paths, instruction_publication)
         if stage_identity is not None:
@@ -2112,21 +2459,30 @@ def _exchange_transaction(
 
 
 def _read_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_result]:
+    parent_fd, name = _descriptor_parent(path)
     try:
-        named_before = os.lstat(path)
+        named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError:
+        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} is unavailable") from None
     if not stat.S_ISREG(named_before.st_mode):
+        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} is not a regular file")
     if named_before.st_uid != os.geteuid() or named_before.st_nlink != 1:
+        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} has unsafe ownership or link count")
     if named_before.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} has unsafe writable permissions")
     if named_before.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
+        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} has unsafe special mode bits")
     try:
-        descriptor = os.open(path, os.O_RDONLY | _NOFOLLOW | _CLOEXEC)
+        descriptor = os.open(
+            name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=parent_fd
+        )
     except OSError:
+        os.close(parent_fd)
         raise DeploymentIntegrityError(f"cannot open {label} without following links") from None
     try:
         opened_before = os.fstat(descriptor)
@@ -2165,7 +2521,7 @@ def _read_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_result
                 raise DeploymentIntegrityError(f"{label} exceeds its byte bound")
         opened_after = os.fstat(descriptor)
         try:
-            named_after = os.lstat(path)
+            named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except OSError:
             raise DeploymentIntegrityError(f"{label} changed while it was read") from None
         signatures = {
@@ -2186,6 +2542,7 @@ def _read_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_result
         return b"".join(chunks), opened_after
     finally:
         os.close(descriptor)
+        os.close(parent_fd)
 
 
 def _read_agents(path: Path) -> _AgentsFile:
@@ -2614,9 +2971,52 @@ def _validated_active_authority(
         or authority.get("manifestDigest") != receipt.manifest_digest
     ):
         raise DeploymentIntegrityError("active authority receipt binding is invalid")
-    request, _backup = _bound_operation_request(paths, manifest)
+    request, backup = _bound_operation_request(paths, manifest)
     if request.request_receipt_id != request_receipt_id:
         raise DeploymentIntegrityError("active authority request binding is invalid")
+    if state == "absent":
+        if (
+            request.operation_kind != "rollback"
+            or request_receipt_id is None
+            or backup.prior_manifest is None
+        ):
+            raise DeploymentIntegrityError("absent authority rollback binding is invalid")
+        prior_receipt_bytes, _ = _read_regular_file(
+            paths.receipts_root / f"{request_receipt_id}.json",
+            label="rolled-back deployment receipt",
+        )
+        prior_manifest_bytes, _ = _read_regular_file(
+            paths.receipts_root / f"{request_receipt_id}.manifest.json",
+            label="rolled-back deployment manifest",
+        )
+        prior_receipt = DeploymentReceipt.from_bytes(prior_receipt_bytes)
+        prior_manifest = DeploymentManifest.from_bytes(prior_manifest_bytes)
+        if (
+            prior_receipt.operation_id != request_receipt_id
+            or prior_manifest.operation_id != request_receipt_id
+            or prior_receipt.manifest_byte_length != len(prior_manifest_bytes)
+            or prior_receipt.manifest_digest != _sha256(prior_manifest_bytes)
+        ):
+            raise DeploymentIntegrityError("rolled-back receipt chain is invalid")
+        prior_request, restoration_backup = _bound_operation_request(
+            paths, prior_manifest
+        )
+        restoration_metadata = _canonical_mapping(
+            restoration_backup.identity_payload,
+            label="restoration backup metadata",
+        )
+        if (
+            prior_request.operation_kind != "deploy"
+            or prior_request.request_receipt_id is not None
+            or restoration_metadata.get("packageState") != "absent"
+        ):
+            raise DeploymentIntegrityError("absent restoration chain is invalid")
+        restored_agents = _read_agents(paths.agents_file)
+        if (
+            restored_agents.data != restoration_backup.agents.data
+            or restored_agents.mode != restoration_backup.agents.mode
+        ):
+            raise DeploymentIntegrityError("restored global instructions differ from backup")
     return state, operation_id, request_receipt_id, receipt, manifest
 
 
@@ -2635,7 +3035,25 @@ def _verified_status(paths: DeploymentPaths) -> DeploymentStatus:
                 verified=False,
                 detail="installed package destination is not absent",
             )
-        if paths.active_authority_file.exists():
+        try:
+            active_pointer = os.lstat(paths.active_authority_file)
+        except FileNotFoundError:
+            active_pointer = None
+        except OSError as error:
+            return DeploymentStatus(
+                state="ambiguous",
+                installed=False,
+                verified=False,
+                detail=str(error)[:240],
+            )
+        if active_pointer is not None:
+            if not stat.S_ISREG(active_pointer.st_mode):
+                return DeploymentStatus(
+                    state="invalid",
+                    installed=False,
+                    verified=False,
+                    detail="active authority pointer is not a regular file",
+                )
             try:
                 state, operation_id, _request_id, receipt, _manifest = (
                     _validated_active_authority(paths)
@@ -2821,6 +3239,7 @@ def _rollback_initial_to_absent(
     manifest_publication: _PublishedFile | None = None
     request_publication: _PublishedFile | None = None
     marker_publication: _PublishedFile | None = None
+    authority_transition: _AuthorityTransition | None = None
     try:
         _cut(fault_injector, "uninstall.package.rename")
         if _rename_noreplace(paths.installed_root, retained) != active_identity:
@@ -2870,14 +3289,7 @@ def _rollback_initial_to_absent(
             kind="manifest",
             fault_injector=fault_injector,
         )
-        marker_publication = _publish_immutable_file(
-            paths.receipts_root / f"{operation_id}.json",
-            receipt.to_bytes(),
-            operation_id=operation_id,
-            kind="marker",
-            fault_injector=fault_injector,
-        )
-        _publish_authority_transition(
+        authority_transition = _publish_authority_transition(
             paths,
             state="absent",
             operation_id=operation_id,
@@ -2885,8 +3297,19 @@ def _rollback_initial_to_absent(
             request_receipt_id=receipt_id,
             fault_injector=fault_injector,
         )
+        marker_publication = _publish_immutable_file(
+            paths.receipts_root / f"{operation_id}.json",
+            receipt.to_bytes(),
+            operation_id=operation_id,
+            kind="marker",
+            fault_injector=fault_injector,
+        )
+    except DeploymentAmbiguousError:
+        raise
     except Exception as original_error:
         try:
+            if authority_transition is not None:
+                _rollback_authority_transition(paths, authority_transition)
             if marker_publication is not None:
                 _unlink_exact(marker_publication.path, marker_publication.identity)
             if manifest_publication is not None:
@@ -2909,6 +3332,8 @@ def _rollback_initial_to_absent(
                 "initial rollback failed ambiguously; evidence was preserved"
             ) from original_error
         raise
+    if authority_transition is not None:
+        _finalize_authority_transition(paths, authority_transition)
     if agents_publication is not None:
         _discard_prior_instruction(paths, agents_publication)
     if absent_agents_temp is not None and absent_agents_identity is not None:
@@ -3070,6 +3495,7 @@ class GlobalRsiDeployer:
             instruction_publication: _PublishedInstruction | None = None
             request_publication: _PublishedFile | None = None
             receipt_manifest_publication: _PublishedFile | None = None
+            authority_transition: _AuthorityTransition | None = None
             marker_committed = False
             try:
                 stage_identity = _stage_package(
@@ -3119,6 +3545,14 @@ class GlobalRsiDeployer:
                     kind="manifest",
                     fault_injector=fault_injector,
                 )
+                authority_transition = _publish_authority_transition(
+                    self.paths,
+                    state="present",
+                    operation_id=operation_id,
+                    receipt=receipt,
+                    request_receipt_id=None,
+                    fault_injector=fault_injector,
+                )
                 _publish_immutable_file(
                     self.paths.receipts_root / f"{operation_id}.json",
                     receipt.to_bytes(),
@@ -3127,14 +3561,6 @@ class GlobalRsiDeployer:
                     fault_injector=fault_injector,
                 )
                 marker_committed = True
-                _publish_authority_transition(
-                    self.paths,
-                    state="present",
-                    operation_id=operation_id,
-                    receipt=receipt,
-                    request_receipt_id=None,
-                    fault_injector=fault_injector,
-                )
                 final = _verified_status(self.paths)
                 if not final.verified or final.operation_id != operation_id:
                     raise DeploymentAmbiguousError(
@@ -3147,6 +3573,10 @@ class GlobalRsiDeployer:
                     if marker_committed:
                         raise DeploymentAmbiguousError(
                             "deployment failed after marker publication; evidence was preserved"
+                        )
+                    if authority_transition is not None:
+                        _rollback_authority_transition(
+                            self.paths, authority_transition
                         )
                     if receipt_manifest_publication is not None:
                         _unlink_exact(
@@ -3179,6 +3609,10 @@ class GlobalRsiDeployer:
                     ) from original_error
                 raise
             else:
+                if authority_transition is not None:
+                    _finalize_authority_transition(
+                        self.paths, authority_transition
+                    )
                 if instruction_publication is not None:
                     _discard_prior_instruction(self.paths, instruction_publication)
                 return receipt

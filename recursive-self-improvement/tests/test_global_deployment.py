@@ -1563,6 +1563,247 @@ def test_initial_uninstall_authority_fault_cuts_restore_exact_present_authority(
     assert paths.agents_file.read_bytes() == before_agents
 
 
+def test_receipt_marker_is_strictly_after_durable_authority_pointer(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    observed: list[str] = []
+
+    GlobalRsiDeployer(paths, fault_injector=observed.append).deploy(
+        repo, "marker-order"
+    )
+
+    assert observed.index("authority.pointer.readback") < observed.index(
+        "receipt.marker.write"
+    )
+    assert observed[-1] == "receipt.marker.readback"
+
+
+def test_receipt_marker_prepublication_failure_rolls_back_authority_and_state(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+
+    def inject(boundary: str) -> None:
+        if boundary == "receipt.marker.write":
+            raise InjectedFault(boundary)
+
+    with pytest.raises((InjectedFault, DeploymentError)):
+        GlobalRsiDeployer(paths, fault_injector=inject).deploy(
+            repo, "marker-rollback"
+        )
+
+    assert GlobalRsiDeployer(paths).verify().state == "not-installed"
+    assert not (paths.authorities_root / "marker-rollback.present.json").exists()
+    assert not paths.active_authority_file.exists()
+
+
+def test_absent_replay_rejects_restored_agents_drift(tmp_path: Path) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo, "absent-drift-install")
+    deployer.rollback("absent-drift-install", "absent-drift-rollback")
+    paths.agents_file.write_bytes(b"drifted-after-absence")
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployer.rollback("absent-drift-install", "absent-drift-rollback")
+
+
+def test_dangling_active_pointer_is_invalid_not_missing_authority(tmp_path: Path) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo, "dangling-active-install")
+    deployer.rollback("dangling-active-install", "dangling-active-rollback")
+    paths.active_authority_file.unlink()
+    paths.active_authority_file.symlink_to(tmp_path / "missing-active-target")
+
+    status = deployer.verify()
+
+    assert status.state == "invalid"
+    assert status.verified is False
+
+
+def test_failed_pointer_publication_removes_exact_task_owned_authority(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+
+    def inject(boundary: str) -> None:
+        if boundary == "authority.pointer.write":
+            raise InjectedFault(boundary)
+
+    with pytest.raises((InjectedFault, DeploymentError)):
+        GlobalRsiDeployer(paths, fault_injector=inject).deploy(
+            repo, "orphan-authority"
+        )
+
+    assert not (paths.authorities_root / "orphan-authority.present.json").exists()
+
+
+def test_cleanup_rechecks_member_after_boundary_before_descriptor_unlink(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "cleanup-root"
+    root.mkdir(mode=0o700)
+    member = root / "member"
+    member.write_bytes(b"owned")
+    ledger = deployment_module._capture_cleanup_ledger(root)
+
+    def replace(boundary: str) -> None:
+        if boundary != "cleanup.file.before_unlink":
+            return
+        member.unlink()
+        member.write_bytes(b"foreign")
+
+    with pytest.raises(deployment_module.DeploymentAmbiguousError):
+        deployment_module._remove_tree_exact(
+            root,
+            ledger.root_identity,
+            ledger,
+            cleanup_injector=replace,
+        )
+
+    assert member.read_bytes() == b"foreign"
+
+
+@pytest.mark.parametrize(
+    "mutation", ["write", "mkdir", "rename", "exchange", "unlink", "fsync"]
+)
+def test_each_mutation_helper_stays_on_retained_descriptor_after_ancestor_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    anchor = tmp_path / "anchor"
+    displaced = tmp_path / "displaced"
+    redirected = tmp_path / "redirected"
+
+    def prepare(home: Path) -> DeploymentPaths:
+        paths = DeploymentPaths.for_testing(home)
+        for directory in (
+            paths.codex_home,
+            paths.skills_root,
+            paths.state_root,
+            paths.receipts_root,
+            paths.backups_root,
+            paths.authorities_root,
+        ):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+        return paths
+
+    paths = prepare(anchor / "codex")
+    redirected_paths = prepare(redirected / "codex")
+    for root in (paths.skills_root, redirected_paths.skills_root):
+        (root / "source").write_bytes(b"source")
+        (root / "destination").write_bytes(b"destination")
+        (root / "remove").write_bytes(b"remove")
+    redirect_before = _snapshot_tree(redirected_paths.codex_home)
+    roots = deployment_module._RetainedRoots(paths)
+    token = deployment_module._ACTIVE_ROOTS.set(roots)
+    swapped = False
+
+    def swap() -> None:
+        nonlocal swapped
+        if swapped:
+            return
+        swapped = True
+        anchor.rename(displaced)
+        anchor.symlink_to(redirected)
+
+    try:
+        if mutation == "write":
+            real_open = os.open
+
+            def swap_open(file: object, flags: int, *args: object, **kwargs: object) -> int:
+                if flags & os.O_CREAT:
+                    swap()
+                return real_open(file, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(os, "open", swap_open)
+            deployment_module._write_new_file(
+                paths.skills_root / "written", b"owned", mode=0o600
+            )
+        elif mutation == "mkdir":
+            real_mkdir = os.mkdir
+
+            def swap_mkdir(path: object, *args: object, **kwargs: object) -> None:
+                swap()
+                real_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(os, "mkdir", swap_mkdir)
+            deployment_module._mkdir_private(paths.skills_root / "created")
+        elif mutation in {"rename", "exchange"}:
+            real_renameatx = deployment_module._renameatx
+
+            def swap_renameatx(
+                parent_fd: int, source: str, destination: str, flags: int
+            ) -> None:
+                swap()
+                real_renameatx(parent_fd, source, destination, flags)
+
+            monkeypatch.setattr(deployment_module, "_renameatx", swap_renameatx)
+            if mutation == "rename":
+                deployment_module._rename_noreplace(
+                    paths.skills_root / "source", paths.skills_root / "published"
+                )
+            else:
+                deployment_module._exchange(
+                    paths.skills_root / "source",
+                    paths.skills_root / "destination",
+                )
+        elif mutation == "unlink":
+            identity = deployment_module._identity(
+                os.lstat(paths.skills_root / "remove")
+            )
+            real_unlink = os.unlink
+
+            def swap_unlink(path: object, *args: object, **kwargs: object) -> None:
+                swap()
+                real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(os, "unlink", swap_unlink)
+            deployment_module._unlink_exact(paths.skills_root / "remove", identity)
+        else:
+            swap()
+            opened: list[tuple[int, int]] = []
+            real_fsync = os.fsync
+
+            def record_fsync(descriptor: int) -> None:
+                opened.append(deployment_module._identity(os.fstat(descriptor)))
+                real_fsync(descriptor)
+
+            monkeypatch.setattr(os, "fsync", record_fsync)
+            deployment_module._fsync_directory(paths.skills_root)
+            assert opened == [
+                deployment_module._identity(
+                    os.lstat(displaced / "codex" / "skills")
+                )
+            ]
+    finally:
+        deployment_module._ACTIVE_ROOTS.reset(token)
+        roots.close()
+
+    assert swapped is True
+    assert _snapshot_tree(redirected_paths.codex_home) == redirect_before
+    original_skills = displaced / "codex" / "skills"
+    if mutation == "write":
+        assert (original_skills / "written").read_bytes() == b"owned"
+    elif mutation == "mkdir":
+        assert (original_skills / "created").is_dir()
+    elif mutation == "rename":
+        assert not (original_skills / "source").exists()
+        assert (original_skills / "published").read_bytes() == b"source"
+    elif mutation == "exchange":
+        assert (original_skills / "source").read_bytes() == b"destination"
+        assert (original_skills / "destination").read_bytes() == b"source"
+    elif mutation == "unlink":
+        assert not (original_skills / "remove").exists()
+
+
 @pytest.mark.parametrize(
     ("boundary", "occurrence"),
     [
@@ -1808,7 +2049,7 @@ def test_partial_receipt_authority_is_typed_ambiguous_and_never_repaired(
 @pytest.mark.parametrize(
     "cut", ["receipt.marker.parent_fsync", "receipt.marker.readback"]
 )
-def test_receipt_marker_failure_before_active_pointer_preserves_typed_ambiguity(
+def test_receipt_marker_postpublication_fault_preserves_truthful_verified_authority(
     tmp_path: Path, cut: str
 ) -> None:
     repo = _write_repository(tmp_path)
@@ -1824,8 +2065,9 @@ def test_receipt_marker_failure_before_active_pointer_preserves_typed_ambiguity(
         deployer.deploy(repo, "ambiguous-marker")
 
     status = GlobalRsiDeployer(paths).verify()
-    assert status.verified is False
-    assert status.state in {"invalid", "ambiguous"}
+    assert status.verified is True
+    assert status.state == "verified"
+    assert status.operation_id == "ambiguous-marker"
     assert (paths.receipts_root / "ambiguous-marker.json").exists()
 
 
