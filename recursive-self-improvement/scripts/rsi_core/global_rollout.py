@@ -178,7 +178,9 @@ class DryRunAuthority:
         deployer = GlobalRsiDeployer(paths)
         snapshot = attest_installed_snapshot(paths.installed_root, deployer)
         try:
-            source = snapshot.source_repository.resolve(strict=True)
+            source = _canonical_protected_path(
+                snapshot.source_repository, label="live source authority"
+            )
         finally:
             snapshot.close()
         provider_home = paths.codex_home / "skill-learning"
@@ -813,13 +815,13 @@ def _capture_protected_tree_witness(
 ) -> tuple[tuple[object, ...], ...]:
     """Capture a bounded descriptor-relative nofollow tree witness."""
 
-    root = _canonical_protected_path(root, label="protected target root")
-    try:
-        root_named = os.lstat(root)
-    except OSError:
-        raise ValueError("protected target root is unavailable") from None
-    if not stat.S_ISDIR(root_named.st_mode):
-        raise ValueError("protected target root is not a directory")
+    pinned_root = _pin_canonical_protected_path(
+        root,
+        label="protected target root",
+        require_directory=True,
+    )
+    root = pinned_root.path
+    root_named = pinned_root.final_metadata
 
     records: list[tuple[object, ...]] = []
     seen: set[str] = set()
@@ -1005,11 +1007,18 @@ def _capture_protected_tree_witness(
                 close_registered(descriptor)
 
     root_signature = reserve(".", root.name or ".", 0, root_named)
-    root_fd: int | None = None
     try:
-        root_fd = pin_directory(None, root, root_signature)
+        root_fd = pinned_root.final_fd
         tasks: list[tuple[object, ...]] = [
-            ("scan", None, root, ".", 0, root_signature, root_fd)
+            (
+                "scan",
+                pinned_root.final_parent_fd,
+                pinned_root.final_name,
+                ".",
+                0,
+                root_signature,
+                root_fd,
+            )
         ]
         while tasks:
             task = tasks.pop()
@@ -1095,9 +1104,11 @@ def _capture_protected_tree_witness(
                     target=target,
                 )
             )
+        pinned_root.verify()
     finally:
         for descriptor in tuple(open_descriptors):
             close_registered(descriptor)
+        pinned_root.close()
     records.sort(key=lambda record: str(record[0]).encode("utf-8"))
     return tuple(records)
 
@@ -1465,21 +1476,164 @@ def _scan_rejected_material(
             raise RuntimeError("rejected evidence leaked into dry-run state")
 
 
-def _canonical_protected_path(path: Path, *, label: str) -> Path:
-    if not isinstance(path, Path) or not path.is_absolute() or Path(os.path.abspath(path)) != path:
-        raise ValueError(f"{label} must be an absolute canonical Path")
-    current = Path(path.anchor)
-    for part in path.parts[1:]:
-        current /= part
+@dataclass(slots=True)
+class _PinnedProtectedPath:
+    path: Path
+    label: str
+    descriptors: tuple[int, ...]
+    steps: tuple[tuple[int, str, int, tuple[int, ...]], ...]
+    final_metadata: os.stat_result
+    closed: bool = False
+
+    @property
+    def final_fd(self) -> int:
+        return self.descriptors[-1]
+
+    @property
+    def final_parent_fd(self) -> int | None:
+        return None if not self.steps else self.steps[-1][0]
+
+    @property
+    def final_name(self) -> str | Path:
+        return self.path if not self.steps else self.steps[-1][1]
+
+    def verify(self) -> None:
         try:
-            metadata = os.lstat(current)
-        except FileNotFoundError:
+            for parent_fd, name, descriptor, expected in self.steps:
+                opened = os.fstat(descriptor)
+                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                _require_protected_signature(
+                    opened, expected, context="path ancestry"
+                )
+                _require_protected_signature(
+                    named, expected, context="path ancestry"
+                )
+        except ValueError:
+            raise
+        except (OSError, OverflowError):
+            raise ValueError(f"{self.label} ancestry is unavailable") from None
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        for descriptor in reversed(self.descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self.closed = True
+
+
+def _pin_canonical_protected_path(
+    path: Path,
+    *,
+    label: str,
+    require_directory: bool = False,
+) -> _PinnedProtectedPath:
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or Path(os.path.abspath(path)) != path
+    ):
+        raise ValueError(f"{label} must be an absolute canonical Path")
+    descriptors: list[int] = []
+    steps: list[tuple[int, str, int, tuple[int, ...]]] = []
+    final_metadata: os.stat_result | None = None
+    try:
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        anchor_fd = os.open(path.anchor, directory_flags)
+        descriptors.append(anchor_fd)
+        try:
+            anchor_metadata = os.fstat(anchor_fd)
+        except (OSError, OverflowError):
+            raise ValueError(f"{label} ancestry cannot be pinned") from None
+        if not stat.S_ISDIR(anchor_metadata.st_mode):
+            raise ValueError(f"{label} ancestry is unsafe")
+        final_metadata = anchor_metadata
+        parent_fd = anchor_fd
+        parts = path.parts[1:]
+        for index, part in enumerate(parts):
+            is_final = index == len(parts) - 1
+            try:
+                named = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            except (OSError, OverflowError):
+                raise ValueError(f"{label} ancestry is unavailable") from None
+            if stat.S_ISLNK(named.st_mode):
+                raise ValueError(f"{label} contains a symlink alias")
+            must_be_directory = not is_final or require_directory
+            if must_be_directory and not stat.S_ISDIR(named.st_mode):
+                raise ValueError(f"{label} ancestry is unsafe")
+            flags = (
+                directory_flags
+                if stat.S_ISDIR(named.st_mode)
+                else os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
+            try:
+                child_fd = os.open(part, flags, dir_fd=parent_fd)
+            except (OSError, OverflowError):
+                raise ValueError(f"{label} ancestry cannot be pinned") from None
+            descriptors.append(child_fd)
+            try:
+                opened = os.fstat(child_fd)
+                expected = _protected_stat_signature(named)
+                _require_protected_signature(
+                    opened, expected, context="path ancestry"
+                )
+            except ValueError:
+                raise
+            except (OSError, OverflowError):
+                raise ValueError(f"{label} ancestry cannot be pinned") from None
+            steps.append((parent_fd, part, child_fd, expected))
+            final_metadata = named
+            parent_fd = child_fd
+        try:
+            resolved = path.resolve(strict=True)
+        except (OSError, RuntimeError):
             raise ValueError(f"{label} is unavailable") from None
-        except OSError:
-            raise ValueError(f"{label} is unavailable") from None
-        if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError(f"{label} contains a symlink alias")
-    return path.resolve(strict=True)
+        if resolved != path:
+            raise ValueError(f"{label} is not canonical")
+        if final_metadata is None:
+            raise ValueError(f"{label} is unavailable")
+        pinned = _PinnedProtectedPath(
+            path,
+            label,
+            tuple(descriptors),
+            tuple(steps),
+            final_metadata,
+        )
+        pinned.verify()
+        return pinned
+    except ValueError:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+    except Exception:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise ValueError(f"{label} ancestry is unavailable") from None
+
+
+def _canonical_protected_path(path: Path, *, label: str) -> Path:
+    pinned = _pin_canonical_protected_path(path, label=label)
+    try:
+        pinned.verify()
+        return path
+    finally:
+        pinned.close()
 
 
 def _optional_path_ancestry(

@@ -851,6 +851,182 @@ def test_protected_tree_witness_rejects_directory_rebind_and_closes_descriptors(
     assert {entry.name for entry in fd_root.iterdir()} == before
 
 
+def test_protected_root_resolve_rebind_never_authorizes_or_opens_external_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "protected"
+    root.mkdir()
+    (root / "safe.bin").write_bytes(b"safe")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "external-secret.bin").write_bytes(b"must never be opened")
+    real_resolve = Path.resolve
+    real_open = os.open
+    rebound = False
+    external_regular_opened = False
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+
+    def rebind_during_resolve(
+        self: Path, strict: bool = False
+    ) -> Path:
+        nonlocal rebound
+        if self == root and not rebound:
+            rebound = True
+            root.rename(tmp_path / "protected-displaced")
+            root.symlink_to(external, target_is_directory=True)
+        return real_resolve(self, strict=strict)
+
+    def reject_external_regular_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ):
+        nonlocal external_regular_opened
+        if path == "external-secret.bin" and kwargs.get("dir_fd") is not None:
+            external_regular_opened = True
+            raise AssertionError("external regular content was opened")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "resolve", rebind_during_resolve)
+    monkeypatch.setattr(os, "open", reject_external_regular_open)
+
+    with pytest.raises(ValueError, match="canonical|identity|symlink"):
+        rollout_module._capture_protected_tree_witness(root)
+
+    assert rebound is True
+    assert external_regular_opened is False
+    assert {entry.name for entry in fd_root.iterdir()} == before
+
+
+@pytest.mark.parametrize("component", ["outer", "middle"])
+def test_protected_root_ancestry_rebind_is_bounded_and_fd_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, component: str
+) -> None:
+    root = tmp_path / "outer" / "middle" / "protected"
+    root.mkdir(parents=True)
+    (root / "payload.bin").write_bytes(b"payload")
+    external = tmp_path / "external"
+    external.mkdir()
+    real_open = os.open
+    rebound = False
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+
+    def rebind_before_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ):
+        nonlocal rebound
+        if path == component and kwargs.get("dir_fd") is not None and not rebound:
+            rebound = True
+            victim = tmp_path / "outer"
+            if component == "middle":
+                victim /= "middle"
+            displaced = victim.with_name(victim.name + "-displaced")
+            victim.rename(displaced)
+            victim.symlink_to(external, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", rebind_before_open)
+
+    with pytest.raises(ValueError, match="unsafe|identity|symlink|pinned"):
+        rollout_module._capture_protected_tree_witness(root)
+
+    assert rebound is True
+    assert {entry.name for entry in fd_root.iterdir()} == before
+
+
+def test_protected_tree_witness_rejects_a_symlink_final_root_without_fd_leak(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    alias = tmp_path / "protected"
+    alias.symlink_to(external, target_is_directory=True)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+
+    with pytest.raises(ValueError, match="symlink|canonical|unsafe"):
+        rollout_module._capture_protected_tree_witness(alias)
+
+    assert {entry.name for entry in fd_root.iterdir()} == before
+
+
+@pytest.mark.parametrize("fault", ["stat", "fstat"])
+def test_protected_root_ancestry_stat_faults_are_bounded_and_fd_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    root = tmp_path / "outer" / "protected"
+    root.mkdir(parents=True)
+    (root / "payload.bin").write_bytes(b"payload")
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+    if fault == "stat":
+        real_stat = os.stat
+
+        def fail_ancestry_stat(
+            path: object, *args: object, **kwargs: object
+        ) -> os.stat_result:
+            if path == "outer" and kwargs.get("dir_fd") is not None:
+                raise OverflowError("injected protected ancestry stat failure")
+            return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "stat", fail_ancestry_stat)
+    else:
+        real_fstat = os.fstat
+        failed = False
+
+        def fail_first_fstat(descriptor: int) -> os.stat_result:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OverflowError("injected protected ancestry fstat failure")
+            return real_fstat(descriptor)
+
+        monkeypatch.setattr(os, "fstat", fail_first_fstat)
+
+    with pytest.raises(ValueError, match="unavailable|unsafe|metadata|pinned"):
+        rollout_module._capture_protected_tree_witness(root)
+
+    assert {entry.name for entry in fd_root.iterdir()} == before
+
+
+def test_testing_authority_never_stores_a_resolved_external_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = DeploymentPaths.for_testing(tmp_path / "codex-home")
+    paths.codex_home.mkdir()
+    source = tmp_path / "source"
+    provider = tmp_path / "provider"
+    target = tmp_path / "target"
+    external = tmp_path / "external"
+    for directory in (source, provider, target, external):
+        directory.mkdir()
+    ledger = provider / "events.jsonl"
+    ledger.write_bytes(b"")
+    real_resolve = Path.resolve
+    rebound = False
+
+    def rebind_target(self: Path, strict: bool = False) -> Path:
+        nonlocal rebound
+        if self == target and not rebound:
+            rebound = True
+            target.rename(tmp_path / "target-displaced")
+            target.symlink_to(external, target_is_directory=True)
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", rebind_target)
+
+    with pytest.raises(ValueError, match="canonical|identity|symlink|authority"):
+        DryRunAuthority.for_testing(
+            deployment_paths=paths,
+            source_repository=source,
+            provider_home=provider,
+            provider_ledger=ledger,
+            target_roots=(target,),
+        )
+
+    assert rebound is True
+
+
 def test_live_authority_constructor_and_public_dry_run_use_only_fixed_live_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
