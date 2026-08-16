@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import pwd
-import stat
 import sys
 from typing import Mapping
 
@@ -204,6 +203,23 @@ def _execute(argv: list[str], deployer: object) -> tuple[int, bytes]:
             mapping = _status_mapping(result)
             status = result.state
             if result.state == "not-installed":
+                paths = getattr(deployer, "paths", None)
+                state_root = getattr(paths, "state_root", None)
+                if result.operation_id is None and isinstance(state_root, Path):
+                    try:
+                        nonempty = any(os.scandir(state_root))
+                    except FileNotFoundError:
+                        nonempty = False
+                    except OSError:
+                        nonempty = True
+                    if nonempty:
+                        return EXIT_INTEGRITY, _canonical(
+                            _failure(
+                                command,
+                                "integrity-failure",
+                                "unbound deployment state is not empty",
+                            )
+                        )
                 return EXIT_NOT_INSTALLED, _canonical(
                     {
                         "schemaVersion": 1,
@@ -216,6 +232,14 @@ def _execute(argv: list[str], deployer: object) -> tuple[int, bytes]:
                 if result.state == "busy":
                     return EXIT_CONFLICT, _canonical(
                         _failure(command, "operation-conflict", "deployment status is busy")
+                    )
+                if result.state == "ambiguous":
+                    return EXIT_AMBIGUOUS, _canonical(
+                        _failure(
+                            command,
+                            "ambiguous-state",
+                            "deployment state is ambiguous; preserved evidence requires recovery",
+                        )
                     )
                 return EXIT_INTEGRITY, _canonical(
                     _failure(
@@ -250,132 +274,51 @@ def _live_codex_home() -> Path:
     return home / ".codex"
 
 
-def _live_installed_script() -> Path:
-    return (
-        _live_codex_home()
-        / "skills"
-        / "recursive-self-improvement"
-        / "scripts"
-        / "rsi_deploy.py"
-    )
+def _running_attested_snapshot() -> bool:
+    return globals().get("__rsi_attested_snapshot__") is True
 
 
-def _source_read_only_absence(command: str) -> tuple[int, bytes] | None:
-    """Classify a definitely absent installation without importing source RSI."""
+def _exec_attested_read_only(argv: list[str], deployer: object) -> None:
+    """Replace this process with FD-pinned, fully attested installed Python."""
 
-    codex_home = _live_codex_home()
-    installed_root = codex_home / "skills" / "recursive-self-improvement"
-    state_root = codex_home / "rsi-deployments-v1"
+    from rsi_core.global_rollout import attest_installed_snapshot
+
+    installed = getattr(getattr(deployer, "paths", None), "installed_root", None)
+    if not isinstance(installed, Path):
+        raise RuntimeError("installed deployment authority is unavailable")
+    snapshot = attest_installed_snapshot(installed, deployer)
     try:
-        installed = os.lstat(installed_root)
-    except FileNotFoundError:
-        installed = None
-    except OSError:
-        return EXIT_INTEGRITY, _canonical(
-            _failure(command, "integrity-failure", "installed deployment path is unavailable")
+        command, descriptors = snapshot.execution_spec(
+            "scripts/rsi_deploy.py", argv
         )
-    if installed is not None:
-        if (
-            not stat.S_ISDIR(installed.st_mode)
-            or installed.st_uid != os.geteuid()
-            or installed.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-        ):
-            return EXIT_INTEGRITY, _canonical(
-                _failure(
-                    command,
-                    "integrity-failure",
-                    "installed deployment root has unsafe identity",
-                )
-            )
-        return None
-    try:
-        os.lstat(state_root)
-    except FileNotFoundError:
-        return EXIT_NOT_INSTALLED, _canonical(
-            {
-                "schemaVersion": 1,
-                "command": command,
-                "status": "not-installed",
-                "result": {
-                    "state": "not-installed",
-                    "installed": False,
-                    "verified": False,
-                    "operationId": None,
-                    "sourceCommit": None,
-                    "treeDigest": None,
-                    "manifestDigest": None,
-                    "receiptDigest": None,
-                },
-            }
-        )
-    except OSError:
-        pass
-    return EXIT_INTEGRITY, _canonical(
-        _failure(
-            command,
-            "integrity-failure",
-            "deployment authority exists without an installed package",
-        )
-    )
-
-
-def _same_regular_file(first: Path, second: Path) -> bool:
-    try:
-        one = os.stat(first, follow_symlinks=False)
-        two = os.stat(second, follow_symlinks=False)
-    except OSError:
-        return False
-    return (
-        stat.S_ISREG(one.st_mode)
-        and stat.S_ISREG(two.st_mode)
-        and (one.st_dev, one.st_ino) == (two.st_dev, two.st_ino)
-    )
-
-
-def _reexec_installed_read_only(argv: list[str]) -> None:
-    """Run verify/status from the pinned package, never the mutable source."""
-
-    if not argv or argv[0] not in _READ_ONLY:
-        return
-    installed = _live_installed_script()
-    current = Path(__file__)
-    if _same_regular_file(current, installed):
-        return
-    try:
-        metadata = os.stat(installed, follow_symlinks=False)
-    except OSError:
-        raise RuntimeError("installed deployment CLI is unavailable") from None
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
-        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-    ):
-        raise RuntimeError("installed deployment CLI provenance is invalid")
-    environment = dict(os.environ)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    os.execve(
-        sys.executable,
-        [sys.executable, "-B", os.fspath(installed), *argv],
-        environment,
-    )
+        for descriptor in descriptors:
+            os.set_inheritable(descriptor, True)
+        environment = {
+            "PATH": os.defpath,
+            "HOME": os.fspath(_live_codex_home().parent),
+            "TZ": "UTC",
+            "LC_ALL": "C",
+            "LANG": "C",
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+        os.execve(sys.executable, command, environment)
+    finally:
+        snapshot.close()
 
 
 def main(argv: list[str] | None = None) -> int:
     command = list(sys.argv[1:] if argv is None else argv)
     try:
         parsed_command, _options = _parse(command)
-        if parsed_command in _READ_ONLY:
-            absent = _source_read_only_absence(parsed_command)
-            if absent is not None:
-                code, payload = absent
-                sys.stdout.buffer.write(payload)
-                sys.stdout.buffer.flush()
-                return code
-        _reexec_installed_read_only(command)
         from rsi_core.deployment import GlobalRsiDeployer
 
-        code, payload = _execute(command, GlobalRsiDeployer())
+        deployer = GlobalRsiDeployer()
+        if parsed_command in _READ_ONLY and not _running_attested_snapshot():
+            status = deployer.verify() if parsed_command == "verify" else deployer.status()
+            if status.state == "verified" and status.verified:
+                _exec_attested_read_only(command, deployer)
+        code, payload = _execute(command, deployer)
     except _CliGrammarError:
         code, payload = EXIT_INVALID, _canonical(
             _failure(
