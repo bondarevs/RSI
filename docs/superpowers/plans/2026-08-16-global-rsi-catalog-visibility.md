@@ -18,7 +18,11 @@
 - Catalog visibility is not invocation authority and is not deployment authority.
 - The managed trigger continues to skip ordinary conversation, status questions, one-off facts, tasks without reusable evidence, sensitive or rejected evidence, RSI/skill-learning maintenance, and recursive invocation.
 - The recursion guard remains exactly `CODEX_RSI_TRIGGER_ACTIVE=1`.
-- Visibility probes are read-only: they may render model input but must not execute RSI, call a provider writer, or create RSI state.
+- Visibility probes use the FD-attested installed probe only. Each client receives
+  a disposable projected `CODEX_HOME`; neither client may receive the live Codex
+  home. Client `.system` synchronization is confined and discarded, while all
+  live RSI, provider, target, deployment, global-instruction, and source
+  witnesses must remain exact.
 - All code changes follow RED → GREEN → relevant regression → full-suite verification and are committed separately from review fixes.
 - Stop after each task's tests, review, report, and commit are complete; do not begin the next task with a provisional failure or open finding.
 - Preserve the existing untracked `uv.lock` and `__pycache__` directories; never stage or delete them as part of this plan.
@@ -227,7 +231,8 @@ no open review finding.
 - Modify: `recursive-self-improvement/tests/test_forward.py:700-725`
 
 **Interfaces:**
-- Consumes: the exact shipped `agents/openai.yaml`, `SKILL.md`, and the host `codex debug prompt-input [PROMPT]` read-only command.
+- Consumes: the exact shipped `agents/openai.yaml`, `SKILL.md`, and the host
+  `codex debug prompt-input [PROMPT]` command inside a disposable Codex home.
 - Produces: `_render_fresh_catalog(package_root: Path, tmp_path: Path) -> tuple[str, Path]`, a test-only bounded fresh-Codex fixture.
 - Produces: a regression proving the model-visible catalog contains RSI metadata while the RSI skill body is not invoked or injected.
 
@@ -496,7 +501,8 @@ states:
 - the managed trigger and runtime profile remain the eligibility and authority
   gates;
 - a new Codex task is required after install/update;
-- `codex debug prompt-input` is the read-only visibility probe;
+- the FD-attested `scripts/rsi_catalog_probe.py` wrapper runs local and exact
+  resolved-latest `codex debug prompt-input` clients only in disposable homes;
 - absence, unexpected invocation, or state creation requires rollback through
   the exact deployment receipt.
 
@@ -571,6 +577,9 @@ start Task 4 with any dirty tracked file or unresolved finding.
 
 **Files:**
 - Modify during execution only: `.superpowers/sdd/2026-08-13-global-rsi-observe-rollout/report.md`
+- Review-fix only: `recursive-self-improvement/scripts/rsi_catalog_probe.py`
+- Review-fix only: `recursive-self-improvement/scripts/rsi_core/catalog_probe.py`
+- Review-fix only: `recursive-self-improvement/references/catalog-visibility-design.md`
 - Modify live only after approval: `~/.codex/skills/recursive-self-improvement/**`
 - Modify live only after approval: `~/.codex/AGENTS.md`
 - Append immutable live authority only after approval: `~/.codex/rsi-deployments-v1/**`
@@ -692,30 +701,41 @@ event, or target drift jumps directly to Step 10 rollback.
 
 - [ ] **Step 8: Run fresh local and latest Codex visibility-only probes**
 
-Render prompt input with the installed live Codex and with the latest published
-Codex CLI. Store outputs in a private temporary directory, not the repository:
+Run the verified installed, FD-attested catalog probe. It creates a distinct
+private disposable `CODEX_HOME`, `HOME`, temporary directory, and npm cache for
+each client; copies only the verified live `SKILL.md` and `agents/openai.yaml`
+catalog bytes; and never gives either client the live Codex home:
 
 ```bash
 probe_root=$(mktemp -d /tmp/rsi-catalog-live.XXXXXX)
-probe='Report only whether the model-visible skill catalog contains recursive-self-improvement. Do not invoke any skill.'
-codex debug prompt-input "$probe" > "$probe_root/local.json"
-npx --yes @openai/codex@latest debug prompt-input "$probe" \
-  > "$probe_root/latest.json"
+PYTHONDONTWRITEBYTECODE=1 python3 \
+  ~/.codex/skills/recursive-self-improvement/scripts/rsi_catalog_probe.py \
+  > "$probe_root/result.json"
 ```
 
-For both canonical JSON arrays, join all `input_text` fields and require:
+The probe uses the installed local `codex`, resolves
+`@openai/codex@latest`, records its version, and then runs that exact resolved
+version. It invokes `debug prompt-input` only inside the disposable homes. The
+canonical result must require for both clients:
 
 - `### Available skills` is present;
 - exactly one `- recursive-self-improvement:` catalog entry is present;
-- its locator is the verified live `SKILL.md` path;
+- the model locator is the projected `SKILL.md`, and its exact catalog-surface
+  digest plus `verifiedLocator` bind the projection to the verified live
+  `SKILL.md`;
 - the skill-body sentence `Operate as the control plane for evidence-backed
   role-skill improvement.` is absent, proving visibility without invocation;
-- no RSI/provider event, report, observation, target, deployment receipt, or
-  global-instruction write occurred during the probes.
+- the installed package, source repository, provider, target, deployment, and
+  global-instruction witnesses are unchanged after both probes.
 
-If network access prevents the latest-CLI probe, do not weaken the gate or call
-the rollout complete; preserve the successful local result and retry only when
-the published package is reachable.
+Client-created `.system` rows are allowed only inside their disposable homes
+and are deleted with those homes. Direct `codex debug prompt-input` or
+`npx ... debug prompt-input` against the live `CODEX_HOME` is forbidden.
+
+If network access prevents latest-version resolution or exact execution, the
+probe exits nonzero. Do not weaken the gate or call the rollout complete;
+preserve the successful local result and retry only when the published package
+is reachable.
 
 - [ ] **Step 9: Recheck all live invariants**
 

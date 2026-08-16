@@ -1753,6 +1753,22 @@ def test_attested_clock_capability_is_snapshot_bound_ephemeral_and_entry_scoped(
         second.close()
 
 
+def test_catalog_probe_entry_point_executes_only_from_attested_installed_bytes(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, installed, _authority = _genuine_install(tmp_path)
+    snapshot = attest_installed_snapshot(installed, deployer)
+    try:
+        command, descriptors = snapshot.execution_spec(
+            "scripts/rsi_catalog_probe.py", []
+        )
+        payload = json.loads(command[5])
+        assert payload["entry"]["path"] == "scripts/rsi_catalog_probe.py"
+        assert tuple(descriptors) == snapshot.file_fds
+    finally:
+        snapshot.close()
+
+
 def test_ordinary_installed_process_cannot_spoof_event_clock_with_environment(
     tmp_path: Path,
 ) -> None:

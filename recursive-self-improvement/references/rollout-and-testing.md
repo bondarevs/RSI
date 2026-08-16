@@ -7,9 +7,10 @@ Read [global rollout](global-rollout.md) before activating the pinned global
 Stage 0/1 observe copy. That deployment remains `observe + late-review`, keeps
 the production allowlist empty, and requires a new Codex task for catalog
 discovery after installation. Follow its **Catalog visibility** procedure for
-the read-only `codex debug prompt-input` probe and exact-receipt rollback. A
-model-visible catalog entry is not invocation, promotion, or deployment
-authority.
+the FD-attested `scripts/rsi_catalog_probe.py` local/latest probe and
+exact-receipt rollback. Its internal `codex debug prompt-input` clients use
+disposable projected catalog homes, never the live `CODEX_HOME`. A model-visible
+catalog entry is not invocation, promotion, or deployment authority.
 
 ## Rollout manifest schema
 

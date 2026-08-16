@@ -536,9 +536,14 @@ def attest_installed_snapshot(
             for path in entries
             if path == "scripts/rsi.py"
             or path == "scripts/rsi_deploy.py"
+            or path == "scripts/rsi_catalog_probe.py"
             or (path.startswith("scripts/rsi_core/") and path.endswith(".py"))
         )
-        if not {"scripts/rsi.py", "scripts/rsi_deploy.py"} <= set(python_paths):
+        if not {
+            "scripts/rsi.py",
+            "scripts/rsi_catalog_probe.py",
+            "scripts/rsi_deploy.py",
+        } <= set(python_paths):
             raise ValueError("installed Python entry points are not manifested")
         records: dict[str, dict[str, object]] = {}
         for relative in python_paths:

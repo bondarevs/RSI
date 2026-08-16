@@ -144,6 +144,8 @@ def test_global_rollout_reference_is_a_closed_release_contract() -> None:
 
     assert "Catalog visibility is not invocation authority" in text
     assert "codex debug prompt-input" in text
+    assert "scripts/rsi_catalog_probe.py" in text
+    assert "Never run either client against the live `CODEX_HOME`" in text
     assert "rollback through the exact deployment receipt" in text
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,8 @@ import pytest
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 CODEX = shutil.which("codex")
+NPX = shutil.which("npx")
+RUN_LATEST_CODEX = os.environ.get("RSI_TEST_LATEST_CODEX") == "1"
 CATALOG_PROMPT = (
     "Report only whether the model-visible skill catalog contains "
     "recursive-self-improvement. Do not invoke any skill."
@@ -63,9 +66,13 @@ def _install_catalog_surface(package_root: Path, installed: Path) -> None:
 
 
 def _render_fresh_catalog(
-    package_root: Path, run_root: Path
+    package_root: Path,
+    run_root: Path,
+    *,
+    command: tuple[str, ...] | None = None,
 ) -> tuple[str, Path]:
-    assert CODEX is not None
+    selected = (CODEX,) if command is None else command
+    assert selected and all(type(item) is str and item for item in selected)
     run_root.mkdir(parents=True)
     codex_home = run_root / "codex-home"
     installed = codex_home / "skills" / "recursive-self-improvement"
@@ -81,13 +88,13 @@ def _render_fresh_catalog(
         "NO_COLOR": "1",
     }
     completed = subprocess.run(
-        [CODEX, "debug", "prompt-input", CATALOG_PROMPT],
+        [*selected, "debug", "prompt-input", CATALOG_PROMPT],
         cwd=run_root,
         env=environment,
         check=False,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
     )
     assert completed.returncode == 0, completed.stderr
     payload = json.loads(completed.stdout)
@@ -99,6 +106,77 @@ def _render_fresh_catalog(
         if item.get("type") == "input_text" and type(item.get("text")) is str
     )
     return rendered, codex_home
+
+
+@pytest.mark.parametrize(
+    ("client_name", "command"),
+    [
+        pytest.param(
+            "local",
+            (CODEX,),
+            marks=pytest.mark.skipif(CODEX is None, reason="Codex CLI is unavailable"),
+        ),
+        pytest.param(
+            "latest",
+            (NPX, "--yes", "@openai/codex@latest"),
+            marks=pytest.mark.skipif(
+                NPX is None or not RUN_LATEST_CODEX,
+                reason="set RSI_TEST_LATEST_CODEX=1 for the mandatory network gate",
+            ),
+        ),
+    ],
+)
+def test_catalog_probe_confines_real_client_system_sync(
+    tmp_path: Path,
+    client_name: str,
+    command: tuple[str, ...],
+) -> None:
+    assert all(item is not None for item in command)
+    exact_command = tuple(str(item) for item in command)
+
+    unsafe_home = tmp_path / "unsafe-codex-home"
+    unsafe_installed = unsafe_home / "skills" / "recursive-self-improvement"
+    _install_catalog_surface(PACKAGE_ROOT, unsafe_installed)
+    unsafe_before = _tree_snapshot(unsafe_home)
+
+    _render_fresh_catalog(
+        PACKAGE_ROOT,
+        tmp_path / "unsafe-run",
+        command=exact_command,
+    )
+    direct_run_home = tmp_path / "unsafe-run" / "codex-home"
+    direct_after_client = _tree_snapshot(direct_run_home)
+    assert direct_after_client != unsafe_before
+    assert (direct_run_home / "skills" / ".system").is_dir()
+
+    probe_module = PACKAGE_ROOT / "scripts" / "rsi_core" / "catalog_probe.py"
+    assert probe_module.is_file(), (
+        f"real {client_name} catalog rendering synchronized .system inside its "
+        "active CODEX_HOME, but the isolated catalog probe is missing"
+    )
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+
+    protected_home = tmp_path / "protected-codex-home"
+    protected_installed = (
+        protected_home / "skills" / "recursive-self-improvement"
+    )
+    _install_catalog_surface(PACKAGE_ROOT, protected_installed)
+    protected_before = _tree_snapshot(protected_home)
+
+    result = catalog_probe.probe_catalog_client(
+        protected_installed,
+        tmp_path / "isolated-probe",
+        command=exact_command,
+        client_name=client_name,
+    )
+
+    assert _tree_snapshot(protected_home) == protected_before
+    assert result.client_name == client_name
+    assert result.catalog_entry_count == 1
+    assert result.verified_locator == protected_installed / "SKILL.md"
+    assert result.model_locator != result.verified_locator
+    assert result.isolated_home_change_count > 0
+    assert result.skill_body_absent is True
 
 
 @pytest.mark.skipif(CODEX is None, reason="Codex CLI is unavailable")

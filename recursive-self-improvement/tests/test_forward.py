@@ -756,6 +756,46 @@ def test_release_package_links_examples_metadata_permissions_and_validator() -> 
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_installed_package_links_keep_the_catalog_design_inside_the_package(
+    tmp_path: Path,
+) -> None:
+    """An installed package must not depend on repository-only ancestors."""
+
+    installed = tmp_path / "installed" / "recursive-self-improvement"
+    shutil.copytree(
+        PACKAGE_ROOT,
+        installed,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    installed_boundary = installed.resolve(strict=True)
+    markdown_files = [
+        installed / "SKILL.md",
+        *sorted((installed / "references").glob("*.md")),
+    ]
+    for markdown in markdown_files:
+        text = markdown.read_text(encoding="utf-8")
+        for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+            if "://" in target or target.startswith("#"):
+                continue
+            resolved = (markdown.parent / target.split("#", 1)[0]).resolve()
+            assert resolved.is_relative_to(installed_boundary), (
+                f"installed package link escapes package: {markdown.name} -> {target}"
+            )
+            assert resolved.is_file(), (
+                f"broken installed package link: {markdown.name} -> {target}"
+            )
+
+    packaged_design = installed / "references" / "catalog-visibility-design.md"
+    source_design = (
+        PACKAGE_ROOT.parent
+        / "docs"
+        / "superpowers"
+        / "specs"
+        / "2026-08-16-global-rsi-catalog-visibility-design.md"
+    )
+    assert packaged_design.read_bytes() == source_design.read_bytes()
+
+
 def test_release_index_contract_graph_and_provider_ledger_validate_in_controlled_homes(
     tmp_path: Path,
 ) -> None:

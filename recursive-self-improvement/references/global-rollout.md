@@ -167,18 +167,29 @@ decides whether a completed task is eligible, and the exact runtime profile
 remains the authority gate for any admitted operation.
 
 Installation does not alter the catalog of an already running Codex task.
-After a successful install or update, start a new Codex task. Use
-`codex debug prompt-input` as the read-only probe and confirm that the catalog
-contains one `recursive-self-improvement` entry while its skill body is not
-injected or invoked. The probe must create no RSI/provider state and must leave
-the repository, installed package, global instructions, live provider ledger,
-and all target roots byte-identical.
+After a successful install or update, start a new Codex task. Run
+`PYTHONDONTWRITEBYTECODE=1 python3 ~/.codex/skills/recursive-self-improvement/scripts/rsi_catalog_probe.py`.
+This FD-attested probe first binds the verified live deployment, then copies
+only its exact `SKILL.md` and `agents/openai.yaml` bytes into a separate
+disposable `CODEX_HOME` for each client. It runs the installed local client and
+resolves `@openai/codex@latest`, records that version, and executes the exact
+resolved version. Internally, each client runs `codex debug prompt-input` only
+against its disposable catalog projection; client `.system` synchronization is
+discarded with that projection. Never run either client against the live `CODEX_HOME`.
+
+The canonical result must report both clients and their exact versions, one
+`recursive-self-improvement` row per client, the model-visible projected
+locator, the verified live locator and catalog-surface digest that bind it, and
+absence of the RSI skill body. It must also report unchanged repository,
+installed-package, global-instruction, deployment, provider, and target
+witnesses. Network failure while resolving or executing the latest published
+client is a failed gate, not a local-only success.
 
 If the entry is absent, RSI is invoked unexpectedly, or the probe creates RSI
 state, stop the rollout and rollback through the exact deployment receipt. Do
 not repair the installed tree or retry under a new operation ID. The catalog
 visibility boundary is specified by the
-[catalog-visibility design addendum](../../docs/superpowers/specs/2026-08-16-global-rsi-catalog-visibility-design.md).
+[catalog-visibility design addendum](catalog-visibility-design.md).
 
 ## Recovery
 
