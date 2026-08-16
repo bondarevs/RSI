@@ -738,6 +738,119 @@ def test_testing_authority_cannot_alias_the_live_codex_tree(
         )
 
 
+def test_live_authority_validation_rederives_provider_ledger_and_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo, _paths, installed = _genuine_live_install(tmp_path, monkeypatch)
+    authority = DryRunAuthority.live()
+    forged_provider = tmp_path / "forged-provider"
+    forged_provider.mkdir()
+    forged_ledger = forged_provider / "events.jsonl"
+    forged_ledger.write_bytes(b"")
+    object.__setattr__(authority, "provider_home", forged_provider)
+    object.__setattr__(authority, "provider_ledger", forged_ledger)
+    object.__setattr__(authority, "target_roots", (tmp_path,))
+    dry_root = tmp_path / "must-remain-absent"
+
+    with pytest.raises(ValueError, match="live.*authority|authority.*live"):
+        run_observe_dry_run(installed, dry_root, authority=authority)
+
+    assert not dry_root.exists()
+
+
+def test_attested_clock_capability_is_snapshot_bound_ephemeral_and_entry_scoped(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, installed, _authority = _genuine_install(tmp_path)
+    first = attest_installed_snapshot(installed, deployer)
+    second = attest_installed_snapshot(installed, deployer)
+    try:
+        command_one, _fds_one = first.execution_spec(
+            "scripts/rsi.py", [], attested_now=rollout_module.DRY_RUN_ATTESTED_NOW
+        )
+        command_two, _fds_two = second.execution_spec(
+            "scripts/rsi.py", [], attested_now=rollout_module.DRY_RUN_ATTESTED_NOW
+        )
+        payload_one = json.loads(command_one[5])
+        payload_two = json.loads(command_two[5])
+        assert payload_one["clock"]["now"] == rollout_module.DRY_RUN_ATTESTED_NOW
+        assert payload_one["clock"]["authorityDigest"] == first.authority_digest
+        assert payload_one["clock"]["nonce"] != payload_two["clock"]["nonce"]
+        assert payload_one["clock"]["digest"] != payload_two["clock"]["digest"]
+        with pytest.raises(ValueError, match="clock|entry"):
+            first.execution_spec(
+                "scripts/rsi_deploy.py",
+                ["verify"],
+                attested_now=rollout_module.DRY_RUN_ATTESTED_NOW,
+            )
+    finally:
+        first.close()
+        second.close()
+
+
+def test_ordinary_installed_process_cannot_spoof_event_clock_with_environment(
+    tmp_path: Path,
+) -> None:
+    _repo, _deployer, installed, _authority = _genuine_install(tmp_path / "installation")
+    target = tmp_path / "ordinary-target"
+    target.mkdir()
+    state = tmp_path / "ordinary-state"
+    request = tmp_path / "ordinary-request.json"
+    request.write_bytes(
+        canonical_json_bytes(
+            {
+                "mode": "observe",
+                "hookMode": "late-review",
+                "taskClass": "code.change",
+                "activeSkills": [{"name": "mail", "versionHash": DIGEST_A}],
+                "taskFingerprint": DIGEST_A,
+                "artifactDigest": DIGEST_B,
+                "finalArtifacts": [
+                    {"kind": "test-result", "summary": "The ordinary fixture passed."}
+                ],
+            }
+        )
+    )
+    spoofed = "2001-02-03T04:05:06Z"
+    spoof_digest = "sha256:" + hashlib.sha256(
+        ("rsi-dry-run-attested-clock-v1\0" + spoofed).encode()
+    ).hexdigest()
+    environment = {
+        "PATH": os.defpath,
+        "HOME": os.fspath(tmp_path / "ordinary-home"),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "CODEX_RSI_ATTESTED_NOW": spoofed,
+        "CODEX_RSI_ATTESTED_CLOCK_AUTHORITY": spoof_digest,
+    }
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            os.fspath(installed / "scripts" / "rsi.py"),
+            "local-review",
+            "--home",
+            os.fspath(state),
+            "--target-root",
+            os.fspath(target),
+            "--run-id",
+            "ordinary-clock-spoof",
+            "--idempotency-key",
+            "ordinary-clock-spoof",
+            "--input-file",
+            os.fspath(request),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        env=environment,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    events = [json.loads(line) for line in (state / "events.jsonl").read_text().splitlines()]
+    assert spoofed not in {event["createdAt"] for event in events}
+
+
 def test_observe_dry_run_never_persists_rejected_bytes_or_their_hashes(tmp_path: Path) -> None:
     _repo, _deployer, installed, authority = _genuine_install(tmp_path / "installation")
     temp_root = tmp_path / "dry-run"

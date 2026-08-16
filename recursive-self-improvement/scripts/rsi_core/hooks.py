@@ -5,9 +5,9 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
+import sys
 from typing import Any, Mapping, Sequence
 
 from .events import EventEnvelope, derive_idempotency_key
@@ -33,10 +33,11 @@ from .validation import (
 PRODUCER_VERSION = "1.0.0"
 MAX_DRAFTS = 3
 LATE_REVIEW_WARNING = "late-review: in-dialog-only signals were unavailable"
-_ATTESTED_CLOCK_DOMAIN = "rsi-dry-run-attested-clock-v1"
-_ATTESTED_NOW_ENV = "CODEX_RSI_ATTESTED_NOW"
-_ATTESTED_CLOCK_ENV = "CODEX_RSI_ATTESTED_CLOCK_AUTHORITY"
+_CLOCK_CAPABILITY_MODULE = "_rsi_attested_clock_capability"
+_CLOCK_CAPABILITY_DOMAIN = "rsi-dry-run-bootstrap-clock-v1"
 _UTC_SECONDS = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\Z")
+_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_NONCE = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def canonical_digest(value: object) -> str:
@@ -88,22 +89,33 @@ def _digest(*parts: str) -> str:
 
 
 def _now() -> str:
-    attested_now = os.environ.get(_ATTESTED_NOW_ENV)
-    authority = os.environ.get(_ATTESTED_CLOCK_ENV)
-    if attested_now is not None or authority is not None:
-        expected = (
-            "sha256:"
-            + hashlib.sha256(
-                (_ATTESTED_CLOCK_DOMAIN + "\0" + str(attested_now)).encode("utf-8")
-            ).hexdigest()
-        )
+    module = sys.modules.get(_CLOCK_CAPABILITY_MODULE)
+    if module is not None:
+        capability = getattr(module, "CAPABILITY", None)
+        if type(capability) is not tuple or len(capability) != 5:
+            raise LifecycleError("attested dry-run clock capability is invalid")
+        attested_now, nonce, authority_digest, entry_digest, digest = capability
         if (
-            attested_now is None
-            or authority is None
+            any(type(value) is not str for value in capability)
             or _UTC_SECONDS.fullmatch(attested_now) is None
-            or authority != expected
+            or _NONCE.fullmatch(nonce) is None
+            or _SHA256.fullmatch(authority_digest) is None
+            or _SHA256.fullmatch(entry_digest) is None
         ):
-            raise LifecycleError("attested dry-run clock authority is invalid")
+            raise LifecycleError("attested dry-run clock capability is invalid")
+        expected = "sha256:" + hashlib.sha256(
+            "\0".join(
+                (
+                    _CLOCK_CAPABILITY_DOMAIN,
+                    authority_digest,
+                    entry_digest,
+                    nonce,
+                    attested_now,
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        if digest != expected:
+            raise LifecycleError("attested dry-run clock capability is invalid")
         return attested_now
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
