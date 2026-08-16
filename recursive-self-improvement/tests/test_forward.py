@@ -862,6 +862,81 @@ def _global_rollout_recovery_contract() -> dict[str, str]:
     return recovery
 
 
+def _independent_git_head(repository: Path) -> str:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
+    }
+    environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"})
+    completed = subprocess.run(
+        ["git", "-C", os.fspath(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    commit = completed.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{40}", commit)
+    return commit
+
+
+def _assert_manifest_source_provenance(
+    manifest: dict[str, object], *, repository: Path, commit: str
+) -> None:
+    assert (
+        manifest.get("sourceRepository"),
+        manifest.get("sourceCommit"),
+    ) == (os.fspath(repository), commit)
+
+
+def _assert_active_release_provenance(
+    deployer: GlobalRsiDeployer,
+    *,
+    repository: Path,
+    commit: str,
+    operation_id: str,
+) -> dict[str, object]:
+    status = deployer.verify()
+    assert (
+        status.state,
+        status.verified,
+        status.operation_id,
+        status.source_commit,
+    ) == ("verified", True, operation_id, commit)
+
+    paths = deployer.paths
+    installed_manifest_bytes = (
+        paths.installed_root / ".rsi-deployment-manifest.json"
+    ).read_bytes()
+    receipt_manifest_bytes = (
+        paths.receipts_root / f"{operation_id}.manifest.json"
+    ).read_bytes()
+    receipt_bytes = (paths.receipts_root / f"{operation_id}.json").read_bytes()
+    manifest = json.loads(installed_manifest_bytes)
+    receipt = json.loads(receipt_bytes)
+    active = json.loads(paths.active_authority_file.read_bytes())
+    assert isinstance(manifest, dict)
+    assert isinstance(receipt, dict)
+    assert isinstance(active, dict)
+    _assert_manifest_source_provenance(
+        manifest, repository=repository, commit=commit
+    )
+    manifest_digest = "sha256:" + hashlib.sha256(installed_manifest_bytes).hexdigest()
+    receipt_digest = "sha256:" + hashlib.sha256(receipt_bytes).hexdigest()
+    assert installed_manifest_bytes == receipt_manifest_bytes
+    assert (
+        manifest.get("operationId"),
+        receipt.get("operationId"),
+        active.get("operationId"),
+    ) == (operation_id, operation_id, operation_id)
+    assert receipt.get("manifestByteLength") == len(installed_manifest_bytes)
+    assert receipt.get("manifestDigest") == manifest_digest
+    assert active.get("state") == "present"
+    assert status.manifest_digest == manifest_digest
+    assert status.receipt_digest == receipt_digest
+    assert status.tree_digest == manifest.get("installedTreeDigest")
+    return manifest
+
+
 @pytest.mark.skipif(
     sys.platform != "darwin", reason="atomic rollout mutation is Darwin-only"
 )
@@ -870,6 +945,8 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
 ) -> None:
     """One release fixture covers the operator sequence without live/provider writes."""
     repository = _forward_rollout_repository(tmp_path)
+    canonical_repository = repository.resolve(strict=True)
+    v1_commit = _independent_git_head(canonical_repository)
     paths = DeploymentPaths.for_testing(tmp_path / "codex-home")
     deployer = GlobalRsiDeployer(paths)
     provider = tmp_path / "protected-provider"
@@ -890,7 +967,20 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
 
     installed = deployer.deploy(repository, "forward-install-v1")
     assert installed.operation_id == "forward-install-v1"
-    assert deployer.verify().verified is True
+    v1_manifest = _assert_active_release_provenance(
+        deployer,
+        repository=canonical_repository,
+        commit=v1_commit,
+        operation_id="forward-install-v1",
+    )
+    for mutation in (
+        {**v1_manifest, "sourceRepository": os.fspath(canonical_repository.parent)},
+        {**v1_manifest, "sourceCommit": "0" * 40},
+    ):
+        with pytest.raises(AssertionError):
+            _assert_manifest_source_provenance(
+                mutation, repository=canonical_repository, commit=v1_commit
+            )
     assert (
         _normalized_release_tree(paths.installed_root, source=False) == v1_release
     )
@@ -1017,11 +1107,18 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
         ["git", "-C", str(repository), "commit", "-q", "-m", "release-v2"],
         check=True,
     )
+    v2_commit = _independent_git_head(canonical_repository)
+    assert v2_commit != v1_commit
     v2_release = _normalized_release_tree(source_package, source=True)
     assert v2_release != v1_release
     updated = deployer.deploy(repository, "forward-update-v2")
     assert updated.operation_id == "forward-update-v2"
-    assert deployer.verify().operation_id == "forward-update-v2"
+    _assert_active_release_provenance(
+        deployer,
+        repository=canonical_repository,
+        commit=v2_commit,
+        operation_id="forward-update-v2",
+    )
     assert (
         _normalized_release_tree(paths.installed_root, source=False) == v2_release
     )
@@ -1079,7 +1176,12 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
     assert deployer.verify().verified is True
     rolled_back = deployer.rollback("forward-update-v2", "forward-rollback-v1")
     assert rolled_back.operation_id == "forward-rollback-v1"
-    assert deployer.verify().operation_id == "forward-rollback-v1"
+    _assert_active_release_provenance(
+        deployer,
+        repository=canonical_repository,
+        commit=v1_commit,
+        operation_id="forward-rollback-v1",
+    )
     assert (
         _normalized_release_tree(paths.installed_root, source=False) == v1_release
     )
