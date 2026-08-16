@@ -69,6 +69,14 @@ _MAX_IGNORED_NAME_BYTES = 2 * 1024 * 1024
 _MAX_IGNORED_METADATA_BYTES = 4 * 1024 * 1024
 _MAX_IGNORED_SYMLINK_BYTES = 256 * 1024
 _MAX_IGNORED_DEPTH = 64
+_MAX_PROTECTED_ENTRIES = 32_768
+_MAX_PROTECTED_PATH_BYTES = 8 * 1024 * 1024
+_MAX_PROTECTED_NAME_BYTES = 4 * 1024 * 1024
+_MAX_PROTECTED_METADATA_BYTES = 8 * 1024 * 1024
+_MAX_PROTECTED_SYMLINK_BYTES = 1024 * 1024
+_MAX_PROTECTED_FILE_BYTES = 64 * 1024 * 1024
+_MAX_PROTECTED_CONTENT_BYTES = 512 * 1024 * 1024
+_MAX_PROTECTED_DEPTH = 64
 DRY_RUN_ATTESTED_NOW = "2026-08-13T00:00:00Z"
 _CLOCK_CAPABILITY_MODULE = "_rsi_attested_clock_capability"
 _CLOCK_CAPABILITY_DOMAIN = "rsi-dry-run-bootstrap-clock-v1"
@@ -770,6 +778,328 @@ def _tree_digest(root: Path) -> str:
         elif not stat.S_ISDIR(metadata.st_mode):
             raise ValueError("dry-run protected tree has unsafe topology")
     return "sha256:" + digest.hexdigest()
+
+
+def _protected_stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    try:
+        return (
+            value.st_mode,
+            value.st_uid,
+            value.st_gid,
+            value.st_dev,
+            value.st_ino,
+            value.st_nlink,
+            value.st_rdev,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+    except Exception:
+        raise ValueError("protected tree metadata is invalid") from None
+
+
+def _require_protected_signature(
+    value: os.stat_result,
+    expected: tuple[int, ...],
+    *,
+    context: str,
+) -> None:
+    if _protected_stat_signature(value) != expected:
+        raise ValueError(f"protected tree {context} identity changed")
+
+
+def _capture_protected_tree_witness(
+    root: Path,
+) -> tuple[tuple[object, ...], ...]:
+    """Capture a bounded descriptor-relative nofollow tree witness."""
+
+    root = _canonical_protected_path(root, label="protected target root")
+    try:
+        root_named = os.lstat(root)
+    except OSError:
+        raise ValueError("protected target root is unavailable") from None
+    if not stat.S_ISDIR(root_named.st_mode):
+        raise ValueError("protected target root is not a directory")
+
+    records: list[tuple[object, ...]] = []
+    seen: set[str] = set()
+    path_bytes = 0
+    name_bytes = 0
+    metadata_bytes = 0
+    symlink_bytes = 0
+    content_bytes = 0
+    open_descriptors: set[int] = set()
+
+    def close_registered(descriptor: int) -> None:
+        if descriptor not in open_descriptors:
+            return
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        open_descriptors.remove(descriptor)
+
+    def reserve(
+        relative: str,
+        name: str,
+        depth: int,
+        metadata: os.stat_result,
+    ) -> tuple[int, ...]:
+        nonlocal path_bytes, name_bytes, metadata_bytes
+        if relative in seen:
+            raise ValueError("protected tree contains a duplicate entry")
+        try:
+            encoded_relative = relative.encode("utf-8", "strict")
+            encoded_name = name.encode("utf-8", "strict")
+        except UnicodeEncodeError:
+            raise ValueError("protected tree entry name is not canonical UTF-8") from None
+        if relative != ".":
+            _canonical_ignored_relative(relative)
+        signature = _protected_stat_signature(metadata)
+        if len(seen) + 1 > _MAX_PROTECTED_ENTRIES:
+            raise ValueError("protected tree entry bound exceeded")
+        if path_bytes + len(encoded_relative) > _MAX_PROTECTED_PATH_BYTES:
+            raise ValueError("protected tree path byte bound exceeded")
+        if name_bytes + len(encoded_name) > _MAX_PROTECTED_NAME_BYTES:
+            raise ValueError("protected tree name byte bound exceeded")
+        if metadata_bytes + len(signature) * 8 > _MAX_PROTECTED_METADATA_BYTES:
+            raise ValueError("protected tree metadata byte bound exceeded")
+        if depth > _MAX_PROTECTED_DEPTH:
+            raise ValueError("protected tree depth bound exceeded")
+        seen.add(relative)
+        path_bytes += len(encoded_relative)
+        name_bytes += len(encoded_name)
+        metadata_bytes += len(signature) * 8
+        return signature
+
+    def record_for(
+        relative: str,
+        kind: str,
+        signature: tuple[int, ...],
+        *,
+        content_digest: str | None = None,
+        target: bytes | None = None,
+    ) -> tuple[object, ...]:
+        target_digest = (
+            None if target is None else "sha256:" + hashlib.sha256(target).hexdigest()
+        )
+        return (relative, kind, signature, content_digest, target, target_digest)
+
+    def pin_directory(
+        parent_fd: int | None,
+        name: str | Path,
+        expected: tuple[int, ...],
+    ) -> int:
+        descriptor: int | None = None
+        try:
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            if parent_fd is None:
+                descriptor = os.open(name, flags)
+            else:
+                descriptor = os.open(name, flags, dir_fd=parent_fd)
+            open_descriptors.add(descriptor)
+            opened = os.fstat(descriptor)
+            _require_protected_signature(
+                opened, expected, context="directory"
+            )
+            return descriptor
+        except ValueError:
+            if descriptor is not None:
+                close_registered(descriptor)
+            raise
+        except OSError:
+            if descriptor is not None:
+                close_registered(descriptor)
+            raise ValueError("protected tree directory cannot be pinned") from None
+
+    def enumerate_children(
+        directory_fd: int, relative: str, depth: int
+    ) -> list[tuple[str, str, int, tuple[int, ...]]]:
+        children: list[tuple[str, str, int, tuple[int, ...]]] = []
+        try:
+            with os.scandir(directory_fd) as iterator:
+                for entry in iterator:
+                    child_name = entry.name
+                    if type(child_name) is not str:
+                        raise ValueError("protected tree entry name is invalid")
+                    child_relative = (
+                        child_name if relative == "." else relative + "/" + child_name
+                    )
+                    try:
+                        child_metadata = os.stat(
+                            child_name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        raise ValueError(
+                            "protected tree entry changed during enumeration"
+                        ) from None
+                    child_signature = reserve(
+                        child_relative,
+                        child_name,
+                        depth + 1,
+                        child_metadata,
+                    )
+                    children.append(
+                        (child_name, child_relative, depth + 1, child_signature)
+                    )
+        except ValueError:
+            raise
+        except OSError:
+            raise ValueError("protected tree directory cannot be enumerated") from None
+        children.sort(key=lambda child: child[0].encode("utf-8"))
+        return children
+
+    def digest_regular(
+        parent_fd: int, name: str, expected: tuple[int, ...]
+    ) -> str:
+        nonlocal content_bytes
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_fd,
+            )
+            open_descriptors.add(descriptor)
+            opened = os.fstat(descriptor)
+            _require_protected_signature(opened, expected, context="regular file")
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError("protected tree regular file changed type")
+            if opened.st_size > _MAX_PROTECTED_FILE_BYTES:
+                raise ValueError("protected tree file byte bound exceeded")
+            if content_bytes + opened.st_size > _MAX_PROTECTED_CONTENT_BYTES:
+                raise ValueError("protected tree content byte bound exceeded")
+            digest = hashlib.sha256()
+            captured = 0
+            while True:
+                chunk = os.read(descriptor, min(64 * 1024, opened.st_size + 1 - captured))
+                if not chunk:
+                    break
+                captured += len(chunk)
+                if captured > opened.st_size:
+                    raise ValueError("protected tree regular file grew during capture")
+                digest.update(chunk)
+            if captured != opened.st_size:
+                raise ValueError("protected tree regular file changed during capture")
+            _require_protected_signature(
+                os.fstat(descriptor), expected, context="regular file"
+            )
+            content_bytes += captured
+            return "sha256:" + digest.hexdigest()
+        except ValueError:
+            raise
+        except OSError:
+            raise ValueError("protected tree regular file cannot be read") from None
+        finally:
+            if descriptor is not None:
+                close_registered(descriptor)
+
+    root_signature = reserve(".", root.name or ".", 0, root_named)
+    root_fd: int | None = None
+    try:
+        root_fd = pin_directory(None, root, root_signature)
+        tasks: list[tuple[object, ...]] = [
+            ("scan", None, root, ".", 0, root_signature, root_fd)
+        ]
+        while tasks:
+            task = tasks.pop()
+            if task[0] == "finish":
+                _, parent_fd, name, relative, expected, directory_fd = task
+                try:
+                    opened_after = os.fstat(directory_fd)
+                    named_after = (
+                        os.lstat(name)
+                        if parent_fd is None
+                        else os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    )
+                except OSError:
+                    raise ValueError(
+                        "protected tree directory changed during capture"
+                    ) from None
+                _require_protected_signature(
+                    opened_after, expected, context="directory"
+                )
+                _require_protected_signature(
+                    named_after, expected, context="directory"
+                )
+                records.append(record_for(relative, "directory", expected))
+                close_registered(directory_fd)
+                continue
+            if task[0] == "scan":
+                _, parent_fd, name, relative, depth, expected, directory_fd = task
+                children = enumerate_children(directory_fd, relative, depth)
+                tasks.append(
+                    ("finish", parent_fd, name, relative, expected, directory_fd)
+                )
+                for child in reversed(children):
+                    tasks.append(("entry", directory_fd, *child))
+                continue
+            _, parent_fd, name, relative, depth, expected = task
+            try:
+                named_before = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except OSError:
+                raise ValueError("protected tree entry is unavailable") from None
+            _require_protected_signature(
+                named_before, expected, context="entry"
+            )
+            kind = _ignored_kind(named_before.st_mode)
+            if kind == "directory":
+                directory_fd = pin_directory(parent_fd, name, expected)
+                tasks.append(
+                    ("scan", parent_fd, name, relative, depth, expected, directory_fd)
+                )
+                continue
+            content_digest: str | None = None
+            target: bytes | None = None
+            if kind == "regular":
+                content_digest = digest_regular(parent_fd, name, expected)
+            elif kind == "symlink":
+                try:
+                    target = os.readlink(
+                        os.fsencode(name), dir_fd=parent_fd
+                    )
+                except OSError:
+                    raise ValueError("protected tree symlink is invalid") from None
+                symlink_bytes += len(target)
+                if symlink_bytes > _MAX_PROTECTED_SYMLINK_BYTES:
+                    raise ValueError("protected tree symlink byte bound exceeded")
+            try:
+                named_after = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except OSError:
+                raise ValueError(
+                    "protected tree entry changed during capture"
+                ) from None
+            _require_protected_signature(
+                named_after, expected, context="entry"
+            )
+            records.append(
+                record_for(
+                    relative,
+                    kind,
+                    expected,
+                    content_digest=content_digest,
+                    target=target,
+                )
+            )
+    finally:
+        for descriptor in tuple(open_descriptors):
+            close_registered(descriptor)
+    records.sort(key=lambda record: str(record[0]).encode("utf-8"))
+    return tuple(records)
 
 
 def _write_canonical(path: Path, value: Mapping[str, object]) -> None:
@@ -1909,7 +2239,10 @@ def _run_attested_observe_dry_run(
         _tree_digest(path)
         if path.is_dir()
         else _read_stable_file(path, limit=16 * 1024 * 1024)
-        for path in snapshotted
+        for path in snapshotted[:2]
+    ) + tuple(
+        _capture_protected_tree_witness(path)
+        for path in authority.target_roots
     )
     provider_before = (
         _capture_optional_path_witness(
@@ -2013,7 +2346,10 @@ def _run_attested_observe_dry_run(
         _tree_digest(path)
         if path.is_dir()
         else _read_stable_file(path, limit=16 * 1024 * 1024)
-        for path in snapshotted
+        for path in snapshotted[:2]
+    ) + tuple(
+        _capture_protected_tree_witness(path)
+        for path in authority.target_roots
     )
     if protected_after != protected_before:
         raise RuntimeError("dry run changed a protected authority root")

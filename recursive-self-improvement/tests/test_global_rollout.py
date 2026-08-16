@@ -694,6 +694,163 @@ def test_observe_dry_run_uses_only_installed_cli_and_temporary_state(tmp_path: P
         }
 
 
+def test_observe_dry_run_admits_nofollow_protected_target_topology(
+    tmp_path: Path,
+) -> None:
+    _repo, _deployer, installed, authority = _genuine_install(
+        tmp_path / "installation"
+    )
+    target = authority.target_roots[0]
+    nested = target / "nested"
+    nested.mkdir()
+    (nested / "payload.bin").write_bytes(b"protected payload")
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"must not be followed")
+    (target / "ordinary-link").symlink_to(outside)
+    os.mkfifo(target / "special.fifo")
+    report = run_observe_dry_run(
+        installed,
+        tmp_path / "symlinked-protected-root-dry-run",
+        authority=authority,
+    )
+
+    assert report.complete is True
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["content", "mode", "inode", "symlink-target", "nested"],
+)
+def test_observe_dry_run_detects_every_protected_target_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    _repo, _deployer, installed, authority = _genuine_install(
+        tmp_path / "installation"
+    )
+    target = authority.target_roots[0]
+    payload = target / "payload.bin"
+    payload.write_bytes(b"same protected bytes")
+    nested = target / "nested"
+    nested.mkdir()
+    (nested / "existing.bin").write_bytes(b"nested bytes")
+    first_target = tmp_path / "first-a.bin"
+    second_target = tmp_path / "second-b.bin"
+    first_target.write_bytes(b"first outside")
+    second_target.write_bytes(b"second outside")
+    link = target / "ordinary-link"
+    if mutation == "symlink-target":
+        link.symlink_to(first_target)
+    real_review = rollout_module._run_installed_review
+    injected = False
+
+    def mutate_protected_target(*args: object, **kwargs: object):
+        nonlocal injected
+        result = real_review(*args, **kwargs)
+        if injected:
+            return result
+        injected = True
+        if mutation == "content":
+            payload.write_bytes(b"changed protected bytes")
+        elif mutation == "mode":
+            payload.chmod(0o600)
+        elif mutation == "inode":
+            replacement = target / "replacement.bin"
+            replacement.write_bytes(b"same protected bytes")
+            replacement.chmod(stat.S_IMODE(os.lstat(payload).st_mode))
+            os.replace(replacement, payload)
+        elif mutation == "symlink-target":
+            link.unlink()
+            link.symlink_to(second_target)
+        else:
+            (nested / "created.bin").write_bytes(b"new nested bytes")
+        return result
+
+    monkeypatch.setattr(
+        rollout_module, "_run_installed_review", mutate_protected_target
+    )
+
+    with pytest.raises(RuntimeError, match="protected authority root"):
+        run_observe_dry_run(
+            installed,
+            tmp_path / f"{mutation}-drift-dry-run",
+            authority=authority,
+        )
+
+    assert injected is True
+
+
+def test_protected_tree_witness_never_follows_symlink_content_and_records_special(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "protected"
+    root.mkdir()
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside version one")
+    (root / "ordinary-link").symlink_to(outside)
+    special = root / "special.fifo"
+    os.mkfifo(special)
+
+    before = rollout_module._capture_protected_tree_witness(root)
+    outside.write_bytes(b"outside version two")
+    after_external_change = rollout_module._capture_protected_tree_witness(root)
+    special.chmod(0o644)
+    after_special_change = rollout_module._capture_protected_tree_witness(root)
+
+    assert after_external_change == before
+    assert after_special_change != before
+    assert any(record[1] == "fifo" for record in before)
+
+
+def test_protected_tree_witness_bounds_fanout_and_closes_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "protected"
+    root.mkdir()
+    for index in range(3):
+        (root / f"entry-{index}.bin").write_bytes(b"entry")
+    monkeypatch.setattr(rollout_module, "_MAX_PROTECTED_ENTRIES", 2)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+
+    with pytest.raises(ValueError, match="entry bound"):
+        rollout_module._capture_protected_tree_witness(root)
+
+    assert {entry.name for entry in fd_root.iterdir()} == before
+
+
+def test_protected_tree_witness_rejects_directory_rebind_and_closes_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "protected"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    (nested / "payload.bin").write_bytes(b"payload")
+    real_open = os.open
+    rebound = False
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+
+    def rebind_before_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ):
+        nonlocal rebound
+        if path == "nested" and kwargs.get("dir_fd") is not None and not rebound:
+            rebound = True
+            nested.rename(root / "nested-displaced")
+            nested.mkdir()
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", rebind_before_open)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        rollout_module._capture_protected_tree_witness(root)
+
+    assert rebound is True
+    assert {entry.name for entry in fd_root.iterdir()} == before
+
+
 def test_live_authority_constructor_and_public_dry_run_use_only_fixed_live_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1371,19 +1528,16 @@ def test_absent_live_provider_creation_is_detected_as_protected_drift(
 
 
 def test_preflight_failure_after_attestation_closes_every_snapshot_descriptor(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _repo, _deployer, installed, authority = _genuine_install(tmp_path / "installation")
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (authority.target_roots[0] / "unsafe-link").symlink_to(
-        outside, target_is_directory=True
-    )
+    (authority.target_roots[0] / "bounded.bin").write_bytes(b"too large")
+    monkeypatch.setattr(rollout_module, "_MAX_PROTECTED_FILE_BYTES", 1)
     fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
     before = len(tuple(fd_root.iterdir()))
 
     for attempt in range(3):
-        with pytest.raises(ValueError, match="symlink"):
+        with pytest.raises(ValueError, match="file byte bound"):
             run_observe_dry_run(
                 installed,
                 tmp_path / f"descriptor-leak-dry-run-{attempt}",
