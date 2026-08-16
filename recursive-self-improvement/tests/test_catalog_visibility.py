@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+
+import pytest
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+CODEX = shutil.which("codex")
+CATALOG_PROMPT = (
+    "Report only whether the model-visible skill catalog contains "
+    "recursive-self-improvement. Do not invoke any skill."
+)
+SKILL_BODY_SENTINEL = (
+    "Operate as the control plane for evidence-backed role-skill improvement."
+)
+
+
+def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
+    result: list[tuple[object, ...]] = []
+    for path in sorted((root, *root.rglob("*")), key=lambda item: os.fsencode(item)):
+        metadata = os.lstat(path)
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISREG(metadata.st_mode):
+            payload = path.read_bytes()
+            kind = "regular"
+            evidence: object = (len(payload), hashlib.sha256(payload).hexdigest())
+        elif stat.S_ISDIR(metadata.st_mode):
+            kind = "directory"
+            evidence = None
+        elif stat.S_ISLNK(metadata.st_mode):
+            kind = "symlink"
+            evidence = os.readlink(path)
+        else:
+            kind = "special"
+            evidence = None
+        result.append((relative, kind, mode, metadata.st_nlink, evidence))
+    return tuple(result)
+
+
+def _install_catalog_surface(package_root: Path, installed: Path) -> None:
+    (installed / "agents").mkdir(parents=True)
+    shutil.copy2(package_root / "SKILL.md", installed / "SKILL.md")
+    shutil.copy2(
+        package_root / "agents/openai.yaml",
+        installed / "agents/openai.yaml",
+    )
+
+
+def _render_fresh_catalog(
+    package_root: Path, run_root: Path
+) -> tuple[str, Path]:
+    assert CODEX is not None
+    run_root.mkdir(parents=True)
+    codex_home = run_root / "codex-home"
+    installed = codex_home / "skills" / "recursive-self-improvement"
+    _install_catalog_surface(package_root, installed)
+    isolated_home = run_root / "isolated-home"
+    isolated_home.mkdir()
+    environment = {
+        "CODEX_HOME": os.fspath(codex_home),
+        "HOME": os.fspath(isolated_home),
+        "PATH": os.environ["PATH"],
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "NO_COLOR": "1",
+    }
+    completed = subprocess.run(
+        [CODEX, "debug", "prompt-input", CATALOG_PROMPT],
+        cwd=run_root,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    assert type(payload) is list
+    rendered = "\n".join(
+        item["text"]
+        for message in payload
+        for item in message.get("content", [])
+        if item.get("type") == "input_text" and type(item.get("text")) is str
+    )
+    return rendered, codex_home
+
+
+@pytest.mark.skipif(CODEX is None, reason="Codex CLI is unavailable")
+def test_fresh_codex_catalog_lists_rsi_without_invoking_it(tmp_path: Path) -> None:
+    rendered, codex_home = _render_fresh_catalog(PACKAGE_ROOT, tmp_path / "visible")
+
+    assert "### Available skills" in rendered
+    assert rendered.count("- recursive-self-improvement:") == 1
+    assert os.fspath(
+        codex_home / "skills/recursive-self-improvement/SKILL.md"
+    ) in rendered
+    assert SKILL_BODY_SENTINEL not in rendered
+
+
+@pytest.mark.skipif(CODEX is None, reason="Codex CLI is unavailable")
+def test_disabled_policy_is_not_model_visible(tmp_path: Path) -> None:
+    disabled = tmp_path / "disabled-package"
+    _install_catalog_surface(PACKAGE_ROOT, disabled)
+    metadata_path = disabled / "agents/openai.yaml"
+    metadata = metadata_path.read_text(encoding="utf-8")
+    assert metadata.count("allow_implicit_invocation: true") == 1
+    metadata_path.write_text(
+        metadata.replace(
+            "allow_implicit_invocation: true",
+            "allow_implicit_invocation: false",
+        ),
+        encoding="utf-8",
+    )
+
+    rendered, codex_home = _render_fresh_catalog(disabled, tmp_path / "disabled")
+
+    assert "- recursive-self-improvement:" not in rendered
+    assert os.fspath(
+        codex_home / "skills/recursive-self-improvement/SKILL.md"
+    ) not in rendered
+
+
+@pytest.mark.skipif(CODEX is None, reason="Codex CLI is unavailable")
+def test_catalog_probe_preserves_source_and_creates_no_rsi_state(tmp_path: Path) -> None:
+    protected = tmp_path / "protected" / "witness.bin"
+    protected.parent.mkdir()
+    protected.write_bytes(b"protected-before\n")
+    package_before = _tree_snapshot(PACKAGE_ROOT)
+
+    _render_fresh_catalog(PACKAGE_ROOT, tmp_path / "zero-write")
+
+    assert _tree_snapshot(PACKAGE_ROOT) == package_before
+    assert protected.read_bytes() == b"protected-before\n"
+    assert not list(tmp_path.rglob("events.jsonl"))
+    assert not list(tmp_path.rglob("observations.jsonl"))
+    assert not list(tmp_path.rglob("reports.jsonl"))
+    assert not list(tmp_path.rglob("rsi-deployments-v1"))
