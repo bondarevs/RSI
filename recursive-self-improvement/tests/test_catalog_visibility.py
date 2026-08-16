@@ -452,6 +452,64 @@ def test_disposable_tree_inventory_is_deterministic_and_never_follows_links(
     assert _open_descriptor_names() == descriptors_before
 
 
+def test_disposable_tree_inventory_tolerates_unrelated_ancestor_churn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    scan_parent = tmp_path / "scan-parent"
+    root = scan_parent / "isolated-root"
+    root.mkdir(parents=True)
+    (root / "payload.bin").write_bytes(b"payload")
+    real_scandir = os.scandir
+    churned = False
+
+    def churn_sibling_once(directory: object):
+        nonlocal churned
+        if not churned:
+            churned = True
+            sibling = scan_parent / "unrelated-client"
+            sibling.mkdir()
+            sibling.rmdir()
+        return real_scandir(directory)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(catalog_probe.os, "scandir", churn_sibling_once)
+
+    snapshot = catalog_probe._tree_snapshot(root)
+
+    assert churned is True
+    assert {str(row[0]) for row in snapshot} == {".", "payload.bin"}
+
+
+def test_disposable_tree_inventory_rejects_ancestor_rebind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    scan_parent = tmp_path / "scan-parent"
+    root = scan_parent / "isolated-root"
+    root.mkdir(parents=True)
+    (root / "payload.bin").write_bytes(b"payload")
+    displaced = tmp_path / "scan-parent-displaced"
+    real_scandir = os.scandir
+    rebound = False
+
+    def rebind_ancestor_once(directory: object):
+        nonlocal rebound
+        if not rebound:
+            rebound = True
+            scan_parent.rename(displaced)
+            root.mkdir(parents=True)
+        return real_scandir(directory)  # type: ignore[arg-type]
+
+    descriptors_before = _open_descriptor_names()
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog_probe.os, "scandir", rebind_ancestor_once)
+        with pytest.raises(catalog_probe.CatalogProbeError, match="ancestry identity"):
+            catalog_probe._tree_snapshot(root)
+
+    assert rebound is True
+    assert _open_descriptor_names() == descriptors_before
+
+
 def test_disposable_tree_inventory_rejects_duplicate_directory_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

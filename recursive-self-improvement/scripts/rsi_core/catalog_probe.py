@@ -277,6 +277,7 @@ def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
     total_file_bytes = 0
     open_descriptors: set[int] = set()
     metadata_record_bytes = 10 * 8
+    binding_fields = (0, 1, 2, 3, 4, 6)
 
     def close_registered(descriptor: int) -> None:
         if descriptor not in open_descriptors:
@@ -297,6 +298,42 @@ def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
             raise CatalogProbeError(
                 f"isolated client tree {context} identity changed"
             )
+
+    def require_root_binding() -> None:
+        """Recheck ancestry identity without freezing unrelated directory state."""
+
+        try:
+            steps = pinned_root.steps
+            if not steps:
+                require_signature(
+                    os.fstat(pinned_root.final_fd),
+                    root_signature,
+                    context="root",
+                )
+                return
+            final_index = len(steps) - 1
+            for index, (parent_fd, name, descriptor, expected) in enumerate(steps):
+                opened = os.fstat(descriptor)
+                named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                expected_binding = tuple(expected[item] for item in binding_fields)
+                for current in (opened, named):
+                    signature = _tree_metadata_signature(current)
+                    current_binding = tuple(
+                        signature[item] for item in binding_fields
+                    )
+                    if current_binding != expected_binding:
+                        raise CatalogProbeError(
+                            "isolated client root ancestry identity changed"
+                        )
+                if index == final_index:
+                    require_signature(opened, root_signature, context="root")
+                    require_signature(named, root_signature, context="root")
+        except CatalogProbeError:
+            raise
+        except (OSError, OverflowError, ValueError):
+            raise CatalogProbeError(
+                "isolated client root changed while scanning"
+            ) from None
 
     def preflight_name(
         relative: str,
@@ -670,12 +707,7 @@ def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
                     expected,
                 )
             )
-        try:
-            pinned_root.verify()
-        except (OSError, OverflowError, ValueError):
-            raise CatalogProbeError(
-                "isolated client root changed while scanning"
-            ) from None
+        require_root_binding()
     finally:
         for descriptor in tuple(open_descriptors):
             close_registered(descriptor)
