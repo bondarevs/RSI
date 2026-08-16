@@ -1280,6 +1280,34 @@ def _ignored_stat_signature(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+class _IgnoredIdentityDrift(ValueError):
+    pass
+
+
+_NO_IGNORED_SIGNATURE = object()
+
+
+def _checked_ignored_stat_signature(
+    value: os.stat_result,
+    *,
+    context: str,
+    expected: object = _NO_IGNORED_SIGNATURE,
+    drift_message: str | None = None,
+) -> tuple[int, ...]:
+    try:
+        signature = _ignored_stat_signature(value)
+    except Exception:
+        raise ValueError(
+            f"ignored repository {context} signature is invalid"
+        ) from None
+    if expected is not _NO_IGNORED_SIGNATURE and signature != expected:
+        message = drift_message or f"ignored repository {context} signature changed"
+        if drift_message is not None:
+            raise _IgnoredIdentityDrift(message)
+        raise ValueError(message)
+    return signature
+
+
 def _ignored_kind(mode: int) -> str:
     if stat.S_ISDIR(mode):
         return "directory"
@@ -1344,13 +1372,17 @@ def _capture_ignored_inventory(
         depth: int,
         metadata: os.stat_result,
         kind: str,
+        *,
+        context: str,
     ) -> tuple[int, ...]:
         nonlocal path_bytes, name_bytes, metadata_bytes
         if relative in seen_entries:
             raise ValueError("ignored repository inventory contains a duplicate entry")
         encoded_relative = relative.encode("utf-8")
         encoded_name = name.encode("utf-8")
-        signature = _ignored_stat_signature(metadata)
+        signature = _checked_ignored_stat_signature(
+            metadata, context=context
+        )
         record_metadata_bytes = len(kind.encode("ascii")) + 8 * len(signature)
         if len(seen_entries) + 1 > _MAX_IGNORED_ENTRIES:
             raise ValueError("ignored repository entry bound exceeded")
@@ -1422,13 +1454,17 @@ def _capture_ignored_inventory(
             close_registered()
             raise ValueError("ignored repository directory cannot be pinned") from None
         try:
-            identity_matches = _ignored_stat_signature(opened) == expected
-        except OSError:
+            _checked_ignored_stat_signature(
+                opened,
+                context="directory pin",
+                expected=expected,
+                drift_message=(
+                    "ignored repository directory identity changed while opening"
+                ),
+            )
+        except ValueError:
             close_registered()
-            raise ValueError("ignored repository directory cannot be pinned") from None
-        if not identity_matches:
-            close_registered()
-            raise ValueError("ignored repository directory identity changed while opening")
+            raise
         return descriptor
 
     def enumerate_children(
@@ -1461,6 +1497,7 @@ def _capture_ignored_inventory(
                         depth + 1,
                         child_metadata,
                         child_kind,
+                        context="entry enumeration",
                     )
                     children.append(
                         (child_name, child_relative, depth + 1, child_signature)
@@ -1500,8 +1537,12 @@ def _capture_ignored_inventory(
                         child_fd = pin_directory(
                             parent_fd,
                             component,
-                            _ignored_stat_signature(named),
+                            _checked_ignored_stat_signature(
+                                named, context="root ancestry"
+                            ),
                         )
+                    except _IgnoredIdentityDrift:
+                        raise
                     except (OSError, ValueError):
                         raise ValueError(
                             "ignored repository root ancestry is unsafe"
@@ -1522,6 +1563,7 @@ def _capture_ignored_inventory(
                     len(parts),
                     root_metadata,
                     root_kind,
+                    context="root",
                 )
                 tasks: list[tuple[object, ...]] = [
                     ("entry", parent_fd, parts[-1], relative, len(parts), root_signature)
@@ -1541,13 +1583,16 @@ def _capture_ignored_inventory(
                             raise ValueError(
                                 "ignored repository directory changed during capture"
                             ) from None
-                        if (
-                            _ignored_stat_signature(opened_after) != expected
-                            or _ignored_stat_signature(named_after) != expected
-                        ):
-                            raise ValueError(
-                                "ignored repository directory changed during capture"
-                            )
+                        _checked_ignored_stat_signature(
+                            opened_after,
+                            context="directory finish",
+                            expected=expected,
+                        )
+                        _checked_ignored_stat_signature(
+                            named_after,
+                            context="directory finish",
+                            expected=expected,
+                        )
                         records.append(
                             record_for(task_relative, "directory", named_after)
                         )
@@ -1565,10 +1610,11 @@ def _capture_ignored_inventory(
                         raise ValueError(
                             "ignored repository entry is unavailable"
                         ) from None
-                    if _ignored_stat_signature(named_before) != expected:
-                        raise ValueError(
-                            "ignored repository entry changed before capture"
-                        )
+                    _checked_ignored_stat_signature(
+                        named_before,
+                        context="entry pre-capture",
+                        expected=expected,
+                    )
                     kind = _ignored_kind(named_before.st_mode)
                     if kind == "directory":
                         directory_fd = pin_directory(
@@ -1625,10 +1671,11 @@ def _capture_ignored_inventory(
                         raise ValueError(
                             "ignored repository entry changed during capture"
                         ) from None
-                    if _ignored_stat_signature(named_after) != expected:
-                        raise ValueError(
-                            "ignored repository entry changed during capture"
-                        )
+                    _checked_ignored_stat_signature(
+                        named_after,
+                        context="entry post-capture",
+                        expected=expected,
+                    )
                     records.append(
                         record_for(task_relative, kind, named_after, target)
                     )

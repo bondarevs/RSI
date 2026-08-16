@@ -1131,6 +1131,133 @@ def test_nested_ignored_root_ancestry_faults_are_bounded_and_close_each_fd_once(
 
 
 @pytest.mark.parametrize(
+    ("stage", "signature_call", "message"),
+    [
+        ("final-root", 1, "root"),
+        ("entry-pre", 5, "pre-capture"),
+        ("entry-post", 6, "post-capture"),
+        ("directory-finish", 7, "finish"),
+    ],
+)
+def test_every_ignored_signature_stage_is_contextual_and_fd_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    signature_call: int,
+    message: str,
+) -> None:
+    repo = tmp_path / "repo"
+    ignored = repo / "ignored"
+    ignored.mkdir(parents=True)
+    (ignored / "child.txt").write_bytes(b"ignored")
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+    real_signature = rollout_module._ignored_stat_signature
+    calls = 0
+
+    def fail_selected_signature(value: os.stat_result):
+        nonlocal calls
+        calls += 1
+        if calls == signature_call:
+            raise OverflowError(f"injected {stage} signature failure")
+        return real_signature(value)
+
+    monkeypatch.setattr(
+        rollout_module, "_ignored_stat_signature", fail_selected_signature
+    )
+
+    with pytest.raises(ValueError, match=message):
+        rollout_module._capture_ignored_inventory(repo, b"!! ignored/\0")
+
+    after = {entry.name for entry in fd_root.iterdir()}
+    assert calls >= signature_call
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("component", "signature_call"),
+    [("outer", 1), ("middle", 3)],
+)
+def test_nested_ancestry_signature_failures_are_contextual_and_fd_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+    signature_call: int,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "outer" / "middle" / "ignored").mkdir(parents=True)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+    real_signature = rollout_module._ignored_stat_signature
+    calls = 0
+
+    def fail_selected_signature(value: os.stat_result):
+        nonlocal calls
+        calls += 1
+        if calls == signature_call:
+            raise OverflowError(f"injected {component} ancestry signature failure")
+        return real_signature(value)
+
+    monkeypatch.setattr(
+        rollout_module, "_ignored_stat_signature", fail_selected_signature
+    )
+
+    with pytest.raises(ValueError, match="^ignored repository root ancestry is unsafe$"):
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! outer/middle/ignored/\0"
+        )
+
+    after = {entry.name for entry in fd_root.iterdir()}
+    assert calls >= signature_call
+    assert after == before
+
+
+@pytest.mark.parametrize("component", ["outer", "middle"])
+def test_nested_ancestry_rebind_preserves_exact_identity_drift_and_closes_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    repo = tmp_path / "repo"
+    target = repo / "outer" / "middle" / "ignored"
+    target.mkdir(parents=True)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+    real_open = os.open
+    rebound = False
+
+    def rebind_before_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ):
+        nonlocal rebound
+        if (
+            path == component
+            and kwargs.get("dir_fd") is not None
+            and not rebound
+        ):
+            rebound = True
+            victim = repo / "outer" if component == "outer" else repo / "outer" / "middle"
+            displaced = victim.with_name(victim.name + "-displaced")
+            victim.rename(displaced)
+            victim.mkdir()
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", rebind_before_open)
+
+    with pytest.raises(
+        ValueError,
+        match="^ignored repository directory identity changed while opening$",
+    ):
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! outer/middle/ignored/\0"
+        )
+
+    after = {entry.name for entry in fd_root.iterdir()}
+    assert rebound is True
+    assert after == before
+
+
+@pytest.mark.parametrize(
     ("constant", "match"),
     [
         ("_MAX_IGNORED_NAME_BYTES", "name"),
