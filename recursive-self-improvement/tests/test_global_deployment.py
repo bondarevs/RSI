@@ -1646,6 +1646,11 @@ def test_dangling_active_pointer_is_invalid_not_missing_authority(tmp_path: Path
         ("authorityDigest", "0" * 64),
         ("authorityDigest", "sha256:" + "g" * 64),
         ("authorityDigest", None),
+        ("state", ["present"]),
+        ("state", {"present": True}),
+        ("state", None),
+        ("state", True),
+        ("state", 1),
     ],
 )
 def test_active_pointer_validates_every_derived_field_before_any_authority_read(
@@ -1675,6 +1680,107 @@ def test_active_pointer_validates_every_derived_field_before_any_authority_read(
         deployment_module._validated_active_authority(paths)
 
     assert reads == [paths.active_authority_file]
+
+
+@pytest.mark.parametrize("value", [["deploy"], {"deploy": True}, None, True, 1])
+def test_stored_operation_request_kind_requires_exact_string_type(value: object) -> None:
+    payload = canonical_json_bytes(
+        {
+            "schemaVersion": 1,
+            "domain": "rsi-global-operation-request-v1",
+            "operationId": "stored-request",
+            "operationKind": value,
+            "requestReceiptId": None,
+            "priorStateBackupDigest": "sha256:" + "a" * 64,
+        }
+    )
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._OperationRequest.from_bytes(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("packageState", ["absent"]),
+        ("packageState", {"absent": True}),
+        ("packageState", None),
+        ("packageState", True),
+        ("packageState", 1),
+        ("operationKind", ["deploy"]),
+        ("operationKind", {"deploy": True}),
+        ("operationKind", None),
+        ("operationKind", True),
+        ("operationKind", 1),
+    ],
+)
+def test_stored_backup_enums_reject_invalid_types_before_derived_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo, "backup-enum-install")
+    backups = [path for path in paths.backups_root.iterdir() if path.is_dir()]
+    assert len(backups) == 1
+    backup = backups[0]
+    metadata_path = backup / "backup.json"
+    metadata = json.loads(metadata_path.read_bytes())
+    metadata[field] = value
+    metadata_bytes = canonical_json_bytes(metadata)
+    metadata_path.write_bytes(metadata_bytes)
+    renamed = paths.backups_root / (
+        "sha256:" + hashlib.sha256(metadata_bytes).hexdigest()
+    )
+    backup.rename(renamed)
+    real_read = deployment_module._read_regular_file
+    reads: list[Path] = []
+
+    def metadata_only(path: Path, *, label: str):
+        reads.append(path)
+        if path != renamed / "backup.json":
+            raise AssertionError(f"invalid backup enum selected a derived read: {path}")
+        return real_read(path, label=label)
+
+    monkeypatch.setattr(deployment_module, "_read_regular_file", metadata_only)
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._validate_backup(renamed)
+
+    assert reads == [renamed / "backup.json"]
+
+
+@pytest.mark.parametrize("value", [["present"], {"present": True}, None, True, 1])
+def test_authority_payload_state_requires_exact_string_type(value: object) -> None:
+    receipt = DeploymentReceipt("payload-state", 1, "sha256:" + "a" * 64)
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._authority_payload(
+            state=value,
+            operation_id="payload-state",
+            receipt=receipt,
+            request_receipt_id=None,
+        )
+
+
+def test_public_verify_bounds_invalid_active_state_without_raw_type_error(
+    tmp_path: Path,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo, "invalid-state-install")
+    pointer = json.loads(paths.active_authority_file.read_bytes())
+    pointer["state"] = ["present"]
+    paths.active_authority_file.write_bytes(canonical_json_bytes(pointer))
+
+    status = deployer.verify()
+
+    assert status.state == "invalid"
+    assert status.verified is False
+    assert "TypeError" not in (status.detail or "")
 
 
 @pytest.mark.parametrize(

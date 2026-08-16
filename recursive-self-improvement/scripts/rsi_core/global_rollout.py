@@ -7,7 +7,7 @@ import base64
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import selectors
 import secrets
@@ -63,6 +63,9 @@ _REASONS = frozenset(
     }
 )
 _MAX_CAPTURE_BYTES = 64 * 1024
+_MAX_IGNORED_ENTRIES = 16_384
+_MAX_IGNORED_PATH_BYTES = 4 * 1024 * 1024
+_MAX_IGNORED_SYMLINK_BYTES = 256 * 1024
 DRY_RUN_ATTESTED_NOW = "2026-08-13T00:00:00Z"
 _CLOCK_CAPABILITY_MODULE = "_rsi_attested_clock_capability"
 _CLOCK_CAPABILITY_DOMAIN = "rsi-dry-run-bootstrap-clock-v1"
@@ -405,7 +408,7 @@ class _RepositoryWitness:
     repository: Path
     root_identity: tuple[int, int, int, int, int, int]
     head: str
-    ignored_inventory: bytes
+    ignored_inventory: tuple[tuple[object, ...], ...]
     package_entries: tuple[object, ...]
     package_tree_digest: str
 
@@ -1236,6 +1239,245 @@ def _run_repository_git(repository: Path, *arguments: str) -> bytes:
     return stdout_bytes
 
 
+def _canonical_ignored_relative(value: str) -> str:
+    if (
+        type(value) is not str
+        or not value
+        or value.endswith("/")
+        or "\\" in value
+        or "\x00" in value
+        or unicodedata.normalize("NFC", value) != value
+    ):
+        raise ValueError("ignored repository path is not canonical UTF-8")
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        raise ValueError("ignored repository path is not canonical UTF-8") from None
+    parsed = PurePosixPath(value)
+    if (
+        parsed.is_absolute()
+        or str(parsed) != value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+        or not encoded
+    ):
+        raise ValueError("ignored repository path is unsafe")
+    return value
+
+
+def _ignored_stat_signature(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_mode,
+        value.st_uid,
+        value.st_dev,
+        value.st_ino,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _capture_ignored_inventory(
+    repository: Path, ignored_status: bytes
+) -> tuple[tuple[object, ...], ...]:
+    if type(ignored_status) is not bytes:
+        raise ValueError("ignored repository inventory is invalid")
+    roots: list[str] = []
+    seen_roots: set[str] = set()
+    for raw_record in ignored_status.split(b"\x00"):
+        if not raw_record:
+            continue
+        if not raw_record.startswith(b"!! "):
+            raise ValueError("ignored repository inventory has an invalid status arm")
+        encoded_path = raw_record[3:]
+        if encoded_path.endswith(b"/"):
+            encoded_path = encoded_path[:-1]
+        try:
+            relative = _canonical_ignored_relative(
+                encoded_path.decode("utf-8", "strict")
+            )
+        except UnicodeDecodeError:
+            raise ValueError("ignored repository path is not valid UTF-8") from None
+        if relative in seen_roots:
+            raise ValueError("ignored repository inventory contains a duplicate root")
+        parsed = PurePosixPath(relative)
+        if any(
+            PurePosixPath(existing) in parsed.parents or parsed in PurePosixPath(existing).parents
+            for existing in seen_roots
+        ):
+            raise ValueError("ignored repository inventory contains overlapping roots")
+        seen_roots.add(relative)
+        roots.append(relative)
+    roots.sort(key=lambda value: value.encode("utf-8"))
+
+    records: list[tuple[object, ...]] = []
+    seen_entries: set[str] = set()
+    path_bytes = 0
+    symlink_bytes = 0
+
+    def account(relative: str) -> None:
+        nonlocal path_bytes
+        if relative in seen_entries:
+            raise ValueError("ignored repository inventory contains a duplicate entry")
+        seen_entries.add(relative)
+        path_bytes += len(relative.encode("utf-8"))
+        if len(seen_entries) > _MAX_IGNORED_ENTRIES:
+            raise ValueError("ignored repository entry bound exceeded")
+        if path_bytes > _MAX_IGNORED_PATH_BYTES:
+            raise ValueError("ignored repository path byte bound exceeded")
+
+    def record_for(
+        relative: str,
+        kind: str,
+        metadata: os.stat_result,
+        target: bytes | None = None,
+    ) -> tuple[object, ...]:
+        target_digest = (
+            None
+            if target is None
+            else "sha256:" + hashlib.sha256(target).hexdigest()
+        )
+        return (
+            relative,
+            kind,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+            target,
+            target_digest,
+        )
+
+    def scan(parent_fd: int, name: str, relative: str) -> None:
+        nonlocal symlink_bytes
+        relative = _canonical_ignored_relative(relative)
+        account(relative)
+        try:
+            named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            raise ValueError("ignored repository entry is unavailable") from None
+        before_signature = _ignored_stat_signature(named_before)
+        if stat.S_ISLNK(named_before.st_mode):
+            try:
+                target_text = os.readlink(name, dir_fd=parent_fd)
+                target = target_text.encode("utf-8", "strict")
+                named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except (OSError, UnicodeEncodeError):
+                raise ValueError("ignored repository symlink is invalid") from None
+            symlink_bytes += len(target)
+            if symlink_bytes > _MAX_IGNORED_SYMLINK_BYTES:
+                raise ValueError("ignored repository symlink byte bound exceeded")
+            if _ignored_stat_signature(named_after) != before_signature:
+                raise ValueError("ignored repository symlink changed during capture")
+            records.append(record_for(relative, "symlink", named_after, target))
+            return
+        if stat.S_ISREG(named_before.st_mode):
+            try:
+                named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                raise ValueError("ignored repository file changed during capture") from None
+            if _ignored_stat_signature(named_after) != before_signature:
+                raise ValueError("ignored repository file changed during capture")
+            records.append(record_for(relative, "regular", named_after))
+            return
+        if not stat.S_ISDIR(named_before.st_mode):
+            raise ValueError("ignored repository entry has an unsupported type")
+        try:
+            directory_fd = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError:
+            raise ValueError("ignored repository directory cannot be pinned") from None
+        try:
+            opened_before = os.fstat(directory_fd)
+            if _ignored_stat_signature(opened_before) != before_signature:
+                raise ValueError("ignored repository directory changed while opening")
+            try:
+                names = sorted(os.listdir(directory_fd), key=os.fsencode)
+            except OSError:
+                raise ValueError("ignored repository directory cannot be enumerated") from None
+            for child_name in names:
+                if type(child_name) is not str:
+                    raise ValueError("ignored repository entry name is invalid")
+                child_relative = _canonical_ignored_relative(
+                    relative + "/" + child_name
+                )
+                scan(directory_fd, child_name, child_relative)
+            opened_after = os.fstat(directory_fd)
+            try:
+                named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError:
+                raise ValueError("ignored repository directory changed during capture") from None
+            signatures = {
+                before_signature,
+                _ignored_stat_signature(opened_before),
+                _ignored_stat_signature(opened_after),
+                _ignored_stat_signature(named_after),
+            }
+            if len(signatures) != 1:
+                raise ValueError("ignored repository directory changed during capture")
+            records.append(record_for(relative, "directory", named_after))
+        finally:
+            os.close(directory_fd)
+
+    repository_fd = os.open(
+        repository,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        for relative in roots:
+            parts = relative.split("/")
+            parent_fd = os.dup(repository_fd)
+            try:
+                for component in parts[:-1]:
+                    try:
+                        named = os.stat(
+                            component, dir_fd=parent_fd, follow_symlinks=False
+                        )
+                        child_fd = os.open(
+                            component,
+                            os.O_RDONLY
+                            | getattr(os, "O_DIRECTORY", 0)
+                            | getattr(os, "O_NOFOLLOW", 0)
+                            | getattr(os, "O_CLOEXEC", 0),
+                            dir_fd=parent_fd,
+                        )
+                    except OSError:
+                        raise ValueError(
+                            "ignored repository root ancestry is unsafe"
+                        ) from None
+                    if (
+                        not stat.S_ISDIR(named.st_mode)
+                        or _ignored_stat_signature(os.fstat(child_fd))
+                        != _ignored_stat_signature(named)
+                    ):
+                        os.close(child_fd)
+                        raise ValueError(
+                            "ignored repository root ancestry changed while opening"
+                        )
+                    os.close(parent_fd)
+                    parent_fd = child_fd
+                scan(parent_fd, parts[-1], relative)
+            finally:
+                os.close(parent_fd)
+    finally:
+        os.close(repository_fd)
+    records.sort(key=lambda record: str(record[0]).encode("utf-8"))
+    return tuple(records)
+
+
 def _capture_repository_witness(repository: Path) -> _RepositoryWitness:
     repository = _canonical_protected_path(repository, label="source repository")
     before = os.lstat(repository)
@@ -1264,7 +1506,7 @@ def _capture_repository_witness(repository: Path) -> _RepositoryWitness:
     )
     if dirty:
         raise ValueError("repository witness tracked worktree is dirty")
-    ignored_inventory = _run_repository_git(
+    ignored_status = _run_repository_git(
         repository,
         "status",
         "--porcelain=v1",
@@ -1273,6 +1515,7 @@ def _capture_repository_witness(repository: Path) -> _RepositoryWitness:
         "--ignored=matching",
         "--no-renames",
     )
+    ignored_inventory = _capture_ignored_inventory(repository, ignored_status)
     from .deployment import _verify_head_package_bytes
     from .deployment_fs import scan_package
 

@@ -370,7 +370,7 @@ class _OperationRequest:
         if type(operation_id) is not str:
             raise DeploymentIntegrityError("operation request ID is invalid")
         _validate_operation_id(operation_id)
-        if operation_kind not in {"deploy", "rollback"}:
+        if type(operation_kind) is not str or operation_kind not in {"deploy", "rollback"}:
             raise DeploymentIntegrityError("operation request kind is invalid")
         if request_receipt_id is not None:
             if type(request_receipt_id) is not str:
@@ -1702,7 +1702,7 @@ def _authority_payload(
     receipt: DeploymentReceipt,
     request_receipt_id: str | None,
 ) -> bytes:
-    if state not in {"present", "absent"}:
+    if type(state) is not str or state not in {"present", "absent"}:
         raise DeploymentIntegrityError("deployment authority state is invalid")
     return canonical_json_bytes(
         {
@@ -2210,12 +2210,18 @@ def _validate_backup(
         "packageManifestDigest",
     }
     package_state = metadata.get("packageState")
+    operation_kind = metadata.get("operationKind")
+    if (
+        type(package_state) is not str
+        or package_state not in {"present", "absent"}
+        or type(operation_kind) is not str
+        or operation_kind not in {"deploy", "rollback"}
+    ):
+        raise DeploymentIntegrityError("deployment backup metadata schema is invalid")
     if (
         set(metadata) != (present_keys if package_state == "present" else common_keys)
         or metadata.get("schemaVersion") != 1
         or metadata.get("domain") != "rsi-global-deployment-backup-v1"
-        or package_state not in {"present", "absent"}
-        or metadata.get("operationKind") not in {"deploy", "rollback"}
         or (
             metadata.get("requestReceiptId") is not None
             and type(metadata.get("requestReceiptId")) is not str
@@ -3214,7 +3220,7 @@ def _validated_active_authority(
     ) != "rsi-global-active-authority-v1":
         raise DeploymentIntegrityError("active authority pointer schema is invalid")
     state = pointer.get("state")
-    if state not in {"present", "absent"}:
+    if type(state) is not str or state not in {"present", "absent"}:
         raise DeploymentIntegrityError("active authority pointer identity is invalid")
     operation_id = _require_stored_operation_id(
         pointer.get("operationId"), label="active authority pointer operation ID"

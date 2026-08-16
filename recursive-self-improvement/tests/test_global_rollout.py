@@ -813,6 +813,154 @@ def test_live_dry_run_repository_witness_ignores_unrelated_worktree_content(
     assert after == before
 
 
+def _ignored_witness_fixture(tmp_path: Path) -> tuple[Path, dict[str, Path]]:
+    repo, _deployer, _installed, _authority = _genuine_install(tmp_path / "installation")
+    (repo / ".git" / "info" / "exclude").write_text(
+        "/ignored-witness\n", encoding="utf-8"
+    )
+    ignored = repo / "ignored-witness"
+    nested = ignored / "nested"
+    nested.mkdir(parents=True)
+    regular = ignored / "ignored-regular-unique.bin"
+    regular.write_bytes(b"ignored regular bytes")
+    child = nested / "ignored-child-unique.bin"
+    child.write_bytes(b"ignored nested bytes")
+    hard_a = ignored / "ignored-hard-a-unique.bin"
+    hard_a.write_bytes(b"ignored hardlink bytes")
+    hard_b = ignored / "ignored-hard-b-unique.bin"
+    os.link(hard_a, hard_b)
+    external_one = tmp_path / "external-one"
+    external_two = tmp_path / "external-two"
+    external_one.mkdir()
+    external_two.mkdir()
+    symlink = ignored / "ignored-symlink-unique"
+    symlink.symlink_to(external_one, target_is_directory=True)
+    large = ignored / "ignored-large-unique.bin"
+    with large.open("wb") as stream:
+        stream.seek(17 * 1024 * 1024)
+        stream.write(b"x")
+    return repo, {
+        "ignored": ignored,
+        "regular": regular,
+        "child": child,
+        "hard_a": hard_a,
+        "hard_b": hard_b,
+        "symlink": symlink,
+        "external_two": external_two,
+        "large": large,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["size-mtime", "chmod", "replacement", "symlink-target", "hardlink", "nested"],
+)
+def test_repository_witness_detects_every_ignored_metadata_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    repo, paths = _ignored_witness_fixture(tmp_path)
+    before = rollout_module._capture_repository_witness(repo)
+
+    if mutation == "size-mtime":
+        paths["regular"].write_bytes(b"ignored regular bytes changed in size")
+    elif mutation == "chmod":
+        paths["regular"].chmod(0o744)
+    elif mutation == "replacement":
+        paths["regular"].unlink()
+        paths["regular"].write_bytes(b"ignored regular bytes")
+    elif mutation == "symlink-target":
+        paths["symlink"].unlink()
+        paths["symlink"].symlink_to(paths["external_two"], target_is_directory=True)
+    elif mutation == "hardlink":
+        paths["hard_b"].unlink()
+        paths["hard_b"].write_bytes(paths["hard_a"].read_bytes())
+    else:
+        paths["child"].write_bytes(b"ignored nested bytes changed")
+
+    after = rollout_module._capture_repository_witness(repo)
+
+    assert after != before
+
+
+def test_ignored_inventory_is_deterministic_and_never_opens_regular_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, paths = _ignored_witness_fixture(tmp_path)
+    real_open = os.open
+    forbidden = {path.name for key, path in paths.items() if key not in {"ignored", "symlink", "external_two"}}
+
+    def reject_regular_open(path: object, flags: int, *args: object, **kwargs: object):
+        if type(path) is str and path in forbidden:
+            raise AssertionError(f"ignored regular content was opened: {path}")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", reject_regular_open)
+
+    first = rollout_module._capture_repository_witness(repo)
+    second = rollout_module._capture_repository_witness(repo)
+    relative_paths = [record[0] for record in first.ignored_inventory]
+
+    assert first == second
+    assert relative_paths == sorted(relative_paths, key=lambda value: value.encode("utf-8"))
+    assert "ignored-witness/ignored-large-unique.bin" in relative_paths
+
+
+@pytest.mark.parametrize(
+    ("constant", "limit", "match"),
+    [
+        ("_MAX_IGNORED_ENTRIES", 2, "entry"),
+        ("_MAX_IGNORED_PATH_BYTES", 8, "path"),
+        ("_MAX_IGNORED_SYMLINK_BYTES", 4, "symlink"),
+    ],
+)
+def test_ignored_inventory_enforces_independent_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    limit: int,
+    match: str,
+) -> None:
+    repo, _paths = _ignored_witness_fixture(tmp_path)
+    monkeypatch.setattr(rollout_module, constant, limit)
+
+    with pytest.raises(ValueError, match=match):
+        rollout_module._capture_repository_witness(repo)
+
+
+def test_ignored_inventory_rejects_duplicate_roots_before_traversal(tmp_path: Path) -> None:
+    repo, _paths = _ignored_witness_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="duplicate"):
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! ignored-witness/\0!! ignored-witness/\0"
+        )
+
+
+def test_ignored_inventory_rejects_directory_rebind_during_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, paths = _ignored_witness_fixture(tmp_path)
+    ignored = paths["ignored"]
+    displaced = repo / "displaced-ignored-witness"
+    real_open = os.open
+    swapped = False
+
+    def swap_directory(path: object, flags: int, *args: object, **kwargs: object):
+        nonlocal swapped
+        if path == "ignored-witness" and flags & getattr(os, "O_DIRECTORY", 0) and not swapped:
+            swapped = True
+            ignored.rename(displaced)
+            ignored.mkdir()
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", swap_directory)
+
+    with pytest.raises(ValueError, match="changed|rebind|identity"):
+        rollout_module._capture_ignored_inventory(repo, b"!! ignored-witness/\0")
+
+    assert swapped is True
+
+
 def test_live_authority_and_dry_run_allow_absent_provider_witnesses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
