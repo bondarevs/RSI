@@ -1932,6 +1932,31 @@ def _validate_operation_id(operation_id: str) -> None:
         raise DeploymentError("deployment operation ID is invalid") from None
 
 
+def _require_stored_operation_id(value: object, *, label: str) -> str:
+    if type(value) is not str:
+        raise DeploymentIntegrityError(f"{label} is invalid")
+    try:
+        DeploymentReceipt(
+            operation_id=value,
+            manifest_byte_length=1,
+            manifest_digest="sha256:" + "0" * 64,
+        )
+    except DeploymentSchemaError:
+        raise DeploymentIntegrityError(f"{label} is invalid") from None
+    return value
+
+
+def _require_stored_digest(value: object, *, label: str) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise DeploymentIntegrityError(f"{label} is invalid")
+    return value
+
+
 def _manifest_for_source(
     admitted: _AdmittedSource,
     operation_id: str,
@@ -2705,31 +2730,34 @@ def _exchange_transaction(
         return receipt
 
 
-def _read_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_result]:
-    parent_fd, name = _descriptor_parent(path)
+def _read_regular_file_at(
+    parent_fd: int, name: str, *, label: str
+) -> tuple[bytes, os.stat_result]:
+    if (
+        type(name) is not str
+        or not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+    ):
+        raise DeploymentIntegrityError(f"{label} basename is unsafe")
     try:
         named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError:
-        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} is unavailable") from None
     if not stat.S_ISREG(named_before.st_mode):
-        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} is not a regular file")
     if named_before.st_uid != os.geteuid() or named_before.st_nlink != 1:
-        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} has unsafe ownership or link count")
     if named_before.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
-        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} has unsafe writable permissions")
     if named_before.st_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX):
-        os.close(parent_fd)
         raise DeploymentIntegrityError(f"{label} has unsafe special mode bits")
     try:
         descriptor = os.open(
             name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=parent_fd
         )
     except OSError:
-        os.close(parent_fd)
         raise DeploymentIntegrityError(f"cannot open {label} without following links") from None
     try:
         opened_before = os.fstat(descriptor)
@@ -2789,7 +2817,24 @@ def _read_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_result
         return b"".join(chunks), opened_after
     finally:
         os.close(descriptor)
+
+
+def _read_regular_file(path: Path, *, label: str) -> tuple[bytes, os.stat_result]:
+    parent_fd, name = _descriptor_parent(path)
+    try:
+        return _read_regular_file_at(parent_fd, name, label=label)
+    finally:
         os.close(parent_fd)
+
+
+def _read_named_regular_file(
+    directory: Path, name: str, *, label: str
+) -> tuple[bytes, os.stat_result]:
+    directory_fd = _descriptor_directory(directory)
+    try:
+        return _read_regular_file_at(directory_fd, name, label=label)
+    finally:
+        os.close(directory_fd)
 
 
 def _read_agents(path: Path) -> _AgentsFile:
@@ -3169,12 +3214,17 @@ def _validated_active_authority(
     ) != "rsi-global-active-authority-v1":
         raise DeploymentIntegrityError("active authority pointer schema is invalid")
     state = pointer.get("state")
-    operation_id = pointer.get("operationId")
-    authority_digest = pointer.get("authorityDigest")
-    if state not in {"present", "absent"} or type(operation_id) is not str:
+    if state not in {"present", "absent"}:
         raise DeploymentIntegrityError("active authority pointer identity is invalid")
-    authority_bytes, authority_stat = _read_regular_file(
-        paths.authorities_root / f"{operation_id}.{state}.json",
+    operation_id = _require_stored_operation_id(
+        pointer.get("operationId"), label="active authority pointer operation ID"
+    )
+    authority_digest = _require_stored_digest(
+        pointer.get("authorityDigest"), label="active authority pointer digest"
+    )
+    authority_bytes, authority_stat = _read_named_regular_file(
+        paths.authorities_root,
+        f"{operation_id}.{state}.json",
         label="immutable deployment authority",
     )
     if stat.S_IMODE(authority_stat.st_mode) != 0o600 or _sha256(
@@ -3194,17 +3244,32 @@ def _validated_active_authority(
         "domain"
     ) != "rsi-global-deployment-authority-v1" or authority.get(
         "state"
-    ) != state or authority.get("operationId") != operation_id:
+    ) != state:
+        raise DeploymentIntegrityError("immutable deployment authority schema is invalid")
+    authority_operation_id = _require_stored_operation_id(
+        authority.get("operationId"), label="deployment authority operation ID"
+    )
+    if authority_operation_id != operation_id:
         raise DeploymentIntegrityError("immutable deployment authority schema is invalid")
     request_receipt_id = authority.get("requestReceiptId")
-    if request_receipt_id is not None and type(request_receipt_id) is not str:
-        raise DeploymentIntegrityError("authority request receipt ID is invalid")
-    receipt_bytes, _ = _read_regular_file(
-        paths.receipts_root / f"{operation_id}.json",
+    if request_receipt_id is not None:
+        request_receipt_id = _require_stored_operation_id(
+            request_receipt_id, label="authority request receipt ID"
+        )
+    receipt_digest = _require_stored_digest(
+        authority.get("receiptDigest"), label="deployment authority receipt digest"
+    )
+    manifest_digest = _require_stored_digest(
+        authority.get("manifestDigest"), label="deployment authority manifest digest"
+    )
+    receipt_bytes, _ = _read_named_regular_file(
+        paths.receipts_root,
+        f"{operation_id}.json",
         label="authority deployment receipt",
     )
-    manifest_bytes, _ = _read_regular_file(
-        paths.receipts_root / f"{operation_id}.manifest.json",
+    manifest_bytes, _ = _read_named_regular_file(
+        paths.receipts_root,
+        f"{operation_id}.manifest.json",
         label="authority deployment manifest",
     )
     receipt = DeploymentReceipt.from_bytes(receipt_bytes)
@@ -3214,8 +3279,8 @@ def _validated_active_authority(
         or manifest.operation_id != operation_id
         or receipt.manifest_byte_length != len(manifest_bytes)
         or receipt.manifest_digest != _sha256(manifest_bytes)
-        or authority.get("receiptDigest") != _sha256(receipt_bytes)
-        or authority.get("manifestDigest") != receipt.manifest_digest
+        or receipt_digest != _sha256(receipt_bytes)
+        or manifest_digest != receipt.manifest_digest
     ):
         raise DeploymentIntegrityError("active authority receipt binding is invalid")
     request, backup = _bound_operation_request(paths, manifest)
@@ -3228,12 +3293,14 @@ def _validated_active_authority(
             or backup.prior_manifest is None
         ):
             raise DeploymentIntegrityError("absent authority rollback binding is invalid")
-        prior_receipt_bytes, _ = _read_regular_file(
-            paths.receipts_root / f"{request_receipt_id}.json",
+        prior_receipt_bytes, _ = _read_named_regular_file(
+            paths.receipts_root,
+            f"{request_receipt_id}.json",
             label="rolled-back deployment receipt",
         )
-        prior_manifest_bytes, _ = _read_regular_file(
-            paths.receipts_root / f"{request_receipt_id}.manifest.json",
+        prior_manifest_bytes, _ = _read_named_regular_file(
+            paths.receipts_root,
+            f"{request_receipt_id}.manifest.json",
             label="rolled-back deployment manifest",
         )
         prior_receipt = DeploymentReceipt.from_bytes(prior_receipt_bytes)

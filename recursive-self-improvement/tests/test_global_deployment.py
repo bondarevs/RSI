@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import pwd
@@ -1632,6 +1633,100 @@ def test_dangling_active_pointer_is_invalid_not_missing_authority(tmp_path: Path
 
     assert status.state == "invalid"
     assert status.verified is False
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("operationId", "../escape"),
+        ("operationId", "/absolute"),
+        ("operationId", "unicode∕separator"),
+        ("operationId", "e\u0301"),
+        ("operationId", "a" * 201),
+        ("authorityDigest", "0" * 64),
+        ("authorityDigest", "sha256:" + "g" * 64),
+        ("authorityDigest", None),
+    ],
+)
+def test_active_pointer_validates_every_derived_field_before_any_authority_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo, "active-field-install")
+    pointer = json.loads(paths.active_authority_file.read_bytes())
+    pointer[field] = value
+    paths.active_authority_file.write_bytes(canonical_json_bytes(pointer))
+    real_read = deployment_module._read_regular_file
+    reads: list[Path] = []
+
+    def bounded_read(path: Path, *, label: str):
+        reads.append(path)
+        if path != paths.active_authority_file:
+            raise AssertionError(f"unvalidated active field selected a read: {path}")
+        return real_read(path, label=label)
+
+    monkeypatch.setattr(deployment_module, "_read_regular_file", bounded_read)
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._validated_active_authority(paths)
+
+    assert reads == [paths.active_authority_file]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("requestReceiptId", "../escape"),
+        ("requestReceiptId", "/absolute"),
+        ("requestReceiptId", "unicode∕separator"),
+        ("requestReceiptId", "e\u0301"),
+        ("requestReceiptId", "r" * 201),
+        ("receiptDigest", "0" * 64),
+        ("manifestDigest", "sha256:" + "g" * 64),
+        ("manifestDigest", None),
+    ],
+)
+def test_active_authority_validates_receipt_and_digest_fields_before_receipt_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo, "authority-field-install")
+    pointer = json.loads(paths.active_authority_file.read_bytes())
+    authority_path = (
+        paths.authorities_root
+        / f"{pointer['operationId']}.{pointer['state']}.json"
+    )
+    authority = json.loads(authority_path.read_bytes())
+    authority[field] = value
+    authority_bytes = canonical_json_bytes(authority)
+    authority_path.write_bytes(authority_bytes)
+    pointer["authorityDigest"] = "sha256:" + hashlib.sha256(authority_bytes).hexdigest()
+    paths.active_authority_file.write_bytes(canonical_json_bytes(pointer))
+    real_read = deployment_module._read_regular_file
+    reads: list[Path] = []
+    allowed = {paths.active_authority_file, authority_path}
+
+    def bounded_read(path: Path, *, label: str):
+        reads.append(path)
+        if path not in allowed:
+            raise AssertionError(f"unvalidated authority field selected a read: {path}")
+        return real_read(path, label=label)
+
+    monkeypatch.setattr(deployment_module, "_read_regular_file", bounded_read)
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._validated_active_authority(paths)
+
+    assert reads and reads[0] == paths.active_authority_file
+    assert set(reads) <= allowed
 
 
 def test_failed_pointer_publication_removes_exact_task_owned_authority(

@@ -23,6 +23,7 @@ from urllib.parse import quote_from_bytes
 from .deployment_schema import (
     DeploymentManifest,
     MANIFEST_RELATIVE_PATH,
+    PACKAGE_RELATIVE_PATH,
     canonical_json_bytes,
 )
 
@@ -168,8 +169,9 @@ class DryRunAuthority:
             snapshot.close()
         provider_home = paths.codex_home / "skill-learning"
         provider_ledger = provider_home / "events.jsonl"
-        for path in (provider_home, provider_ledger, paths.skills_root):
-            _canonical_protected_path(Path(path), label="live dry-run authority")
+        _canonical_optional_path(provider_home, label="live provider authority")
+        _canonical_optional_path(provider_ledger, label="live provider ledger authority")
+        _canonical_protected_path(paths.skills_root, label="live dry-run authority")
         return cls._create(
             deployment_paths=paths,
             source_repository=source,
@@ -234,6 +236,8 @@ class AttestedPythonSnapshot:
     records: dict[str, dict[str, object]]
     file_fds: tuple[int, ...]
     source_repository: Path
+    source_commit: str
+    source_tree_digest: str
     authority_digest: str
     closed: bool = False
 
@@ -396,6 +400,24 @@ class DryRunReport:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class _RepositoryWitness:
+    repository: Path
+    root_identity: tuple[int, int, int, int, int, int]
+    head: str
+    ignored_inventory: bytes
+    package_entries: tuple[object, ...]
+    package_tree_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _OptionalPathWitness:
+    path: Path
+    state: str
+    ancestor_identities: tuple[tuple[str, int, int, int, int], ...]
+    content_digest: str | None
+
+
 def _read_fd(descriptor: int, *, limit: int) -> bytes:
     metadata = os.fstat(descriptor)
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > limit:
@@ -554,6 +576,8 @@ def attest_installed_snapshot(
             records,
             tuple(file_fds),
             Path(manifest.source_repository),
+            manifest.source_commit,
+            manifest.source_tree_digest,
             authority_digest,
         )
     except Exception:
@@ -1122,6 +1146,168 @@ def _canonical_protected_path(path: Path, *, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _optional_path_ancestry(
+    path: Path, *, label: str
+) -> tuple[tuple[tuple[str, int, int, int, int], ...], os.stat_result | None]:
+    if (
+        not isinstance(path, Path)
+        or not path.is_absolute()
+        or Path(os.path.abspath(path)) != path
+    ):
+        raise ValueError(f"{label} must be an absolute canonical Path")
+    identities: list[tuple[str, int, int, int, int]] = []
+    current = Path(path.anchor)
+    for index, part in enumerate(path.parts):
+        if index:
+            current /= part
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            return tuple(identities), None
+        except OSError:
+            raise ValueError(f"{label} ancestry is unavailable") from None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{label} contains a symlink alias")
+        if current != path and not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"{label} ancestry is not a directory")
+        identities.append(
+            (
+                os.fspath(current),
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+            )
+        )
+    if path.resolve(strict=True) != path:
+        raise ValueError(f"{label} is not canonical")
+    return tuple(identities), metadata
+
+
+def _canonical_optional_path(path: Path, *, label: str) -> Path:
+    _optional_path_ancestry(path, label=label)
+    return path
+
+
+def _capture_optional_path_witness(
+    path: Path, *, label: str
+) -> _OptionalPathWitness:
+    ancestry, metadata = _optional_path_ancestry(path, label=label)
+    if metadata is None:
+        return _OptionalPathWitness(path, "absent", ancestry, None)
+    if stat.S_ISDIR(metadata.st_mode):
+        content_digest = _tree_digest(path)
+    elif stat.S_ISREG(metadata.st_mode):
+        payload = _read_stable_file(path, limit=16 * 1024 * 1024)
+        content_digest = "sha256:" + hashlib.sha256(payload).hexdigest()
+    else:
+        raise ValueError(f"{label} has an unsafe type")
+    return _OptionalPathWitness(path, "present", ancestry, content_digest)
+
+
+def _run_repository_git(repository: Path, *arguments: str) -> bytes:
+    environment = {
+        "PATH": os.defpath,
+        "HOME": os.fspath(repository),
+        "TZ": "UTC",
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    try:
+        process = subprocess.Popen(
+            ["git", "-C", os.fspath(repository), *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=os.fspath(repository),
+            env=environment,
+            close_fds=True,
+            start_new_session=True,
+        )
+        return_code, stdout_bytes, stderr_bytes = _capture_bounded(process)
+    except (OSError, RuntimeError):
+        raise ValueError("repository witness Git inspection failed") from None
+    if return_code != 0 or stderr_bytes:
+        raise ValueError("repository witness Git inspection failed")
+    return stdout_bytes
+
+
+def _capture_repository_witness(repository: Path) -> _RepositoryWitness:
+    repository = _canonical_protected_path(repository, label="source repository")
+    before = os.lstat(repository)
+    top = _run_repository_git(repository, "rev-parse", "--show-toplevel")
+    try:
+        top_path = Path(top.decode("utf-8", "strict").strip()).resolve(strict=True)
+    except (UnicodeDecodeError, OSError):
+        raise ValueError("repository witness top level is invalid") from None
+    if top_path != repository:
+        raise ValueError("source repository is not the exact Git top level")
+    try:
+        head = _run_repository_git(
+            repository, "rev-parse", "--verify", "HEAD"
+        ).decode("ascii", "strict").strip()
+    except UnicodeDecodeError:
+        raise ValueError("repository witness HEAD is invalid") from None
+    if len(head) != 40 or any(value not in "0123456789abcdef" for value in head):
+        raise ValueError("repository witness HEAD is invalid")
+    dirty = _run_repository_git(
+        repository,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+    )
+    if dirty:
+        raise ValueError("repository witness tracked worktree is dirty")
+    ignored_inventory = _run_repository_git(
+        repository,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignored=matching",
+        "--no-renames",
+    )
+    from .deployment import _verify_head_package_bytes
+    from .deployment_fs import scan_package
+
+    package = repository / PACKAGE_RELATIVE_PATH
+    package_snapshot = scan_package(package, exclude_manifest=True)
+    _verify_head_package_bytes(repository, head, package, package_snapshot)
+    after = os.lstat(repository)
+    before_signature = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_signature = (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_uid,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_signature != after_signature:
+        raise ValueError("source repository changed during witness capture")
+    return _RepositoryWitness(
+        repository,
+        after_signature,
+        head,
+        ignored_inventory,
+        tuple(package_snapshot.entries),
+        package_snapshot.tree_digest,
+    )
+
+
 def _validate_dry_run_authority(
     installed_root: Path,
     temp_root: Path,
@@ -1171,14 +1357,21 @@ def _validate_dry_run_authority(
         paths.codex_home,
         paths.state_root,
         paths.agents_file,
-        authority.provider_home,
-        authority.provider_ledger,
         *authority.target_roots,
     )
-    protected = tuple(
+    fixed_protected = tuple(
         _canonical_protected_path(Path(path), label="dry-run protected root")
         for path in raw_protected
     )
+    optional_protected = (
+        _canonical_optional_path(
+            authority.provider_home, label="dry-run provider authority"
+        ),
+        _canonical_optional_path(
+            authority.provider_ledger, label="dry-run provider ledger authority"
+        ),
+    )
+    protected = (*fixed_protected, *optional_protected)
     canonical_temp = temp_root.resolve(strict=False)
     for path in protected:
         if (
@@ -1190,7 +1383,7 @@ def _validate_dry_run_authority(
     from .deployment import GlobalRsiDeployer
 
     deployer = GlobalRsiDeployer(paths)
-    snapshotted = tuple(path for number, path in enumerate(protected) if number != 2)
+    snapshotted = (paths.state_root, paths.agents_file, *authority.target_roots)
     return deployer, protected, snapshotted
 
 
@@ -1225,11 +1418,48 @@ def run_observe_dry_run(
         installed_root, temp_root, selected_authority
     )
     snapshot = attest_installed_snapshot(installed_root, deployer)
-    if snapshot.source_repository.resolve(strict=True) != selected_authority.source_repository:
+    try:
+        return _run_attested_observe_dry_run(
+            snapshot,
+            installed_root,
+            temp_root,
+            selected_authority,
+            snapshotted,
+        )
+    finally:
         snapshot.close()
+
+
+def _run_attested_observe_dry_run(
+    snapshot: AttestedPythonSnapshot,
+    installed_root: Path,
+    temp_root: Path,
+    authority: DryRunAuthority,
+    snapshotted: tuple[Path, ...],
+) -> DryRunReport:
+    if snapshot.source_repository.resolve(strict=True) != authority.source_repository:
         raise ValueError("installed source is not bound to dry-run authority")
+    repository_before = _capture_repository_witness(authority.source_repository)
+    if (
+        repository_before.head != snapshot.source_commit
+        or repository_before.package_tree_digest != snapshot.source_tree_digest
+    ):
+        raise ValueError("source repository witness differs from installed authority")
     before_installed = _tree_digest(installed_root)
-    protected_before = tuple(_tree_digest(path) if path.is_dir() else _read_stable_file(path, limit=16 * 1024 * 1024) for path in snapshotted)
+    protected_before = tuple(
+        _tree_digest(path)
+        if path.is_dir()
+        else _read_stable_file(path, limit=16 * 1024 * 1024)
+        for path in snapshotted
+    )
+    provider_before = (
+        _capture_optional_path_witness(
+            authority.provider_home, label="protected provider home"
+        ),
+        _capture_optional_path_witness(
+            authority.provider_ledger, label="protected provider ledger"
+        ),
+    )
     temp_root.mkdir(mode=0o700, parents=True)
 
     skill = SkillUse("mail", "sha256:" + "a" * 64)
@@ -1281,55 +1511,70 @@ def run_observe_dry_run(
         for _name, summary in scenarios
         for value in summary.rejected_evidence
     )
-    try:
-        for name, summary in scenarios:
-            decision = classify_global_trigger(summary)
-            if decision.disposition.startswith("triggered-"):
-                target_before = _tree_digest(temp_root)
-                status, _state_home, stdout, stderr = _run_installed_review(
-                    snapshot, temp_root, name, summary
+    for name, summary in scenarios:
+        decision = classify_global_trigger(summary)
+        if decision.disposition.startswith("triggered-"):
+            target_before = _tree_digest(temp_root)
+            status, _state_home, stdout, stderr = _run_installed_review(
+                snapshot, temp_root, name, summary
+            )
+            transient_payloads.extend((stdout, stderr))
+            if target_before == _tree_digest(temp_root):
+                raise RuntimeError("qualifying dry-run case created no temporary evidence")
+            cases.append(
+                DryRunCase(
+                    name,
+                    decision.disposition,
+                    decision.reason,
+                    True,
+                    status,
+                    "scripts/rsi.py",
+                    "observe",
+                    "late-review",
+                    "1",
                 )
-                transient_payloads.extend((stdout, stderr))
-                if target_before == _tree_digest(temp_root):
-                    raise RuntimeError("qualifying dry-run case created no temporary evidence")
-                cases.append(
-                    DryRunCase(
-                        name,
-                        decision.disposition,
-                        decision.reason,
-                        True,
-                        status,
-                        "scripts/rsi.py",
-                        "observe",
-                        "late-review",
-                        "1",
-                    )
+            )
+        else:
+            before_skip = _tree_digest(temp_root)
+            cases.append(
+                DryRunCase(
+                    name,
+                    decision.disposition,
+                    decision.reason,
+                    False,
+                    "not-invoked",
                 )
-            else:
-                before_skip = _tree_digest(temp_root)
-                cases.append(
-                    DryRunCase(
-                        name,
-                        decision.disposition,
-                        decision.reason,
-                        False,
-                        "not-invoked",
-                    )
-                )
-                if _tree_digest(temp_root) != before_skip:
-                    raise RuntimeError("skipped dry-run case changed temporary state")
-        report = DryRunReport(True, tuple(cases))
-        if _tree_digest(installed_root) != before_installed:
-            raise RuntimeError("installed RSI package changed during dry run")
-        protected_after = tuple(_tree_digest(path) if path.is_dir() else _read_stable_file(path, limit=16 * 1024 * 1024) for path in snapshotted)
-        if protected_after != protected_before:
-            raise RuntimeError("dry run changed a protected authority root")
-        _scan_rejected_material(
-            temp_root, report, tuple(transient_payloads), rejected_values
-        )
-        return report
-    finally:
-        snapshot.close()
+            )
+            if _tree_digest(temp_root) != before_skip:
+                raise RuntimeError("skipped dry-run case changed temporary state")
+    report = DryRunReport(True, tuple(cases))
+    if _tree_digest(installed_root) != before_installed:
+        raise RuntimeError("installed RSI package changed during dry run")
+    protected_after = tuple(
+        _tree_digest(path)
+        if path.is_dir()
+        else _read_stable_file(path, limit=16 * 1024 * 1024)
+        for path in snapshotted
+    )
+    if protected_after != protected_before:
+        raise RuntimeError("dry run changed a protected authority root")
+    provider_after = (
+        _capture_optional_path_witness(
+            authority.provider_home, label="protected provider home"
+        ),
+        _capture_optional_path_witness(
+            authority.provider_ledger, label="protected provider ledger"
+        ),
+    )
+    if provider_after != provider_before:
+        raise RuntimeError("dry run changed a protected provider witness")
+    repository_after = _capture_repository_witness(authority.source_repository)
+    if repository_after != repository_before:
+        raise RuntimeError("dry run changed the source repository witness")
+    _scan_rejected_material(
+        temp_root, report, tuple(transient_payloads), rejected_values
+    )
+    return report
 
 
 __all__ = [

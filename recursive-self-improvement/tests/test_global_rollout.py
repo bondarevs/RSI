@@ -758,6 +758,134 @@ def test_live_authority_validation_rederives_provider_ledger_and_targets(
     assert not dry_root.exists()
 
 
+def test_live_dry_run_repository_witness_ignores_unrelated_worktree_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _paths, installed = _genuine_live_install(tmp_path, monkeypatch)
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.write_text(
+        "/.venv\n/ignored-worktree\n/writable.lock\n/shared-a\n/shared-b\n/large.bin\n",
+        encoding="utf-8",
+    )
+    external_environment = tmp_path / "external-environment"
+    external_environment.mkdir()
+    (repo / ".venv").symlink_to(external_environment, target_is_directory=True)
+    ignored_worktree = repo / "ignored-worktree"
+    ignored_worktree.mkdir()
+    (ignored_worktree / "scratch.txt").write_bytes(b"unrelated scratch bytes")
+    writable_lock = repo / "writable.lock"
+    writable_lock.write_bytes(b"unrelated lock")
+    writable_lock.chmod(0o666)
+    shared_a = repo / "shared-a"
+    shared_a.write_bytes(b"unrelated hardlinked bytes")
+    os.link(shared_a, repo / "shared-b")
+    large = repo / "large.bin"
+    with large.open("wb") as stream:
+        stream.seek(17 * 1024 * 1024)
+        stream.write(b"x")
+    unrelated = (repo / ".venv", ignored_worktree, writable_lock, shared_a, repo / "shared-b", large)
+    before = tuple(
+        (
+            path,
+            os.lstat(path).st_dev,
+            os.lstat(path).st_ino,
+            os.lstat(path).st_mode,
+            os.lstat(path).st_nlink,
+            os.lstat(path).st_size,
+        )
+        for path in unrelated
+    )
+
+    report = run_observe_dry_run(installed, tmp_path / "realistic-live-dry-run")
+
+    after = tuple(
+        (
+            path,
+            os.lstat(path).st_dev,
+            os.lstat(path).st_ino,
+            os.lstat(path).st_mode,
+            os.lstat(path).st_nlink,
+            os.lstat(path).st_size,
+        )
+        for path in unrelated
+    )
+    assert report.complete is True
+    assert after == before
+
+
+def test_live_authority_and_dry_run_allow_absent_provider_witnesses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo, paths, installed = _genuine_live_install(tmp_path, monkeypatch)
+    provider_home = paths.codex_home / "skill-learning"
+    provider_ledger = provider_home / "events.jsonl"
+    provider_ledger.unlink()
+    provider_home.rmdir()
+
+    authority = DryRunAuthority.live()
+    report = run_observe_dry_run(
+        installed, tmp_path / "absent-provider-dry-run", authority=authority
+    )
+
+    assert report.complete is True
+    assert not provider_home.exists()
+    assert not provider_ledger.exists()
+
+
+def test_absent_live_provider_creation_is_detected_as_protected_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo, paths, installed = _genuine_live_install(tmp_path, monkeypatch)
+    provider_home = paths.codex_home / "skill-learning"
+    provider_ledger = provider_home / "events.jsonl"
+    provider_ledger.unlink()
+    provider_home.rmdir()
+    authority = DryRunAuthority.live()
+    real_review = rollout_module._run_installed_review
+    injected = False
+
+    def create_protected_provider(*args: object, **kwargs: object):
+        nonlocal injected
+        result = real_review(*args, **kwargs)
+        if not injected:
+            injected = True
+            provider_home.mkdir(mode=0o700)
+            provider_ledger.write_bytes(b"unexpected protected write\n")
+        return result
+
+    monkeypatch.setattr(rollout_module, "_run_installed_review", create_protected_provider)
+
+    with pytest.raises(RuntimeError, match="protected|drift|changed"):
+        run_observe_dry_run(
+            installed, tmp_path / "provider-drift-dry-run", authority=authority
+        )
+
+    assert injected is True
+
+
+def test_preflight_failure_after_attestation_closes_every_snapshot_descriptor(
+    tmp_path: Path,
+) -> None:
+    _repo, _deployer, installed, authority = _genuine_install(tmp_path / "installation")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (authority.target_roots[0] / "unsafe-link").symlink_to(
+        outside, target_is_directory=True
+    )
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = len(tuple(fd_root.iterdir()))
+
+    for attempt in range(3):
+        with pytest.raises(ValueError, match="symlink"):
+            run_observe_dry_run(
+                installed,
+                tmp_path / f"descriptor-leak-dry-run-{attempt}",
+                authority=authority,
+            )
+
+    assert len(tuple(fd_root.iterdir())) == before
+
+
 def test_attested_clock_capability_is_snapshot_bound_ephemeral_and_entry_scoped(
     tmp_path: Path,
 ) -> None:
