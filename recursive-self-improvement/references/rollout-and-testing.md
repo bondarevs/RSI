@@ -3,6 +3,11 @@
 Read this reference before declaring a stage ready, issuing deployment
 attestations, changing an allowlist, or preparing a release package.
 
+Read [global rollout](global-rollout.md) before activating the pinned global
+Stage 0/1 observe copy. That deployment remains `observe + late-review`, keeps
+the production allowlist empty, and requires a new Codex task for catalog
+discovery after installation.
+
 ## Rollout manifest schema
 
 Store each stage decision in a versioned, signed `rollout-manifest.json`. Use a
@@ -155,3 +160,6 @@ git status --short
   objects. `doctor --salvage-report` is diagnostic only.
 - A control-plane release invalidates prior baselines and requires quarantine,
   compatibility attestation, and clean re-baselining.
+- Global installation does not enable promotion or install the privileged
+  namespace-mutation coordinator. Its deployer requires Darwin atomic exchange
+  for mutation; unsupported hosts fail before deployment-state writes.

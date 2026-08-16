@@ -3,6 +3,10 @@
 Read this reference before invoking the CLI, selecting a mode, installing
 hooks, handling an incident, or recovering a run.
 
+The transactional deployment CLI is distinct from the lifecycle CLI below.
+Read [global rollout](global-rollout.md) for its exact grammar, exit codes,
+health checks, update/rollback protocol, and deployment recovery rules.
+
 ## Effective package defaults
 
 The shipped default is exact and fail-closed:

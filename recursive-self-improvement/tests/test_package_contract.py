@@ -1,5 +1,10 @@
 import json
 from pathlib import Path
+import re
+import shlex
+
+import rsi_deploy
+from rsi_core.global_instructions import MANAGED_BLOCK
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
@@ -33,3 +38,114 @@ def test_contract_kind_is_role() -> None:
     contract = load_json("skill-contract.json")
 
     assert contract["kind"] == "role"
+
+
+def _one_fence(text: str, language: str) -> str:
+    matches = re.findall(rf"```{re.escape(language)}\n(.*?)\n```", text, re.S)
+    assert len(matches) == 1, f"expected one {language} contract fence"
+    return matches[0]
+
+
+def test_global_rollout_reference_is_a_closed_release_contract() -> None:
+    reference = SKILL_ROOT / "references" / "global-rollout.md"
+    assert reference.is_file()
+    text = reference.read_text(encoding="utf-8")
+    contract = json.loads(_one_fence(text, "rsi-rollout-contract"))
+
+    assert contract == {
+        "schemaVersion": 1,
+        "stage": "0/1",
+        "defaults": {
+            "mode": "observe",
+            "hookMode": "late-review",
+            "productionAllowlist": [],
+        },
+        "capabilities": {
+            "promotionEnabled": False,
+            "privilegedCoordinatorInstalled": False,
+        },
+        "paths": {
+            "installedPackage": "~/.codex/skills/recursive-self-improvement",
+            "globalInstructions": "~/.codex/AGENTS.md",
+            "deploymentState": "~/.codex/rsi-deployments-v1",
+            "lock": "~/.codex/rsi-deployments-v1/lock",
+            "activeAuthority": "~/.codex/rsi-deployments-v1/active.json",
+            "receiptManifest": "~/.codex/rsi-deployments-v1/receipts/<operation-id>.manifest.json",
+            "receipt": "~/.codex/rsi-deployments-v1/receipts/<operation-id>.json",
+            "backup": "~/.codex/rsi-deployments-v1/backups/<backup-digest>/",
+        },
+        "trigger": {
+            "newCodexTaskRequiredAfterInstall": True,
+            "recursionGuard": "CODEX_RSI_TRIGGER_ACTIVE=1",
+            "qualifies": [
+                "skill-used",
+                "directly-verified-sanitized-reusable-finding",
+            ],
+            "skips": [
+                "ordinary-conversation",
+                "status-question",
+                "one-off-fact",
+                "no-reusable-evidence",
+                "rsi-or-skill-learning-maintenance",
+                "recursive-invocation",
+            ],
+        },
+        "recovery": {
+            "invalidSource": "repair-or-commit-source-then-rerun-plan",
+            "installedDrift": "stop-trigger-and-preserve-bytes",
+            "instructionDrift": "restore-exact-managed-block-or-use-verified-rollback",
+            "failedReverseExchange": "preserve-evidence-and-escalate-ambiguous",
+            "ambiguousState": "do-not-retry-or-overwrite;preserve-and-investigate",
+        },
+    }
+
+    default = load_json("profiles/default.json")
+    production = load_json("profiles/production.json")
+    assert default["mode"] == contract["defaults"]["mode"]
+    assert default["orchestration"]["hookMode"] == contract["defaults"]["hookMode"]
+    assert production["activation"]["allowedTargets"] == contract["defaults"][
+        "productionAllowlist"
+    ]
+
+
+def test_global_rollout_managed_block_and_cli_examples_execute_the_real_grammar() -> None:
+    text = (SKILL_ROOT / "references" / "global-rollout.md").read_text(
+        encoding="utf-8"
+    )
+    documented_block = (_one_fence(text, "rsi-managed-block") + "\n").encode(
+        "utf-8"
+    )
+    assert documented_block == MANAGED_BLOCK
+
+    commands = [
+        line
+        for line in _one_fence(text, "console").splitlines()
+        if line and not line.startswith("#")
+    ]
+    parsed = []
+    for line in commands:
+        tokens = shlex.split(line)
+        assert tokens[:2] == [
+            "python3",
+            "recursive-self-improvement/scripts/rsi_deploy.py",
+        ]
+        parsed.append(rsi_deploy._parse(tokens[2:]))
+    assert [command for command, _options in parsed] == [
+        "plan",
+        "deploy",
+        "verify",
+        "status",
+        "rollback",
+    ]
+
+
+def test_global_rollout_is_routed_from_every_operator_reference() -> None:
+    skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    assert "[global rollout](references/global-rollout.md)" in skill
+    for relative in (
+        "references/architecture.md",
+        "references/lifecycle-and-policy.md",
+        "references/rollout-and-testing.md",
+    ):
+        text = (SKILL_ROOT / relative).read_text(encoding="utf-8")
+        assert "[global rollout](global-rollout.md)" in text

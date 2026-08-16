@@ -67,6 +67,8 @@ Read [defragmentation](references/defragmentation.md) before structural audit,
 inventory, migration-ledger, or umbrella-plan work. Read
 [rollout and testing](references/rollout-and-testing.md) before release claims,
 deployment attestations, allowlist changes, corpus runs, or forward testing.
+Read [global rollout](references/global-rollout.md) before planning, installing,
+updating, verifying, health-checking, or rolling back the global pinned copy.
 
 Use only the implemented CLI commands and envelopes documented in lifecycle and
 policy. `monitor` may emit an approval-required rollback proposal but never

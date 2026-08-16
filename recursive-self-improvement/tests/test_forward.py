@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -16,6 +17,15 @@ from rsi_core.candidates import CandidateBuilder
 from rsi_core.defragment import audit_registration
 from rsi_core.hashing import build_skill_manifest
 from rsi_core.hooks import LifecycleError, RunCoordinator, VerificationResult
+from rsi_core.deployment import (
+    DeploymentError,
+    DeploymentPaths,
+    DeploymentSourceError,
+    GlobalRsiDeployer,
+)
+from rsi_core.deployment_fs import DeploymentIntegrityError
+from rsi_core.global_instructions import GlobalInstructionsError
+from rsi_core.global_rollout import DryRunAuthority, run_observe_dry_run
 from rsi_core.report import GlobalReportService
 from rsi_core.storage import EventStore
 from test_events import EVENT_PAYLOADS, make_event
@@ -676,6 +686,7 @@ def test_release_package_links_examples_metadata_permissions_and_validator() -> 
         "metrics.md",
         "defragmentation.md",
         "rollout-and-testing.md",
+        "global-rollout.md",
     }
     references = PACKAGE_ROOT / "references"
     assert required_references <= {path.name for path in references.glob("*.md")}
@@ -781,3 +792,106 @@ def test_release_index_contract_graph_and_provider_ledger_validate_in_controlled
     assert decision["owner_skill"] == "recursive-self-improvement"
     assert re.fullmatch(r"[0-9a-f]{64}", decision["route_binding"])
     assert _tree(PROVIDER_ROOT) == provider_before
+
+
+def _forward_rollout_repository(root: Path) -> Path:
+    repository = root / "repository"
+    shutil.copytree(
+        PACKAGE_ROOT,
+        repository / "recursive-self-improvement",
+        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc"),
+    )
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    for key, value in (
+        ("user.email", "rsi-forward@example.invalid"),
+        ("user.name", "RSI Forward Fixture"),
+    ):
+        subprocess.run(
+            ["git", "-C", str(repository), "config", key, value], check=True
+        )
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "recursive-self-improvement"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "release-v1"],
+        check=True,
+    )
+    return repository
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="atomic rollout mutation is Darwin-only")
+def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix(
+    tmp_path: Path,
+) -> None:
+    """One release fixture covers the operator sequence without live/provider writes."""
+    repository = _forward_rollout_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex-home")
+    deployer = GlobalRsiDeployer(paths)
+    provider = tmp_path / "protected-provider"
+    target = tmp_path / "protected-target"
+    simulated_live = tmp_path / "protected-live-state"
+    for root, payload in (
+        (provider, b"provider-ledger\n"),
+        (target, b"target-state\n"),
+        (simulated_live, b"live-state\n"),
+    ):
+        root.mkdir()
+        (root / "witness.bin").write_bytes(payload)
+    provider_ledger = provider / "witness.bin"
+    protected_before = (_tree(provider), _tree(target), _tree(simulated_live))
+
+    installed = deployer.deploy(repository, "forward-install-v1")
+    assert installed.operation_id == "forward-install-v1"
+    assert deployer.verify().verified is True
+    authority = DryRunAuthority.for_testing(
+        deployment_paths=paths,
+        source_repository=repository,
+        provider_home=provider,
+        provider_ledger=provider_ledger,
+        target_roots=(target, simulated_live),
+    )
+    report = run_observe_dry_run(
+        paths.installed_root, tmp_path / "observe-dry-run", authority=authority
+    )
+    by_name = {case.name: case for case in report.cases}
+    assert by_name["safe-finding"].invoked is True
+    assert by_name["ordinary"].invoked is False
+    assert by_name["recursive"].invoked is False
+
+    release_note = repository / "recursive-self-improvement" / "references" / "global-rollout.md"
+    release_note.write_bytes(release_note.read_bytes() + b"\nRelease fixture revision.\n")
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "recursive-self-improvement"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-q", "-m", "release-v2"],
+        check=True,
+    )
+    updated = deployer.deploy(repository, "forward-update-v2")
+    assert updated.operation_id == "forward-update-v2"
+    assert deployer.verify().operation_id == "forward-update-v2"
+    rolled_back = deployer.rollback("forward-update-v2", "forward-rollback-v1")
+    assert rolled_back.operation_id == "forward-rollback-v1"
+    assert deployer.verify().operation_id == "forward-rollback-v1"
+
+    committed_source = release_note.read_bytes()
+    release_note.write_bytes(committed_source + b"dirty-source\n")
+    with pytest.raises(DeploymentSourceError):
+        deployer.plan(repository)
+    release_note.write_bytes(committed_source)
+
+    exact_agents = paths.agents_file.read_bytes()
+    paths.agents_file.write_bytes(exact_agents.replace(b"observe", b"observe-drift", 1))
+    with pytest.raises((DeploymentError, DeploymentIntegrityError, GlobalInstructionsError)):
+        deployer.plan(repository)
+    paths.agents_file.write_bytes(exact_agents)
+    assert deployer.verify().verified is True
+
+    installed_reference = paths.installed_root / "references" / "global-rollout.md"
+    installed_reference.write_bytes(installed_reference.read_bytes() + b"installed-drift\n")
+    status = deployer.verify()
+    assert status.state == "invalid"
+    assert status.verified is False
+    assert (_tree(provider), _tree(target), _tree(simulated_live)) == protected_before
