@@ -713,7 +713,7 @@ def test_release_package_links_examples_metadata_permissions_and_validator() -> 
 
     metadata = _parse_closed_metadata_yaml(PACKAGE_ROOT / "agents" / "openai.yaml")
     assert set(metadata) == {"interface", "policy"}
-    assert metadata["policy"] == {"allow_implicit_invocation": False}
+    assert metadata["policy"] == {"allow_implicit_invocation": True}
     assert "$recursive-self-improvement" in metadata["interface"]["default_prompt"]
     assert 25 <= len(metadata["interface"]["short_description"]) <= 64
 

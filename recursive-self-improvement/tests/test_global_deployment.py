@@ -35,6 +35,18 @@ from rsi_core.deployment_fs import DeploymentIntegrityError, scan_package
 from rsi_core.global_instructions import MANAGED_BLOCK
 
 
+OPENAI_METADATA = (
+    'interface:\n'
+    '  display_name: "Recursive Self-Improvement"\n'
+    '  short_description: "Safely improve role-skills from evidence"\n'
+    '  default_prompt: "Use $recursive-self-improvement in the default observe-only '
+    'late-review mode to evaluate this completed skill-driven task without changing '
+    'its target."\n'
+    'policy:\n'
+    '  allow_implicit_invocation: true\n'
+)
+
+
 def _git(repo: Path, *arguments: str) -> str:
     completed = subprocess.run(
         ["git", "-C", os.fspath(repo), *arguments],
@@ -70,7 +82,7 @@ def _write_repository(root: Path, *, version: str = "v1") -> Path:
         encoding="utf-8",
     )
     (package / "agents" / "openai.yaml").write_text(
-        "interface:\n  display_name: Recursive Self-Improvement\n",
+        OPENAI_METADATA,
         encoding="utf-8",
     )
     (package / "scripts" / "rsi.py").write_text(
@@ -2467,6 +2479,55 @@ def test_source_admission_rejects_every_nonexact_or_unsafe_committed_arm_without
 
     with pytest.raises((deployment_module.DeploymentSourceError, DeploymentIntegrityError)):
         deployer.plan(repo)
+
+    assert not codex_home.exists()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        OPENAI_METADATA.replace(
+            "allow_implicit_invocation: true",
+            "allow_implicit_invocation: false",
+        ),
+        OPENAI_METADATA.replace(
+            "allow_implicit_invocation: true",
+            'allow_implicit_invocation: "true"',
+        ),
+        OPENAI_METADATA.replace(
+            "allow_implicit_invocation: true",
+            "allow_implicit_invocation: 1",
+        ),
+        OPENAI_METADATA.replace("  allow_implicit_invocation: true\n", ""),
+        OPENAI_METADATA.replace(
+            "  allow_implicit_invocation: true\n",
+            "  allow_implicit_invocation: true\n  extra: false\n",
+        ),
+        OPENAI_METADATA + "extra: true\n",
+        OPENAI_METADATA.replace("  display_name:", "  wrong_name:"),
+    ],
+    ids=(
+        "false",
+        "string",
+        "integer",
+        "missing",
+        "extra-policy-key",
+        "extra-top-level-key",
+        "wrong-interface-key",
+    ),
+)
+def test_source_admission_requires_exact_catalog_visibility_policy(
+    tmp_path: Path, metadata: str
+) -> None:
+    repo = _write_repository(tmp_path)
+    package = repo / "recursive-self-improvement"
+    (package / "agents/openai.yaml").write_text(metadata, encoding="utf-8")
+    _git(repo, "add", "recursive-self-improvement/agents/openai.yaml")
+    _git(repo, "commit", "-q", "-m", "catalog-policy")
+    codex_home = tmp_path / "codex-home"
+
+    with pytest.raises(deployment_module.DeploymentSourceError):
+        GlobalRsiDeployer(DeploymentPaths.for_testing(codex_home)).plan(repo)
 
     assert not codex_home.exists()
 

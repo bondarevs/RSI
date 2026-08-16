@@ -3108,10 +3108,39 @@ def _strict_yaml(payload: bytes, *, label: str) -> object:
     return root
 
 
+_EXPECTED_AGENT_INTERFACE = {
+    "display_name": "Recursive Self-Improvement",
+    "short_description": "Safely improve role-skills from evidence",
+    "default_prompt": (
+        "Use $recursive-self-improvement in the default observe-only "
+        "late-review mode to evaluate this completed skill-driven task "
+        "without changing its target."
+    ),
+}
+
+
+def _validate_agent_metadata(value: object) -> None:
+    if type(value) is not dict or set(value) != {"interface", "policy"}:
+        raise DeploymentSourceError(
+            "agent metadata has an invalid top-level schema"
+        )
+    interface = value["interface"]
+    policy = value["policy"]
+    if type(interface) is not dict or interface != _EXPECTED_AGENT_INTERFACE:
+        raise DeploymentSourceError("agent metadata interface is not exact")
+    if type(policy) is not dict or set(policy) != {"allow_implicit_invocation"}:
+        raise DeploymentSourceError("agent metadata policy is not exact")
+    if policy["allow_implicit_invocation"] is not True:
+        raise DeploymentSourceError(
+            "agent metadata catalog visibility is not enabled"
+        )
+
+
 def _validate_package_documents(package: Path, snapshot: PackageSnapshot) -> str:
     if "scripts/rsi.py" not in snapshot.relative_paths:
         raise DeploymentSourceError("RSI package entry point is missing")
     parsed_json: dict[str, object] = {}
+    parsed_yaml: dict[str, object] = {}
     for entry in snapshot.entries:
         suffix = Path(entry.relative_path).suffix.lower()
         if suffix not in {".json", ".yaml", ".yml"}:
@@ -3125,7 +3154,11 @@ def _validate_package_documents(package: Path, snapshot: PackageSnapshot) -> str
                 payload, label=entry.relative_path
             )
         else:
-            _strict_yaml(payload, label=entry.relative_path)
+            parsed_yaml[entry.relative_path] = _strict_yaml(
+                payload, label=entry.relative_path
+            )
+
+    _validate_agent_metadata(parsed_yaml.get("agents/openai.yaml"))
 
     default = parsed_json.get("profiles/default.json")
     if not isinstance(default, dict) or default.get("mode") != "observe":

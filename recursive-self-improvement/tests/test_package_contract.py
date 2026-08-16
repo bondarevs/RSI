@@ -28,10 +28,34 @@ def test_production_allowlist_is_empty() -> None:
     assert production_profile["activation"]["allowedTargets"] == []
 
 
-def test_implicit_invocation_is_disabled() -> None:
-    metadata = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+def _parse_openai_metadata() -> dict[str, object]:
+    metadata: dict[str, object] = {}
+    current: dict[str, object] | None = None
+    path = SKILL_ROOT / "agents/openai.yaml"
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        key, separator, raw_value = raw_line.strip().partition(":")
+        assert separator and key
+        if indent == 0:
+            assert not raw_value.strip()
+            current = {}
+            metadata[key] = current
+            continue
+        assert indent == 2 and current is not None
+        value = raw_value.strip()
+        current[key] = (
+            value == "true" if value in {"true", "false"} else json.loads(value)
+        )
+    return metadata
 
-    assert "allow_implicit_invocation: false" in metadata
+
+def test_catalog_visibility_policy_is_exactly_enabled() -> None:
+    metadata = _parse_openai_metadata()
+
+    assert set(metadata) == {"interface", "policy"}
+    assert metadata["policy"] == {"allow_implicit_invocation": True}
 
 
 def test_contract_kind_is_role() -> None:

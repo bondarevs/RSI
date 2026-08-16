@@ -3,4 +3,4 @@ interface:
   short_description: "Safely improve role-skills from evidence"
   default_prompt: "Use $recursive-self-improvement in the default observe-only late-review mode to evaluate this completed skill-driven task without changing its target."
 policy:
-  allow_implicit_invocation: false
+  allow_implicit_invocation: true
