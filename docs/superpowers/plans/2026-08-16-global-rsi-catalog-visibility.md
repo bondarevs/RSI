@@ -27,8 +27,11 @@
   active deployment manifest, and projected from attested bytes without a
   pathname reopen. Resolver/client output is bounded in flight; each command
   runs in a new process group that is reaped on every exit path. Final live
-  witness comparison is unconditional. Disposable RSI/provider/deployment
-  state outside the exact projection and `skills/.system` fails closed.
+  status and witness checks run independently even if either raises, with
+  bounded primary/status/witness evidence and observed-drift precedence.
+  Disposable RSI/provider/deployment state, including exact `skill-learning`
+  roots/aliases/locks, outside the exact projection and `skills/.system` fails
+  closed under bounded recursive inventory and path classification.
 - All code changes follow RED → GREEN → relevant regression → full-suite verification and are committed separately from review fixes.
 - Stop after each task's tests, review, report, and commit are complete; do not begin the next task with a provisional failure or open finding.
 - Preserve the existing untracked `uv.lock` and `__pycache__` directories; never stage or delete them as part of this plan.
@@ -728,8 +731,9 @@ reopening either installed pathname. Version resolution and both client runs
 must use bounded streaming capture in new process groups, terminate the whole
 group on timeout/output excess, reject lingering descendants, and reap the
 leader. Deployment status and every live witness must be compared in an
-unconditional failure-path cleanup. The canonical result must require for both
-clients:
+unconditional failure-path cleanup, with each comparison attempted even if the
+other raises. Preserve at most the ordered primary/status/witness failures and
+never mask observed drift. The canonical result must require for both clients:
 
 - `### Available skills` is present;
 - exactly one `- recursive-self-improvement:` catalog entry is present;
@@ -745,8 +749,10 @@ Client-created `.system` rows are allowed only below the disposable
 `CODEX_HOME/skills/.system` subtree and are deleted with those homes. Any
 RSI/provider/deployment/event/observation/report state elsewhere in disposable
 `HOME`, `CODEX_HOME`, temporary, or npm-cache space fails the probe. Skills and
-target roots use the bounded nofollow protected-tree witness so supported
-symlink/special topology is accepted but any drift fails. Direct
+provider detection includes exact `skill-learning` root aliases and state-lock
+names at any bounded recursive placement; near-name client caches remain
+allowed. Target roots use the bounded nofollow protected-tree witness so
+supported symlink/special topology is accepted but any drift fails. Direct
 `codex debug prompt-input` or `npx ... debug prompt-input` against the live
 `CODEX_HOME` is forbidden.
 

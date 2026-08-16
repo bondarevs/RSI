@@ -52,9 +52,13 @@ matched to the active manifest, and retained by descriptor; projection writes
 only those attested bytes and never reopens an installed catalog pathname.
 Resolver and client processes run in new process groups with bounded streaming
 capture and TERM-to-KILL cleanup. Post-client deployment and live-witness
-comparisons are unconditional, including timeout, output, resolver, and client
-failure paths. Disposable homes fail closed on RSI/provider/deployment state
-outside the exact catalog projection and client-owned `skills/.system` subtree.
+comparisons run independently even if either raises, including timeout, output,
+resolver, and client failure paths; bounded failure evidence preserves
+primary/status/witness order while observed drift has precedence. Disposable
+homes fail closed on RSI/provider/deployment state, including exact
+`skill-learning` provider-root aliases and state locks, outside the exact
+catalog projection and client-owned `skills/.system` subtree. Their recursive
+inventory and path classification are bounded.
 Skills and target trees use the bounded nofollow protected-tree witness so
 supported symlink and special-file topology is witnessed rather than rejected.
 
@@ -179,8 +183,11 @@ verified:
    entries throughout projection; no installed pathname is reopened. Resolver
    and client output is bounded in flight, every process group is reaped after
    timeout, output excess, failure, or lingering-child detection, and the final
-   live witness comparison always runs. Latest-client resolution or execution
-   failure keeps the gate closed with its exact stage/version error.
+   deployment-status and live-witness comparisons each run independently even
+   when the other raises. Bounded failure aggregation preserves all three
+   primary/status/witness errors without masking observed drift. Latest-client
+   resolution or execution failure keeps the gate closed with its exact
+   stage/version error.
 4. The qualifying safe and qualifying no-finding cases still invoke only the
    verified installed snapshot in `observe + late-review`.
 5. Ordinary conversation, status questions, one-off facts, tasks without
@@ -191,8 +198,10 @@ verified:
 7. The full package, deployment, rollout, forward, adversarial, and repository
    test suite passes; the local/latest real-client mutation regression proves
    `.system` synchronization is confined to disposable homes, no disposable
-   RSI/provider state remains, and supported protected-tree symlink/special
-   topology is stable but drift-sensitive; and the skill
+   RSI/provider state (including `skill-learning` roots/locks and aliases)
+   remains, bounded recursive inventory does not overrun, and supported
+   protected-tree symlink/special topology is stable but drift-sensitive; and
+   the skill
    validator, learning-ledger validator, installed-layout link, permission,
    unfinished-marker, compile, and diff checks pass.
 8. A fresh independent security/spec review approves the exact implementation

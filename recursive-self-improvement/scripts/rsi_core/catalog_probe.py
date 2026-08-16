@@ -25,6 +25,11 @@ _CATALOG_FILES = ("SKILL.md", "agents/openai.yaml")
 _MAX_CLIENT_OUTPUT_BYTES = 16 * 1024 * 1024
 _MAX_VERSION_CHARS = 160
 _CLIENT_TIMEOUT_SECONDS = 120
+_MAX_CLIENT_TREE_ENTRIES = 100_000
+_MAX_CLIENT_TREE_PATH_BYTES = 16 * 1024 * 1024
+_MAX_CLIENT_TREE_DEPTH = 128
+_MAX_CLIENT_TREE_FILE_BYTES = 256 * 1024 * 1024
+_MAX_CLIENT_TREE_TOTAL_FILE_BYTES = 1024 * 1024 * 1024
 _VERSION = re.compile(r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?)")
 _STATE_NAMES = frozenset(
     {
@@ -32,19 +37,28 @@ _STATE_NAMES = frozenset(
         "deployments",
         "event",
         "events",
+        "events.lock",
         "events.jsonl",
+        "learning.jsonl",
+        "learning.lock",
         "observation",
         "observations",
+        "observations.lock",
         "observations.jsonl",
         "provider",
         "provider-home",
         "provider-ledger",
         "report",
         "reports",
+        "reports.lock",
         "reports.jsonl",
         "rsi",
         "rsi-deployments-v1",
+        "rsi-skill-learning",
         "rsi-state",
+        ".skill-learning",
+        "skill-learning",
+        "skill_learning",
     }
 )
 _STATE_PREFIXES = (
@@ -197,11 +211,26 @@ def _write_private_file(path: Path, payload: bytes, *, executable: bool) -> None
 
 def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
     rows: list[tuple[object, ...]] = []
+    paths = [root]
+    path_bytes = len(os.fsencode("."))
     try:
-        paths = (root, *root.rglob("*"))
+        for path in root.rglob("*"):
+            relative_path = path.relative_to(root)
+            encoded = os.fsencode(relative_path)
+            if len(paths) + 1 > _MAX_CLIENT_TREE_ENTRIES:
+                raise CatalogProbeError("isolated client tree entry bound exceeded")
+            if path_bytes + len(encoded) > _MAX_CLIENT_TREE_PATH_BYTES:
+                raise CatalogProbeError("isolated client tree path bound exceeded")
+            if len(relative_path.parts) > _MAX_CLIENT_TREE_DEPTH:
+                raise CatalogProbeError("isolated client tree depth bound exceeded")
+            paths.append(path)
+            path_bytes += len(encoded)
         ordered = sorted(paths, key=lambda path: os.fsencode(path.relative_to(root)))
+    except CatalogProbeError:
+        raise
     except OSError:
         raise CatalogProbeError("isolated client home cannot be enumerated") from None
+    total_file_bytes = 0
     for path in ordered:
         try:
             metadata = os.lstat(path)
@@ -210,11 +239,69 @@ def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
         relative = "." if path == root else path.relative_to(root).as_posix()
         mode = stat.S_IMODE(metadata.st_mode)
         if stat.S_ISREG(metadata.st_mode):
+            total_file_bytes += metadata.st_size
+            if (
+                metadata.st_size > _MAX_CLIENT_TREE_FILE_BYTES
+                or total_file_bytes > _MAX_CLIENT_TREE_TOTAL_FILE_BYTES
+            ):
+                raise CatalogProbeError("isolated client file byte bound exceeded")
+            descriptor: int | None = None
             try:
-                payload = path.read_bytes()
+                descriptor = os.open(
+                    path,
+                    os.O_RDONLY
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                )
+                opened = os.fstat(descriptor)
+                identity = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_mode,
+                    metadata.st_uid,
+                    metadata.st_nlink,
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    metadata.st_ctime_ns,
+                )
+                opened_identity = (
+                    opened.st_dev,
+                    opened.st_ino,
+                    opened.st_mode,
+                    opened.st_uid,
+                    opened.st_nlink,
+                    opened.st_size,
+                    opened.st_mtime_ns,
+                    opened.st_ctime_ns,
+                )
+                if identity != opened_identity or not stat.S_ISREG(opened.st_mode):
+                    raise CatalogProbeError(
+                        "isolated client file changed while scanning"
+                    )
+                digest = hashlib.sha256()
+                offset = 0
+                while offset < opened.st_size:
+                    chunk = os.pread(
+                        descriptor,
+                        min(64 * 1024, opened.st_size - offset),
+                        offset,
+                    )
+                    if not chunk:
+                        raise CatalogProbeError(
+                            "isolated client file read made no progress"
+                        )
+                    digest.update(chunk)
+                    offset += len(chunk)
+                if os.fstat(descriptor) != opened:
+                    raise CatalogProbeError(
+                        "isolated client file changed while scanning"
+                    )
             except OSError:
                 raise CatalogProbeError("isolated client file cannot be read") from None
-            evidence: object = (len(payload), hashlib.sha256(payload).hexdigest())
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+            evidence: object = (opened.st_size, digest.hexdigest())
             kind = "regular"
         elif stat.S_ISDIR(metadata.st_mode):
             evidence, kind = None, "directory"
@@ -249,8 +336,17 @@ def _assert_no_unexpected_state(
         "codex-home/skills/recursive-self-improvement/agents",
         "codex-home/skills/recursive-self-improvement/agents/openai.yaml",
     }
+    if len(snapshot) > _MAX_CLIENT_TREE_ENTRIES:
+        raise CatalogProbeError("catalog state classification entry bound exceeded")
+    path_bytes = 0
     for row in snapshot:
         relative = str(row[0])
+        encoded = os.fsencode(relative)
+        path_bytes += len(encoded)
+        if path_bytes > _MAX_CLIENT_TREE_PATH_BYTES:
+            raise CatalogProbeError("catalog state classification path bound exceeded")
+        if relative != "." and len(Path(relative).parts) > _MAX_CLIENT_TREE_DEPTH:
+            raise CatalogProbeError("catalog state classification depth bound exceeded")
         if relative == "." or relative in allowed_projection:
             continue
         if relative == "codex-home/skills/.system" or relative.startswith(
@@ -609,24 +705,43 @@ def run_live_catalog_probe() -> CatalogProbeReport:
             clients = (local_result, latest_result)
     except Exception as error:
         primary_error = error
-    comparison_error: Exception | None = None
+    status_error: Exception | None = None
+    witness_error: Exception | None = None
     status_after = None
     witness_after = None
     try:
         status_after = deployer.verify()
+    except Exception as error:
+        status_error = error
+    try:
         witness_after = _live_witness(authority)
     except Exception as error:
-        comparison_error = error
+        witness_error = error
     finally:
         if snapshot is not None:
             snapshot.close()
+    errors = tuple(
+        error
+        for error in (primary_error, status_error, witness_error)
+        if error is not None
+    )
+    if len(errors) > 1:
+        failure_cause: Exception | None = ExceptionGroup(
+            "catalog probe failure evidence",
+            list(errors),
+        )
+    else:
+        failure_cause = errors[0] if errors else None
     if (
-        comparison_error is not None
-        or status_after != status_before
-        or witness_after != witness_before
+        (status_error is None and status_after != status_before)
+        or (witness_error is None and witness_after != witness_before)
     ):
         raise CatalogProbeError("catalog probe changed a protected live witness") from (
-            primary_error if primary_error is not None else comparison_error
+            failure_cause
+        )
+    if status_error is not None or witness_error is not None:
+        raise CatalogProbeError("catalog probe final verification is incomplete") from (
+            failure_cause
         )
     if primary_error is not None:
         raise primary_error

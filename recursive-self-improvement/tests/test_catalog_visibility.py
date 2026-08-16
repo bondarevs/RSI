@@ -287,6 +287,23 @@ def test_catalog_client_reaps_descendants_after_leader_exit(
             _kill_pid_for_test(int(child_pid_path.read_text(encoding="utf-8")))
 
 
+def test_disposable_tree_inventory_is_bounded_before_state_classification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    (tmp_path / "one").write_bytes(b"one")
+    (tmp_path / "two").write_bytes(b"two")
+    monkeypatch.setattr(
+        catalog_probe,
+        "_MAX_CLIENT_TREE_ENTRIES",
+        2,
+        raising=False,
+    )
+
+    with pytest.raises(catalog_probe.CatalogProbeError, match="entry bound"):
+        catalog_probe._tree_snapshot(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("client_name", "command"),
     [

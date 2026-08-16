@@ -1898,6 +1898,81 @@ def test_catalog_probe_rejects_rsi_state_created_in_disposable_client_space(
         snapshot.close()
 
 
+def test_catalog_probe_rejects_real_provider_root_in_disposable_home(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, _installed, _authority = _genuine_install(tmp_path / "install")
+    snapshot = attest_installed_snapshot(deployer.paths.installed_root, deployer)
+    command = _write_fake_catalog_client(
+        tmp_path / "provider-state-client.py",
+        state_statement=(
+            "state = pathlib.Path(os.environ['HOME']) / 'skill-learning'; "
+            "state.mkdir(); (state / 'events.lock').write_text('locked\\n')"
+        ),
+    )
+    try:
+        with pytest.raises(
+            catalog_probe_module.CatalogProbeError,
+            match="unexpected RSI or provider state",
+        ):
+            catalog_probe_module.probe_catalog_client(
+                snapshot.catalog_surface(),
+                tmp_path / "run",
+                command=command,
+                client_name="local",
+            )
+    finally:
+        snapshot.close()
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "home/nested/skill-learning/events.lock",
+        "tmp/.skill-learning/observations.lock",
+        "npm-cache/skill_learning/reports.lock",
+        "codex-home/cache/rsi-skill-learning/learning.jsonl",
+    ],
+)
+def test_catalog_state_classifier_rejects_provider_aliases_at_any_depth(
+    relative_path: str,
+) -> None:
+    snapshot = (
+        (".", "directory", 0o700, 1, None),
+        (relative_path, "regular", 0o600, 1, (0, hashlib.sha256(b"").hexdigest())),
+    )
+
+    with pytest.raises(
+        catalog_probe_module.CatalogProbeError,
+        match="unexpected RSI or provider state",
+    ):
+        catalog_probe_module._assert_no_unexpected_state(snapshot)
+
+
+def test_catalog_probe_allows_near_name_client_cache(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, _installed, _authority = _genuine_install(tmp_path / "install")
+    snapshot = attest_installed_snapshot(deployer.paths.installed_root, deployer)
+    command = _write_fake_catalog_client(
+        tmp_path / "near-name-client.py",
+        state_statement=(
+            "state = pathlib.Path(os.environ['HOME']) / 'skill-learning-notes'; "
+            "state.mkdir(); (state / 'cache.lock').write_text('benign\\n')"
+        ),
+    )
+    try:
+        result = catalog_probe_module.probe_catalog_client(
+            snapshot.catalog_surface(),
+            tmp_path / "run",
+            command=command,
+            client_name="local",
+        )
+        assert result.catalog_entry_count == 1
+    finally:
+        snapshot.close()
+
+
 def test_catalog_probe_allows_benign_client_system_synchronization(
     tmp_path: Path,
 ) -> None:
@@ -1958,6 +2033,66 @@ def test_catalog_probe_compares_live_witness_after_client_failure(
     ):
         catalog_probe_module.run_live_catalog_probe()
     assert witness_calls == [False, True]
+
+
+def test_catalog_probe_runs_final_witness_after_post_status_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo, genuine_deployer, _installed, authority = _genuine_install(tmp_path)
+    drifted = False
+    witness_calls: list[bool] = []
+
+    class PostStatusFailingDeployer:
+        paths = genuine_deployer.paths
+        verify_calls = 0
+
+        def verify(self) -> DeploymentStatus:
+            self.verify_calls += 1
+            if self.verify_calls == 3:
+                raise RuntimeError("post-status-failure")
+            return genuine_deployer.verify()
+
+    wrapped_deployer = PostStatusFailingDeployer()
+
+    def capture_witness(_authority: object) -> tuple[object, ...]:
+        witness_calls.append(drifted)
+        return ("protected", drifted)
+
+    def fail_latest(_npx: str, _root: Path) -> tuple[tuple[str, ...], str]:
+        nonlocal drifted
+        drifted = True
+        raise catalog_probe_module.CatalogProbeError("primary-client-failure")
+
+    monkeypatch.setattr(
+        rollout_module.DryRunAuthority,
+        "live",
+        classmethod(lambda cls: authority),
+    )
+    monkeypatch.setattr(
+        deployment_module,
+        "GlobalRsiDeployer",
+        lambda _paths: wrapped_deployer,
+    )
+    monkeypatch.setattr(
+        catalog_probe_module.shutil,
+        "which",
+        lambda name: f"/synthetic/{name}",
+    )
+    monkeypatch.setattr(catalog_probe_module, "_live_witness", capture_witness)
+    monkeypatch.setattr(catalog_probe_module, "_latest_command", fail_latest)
+
+    with pytest.raises(
+        catalog_probe_module.CatalogProbeError,
+        match="changed a protected live witness",
+    ) as captured:
+        catalog_probe_module.run_live_catalog_probe()
+
+    assert witness_calls == [False, True]
+    assert isinstance(captured.value.__cause__, ExceptionGroup)
+    assert [str(item) for item in captured.value.__cause__.exceptions] == [
+        "primary-client-failure",
+        "post-status-failure",
+    ]
 
 
 def _catalog_witness_authority(tmp_path: Path) -> SimpleNamespace:
