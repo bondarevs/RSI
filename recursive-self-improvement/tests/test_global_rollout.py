@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -959,6 +960,159 @@ def test_ignored_inventory_rejects_directory_rebind_during_open(
         rollout_module._capture_ignored_inventory(repo, b"!! ignored-witness/\0")
 
     assert swapped is True
+
+
+def test_ignored_inventory_high_fanout_is_bounded_during_enumeration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, paths = _ignored_witness_fixture(tmp_path)
+    for index in range(20):
+        (paths["ignored"] / f"fanout-{index:03d}").write_bytes(b"x")
+    monkeypatch.setattr(rollout_module, "_MAX_IGNORED_ENTRIES", 8)
+    monkeypatch.setattr(
+        os,
+        "listdir",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ignored directory was materialized with listdir")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="entry"):
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! ignored-witness/\0"
+        )
+
+
+def test_ignored_inventory_depth_bound_is_iterative_not_python_recursion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, paths = _ignored_witness_fixture(tmp_path)
+    current = paths["ignored"]
+    for index in range(24):
+        current = current / f"depth-{index:02d}"
+        current.mkdir()
+    monkeypatch.setattr(rollout_module, "_MAX_IGNORED_DEPTH", 8, raising=False)
+
+    with pytest.raises(ValueError, match="depth") as captured:
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! ignored-witness/\0"
+        )
+
+    assert not isinstance(captured.value, RecursionError)
+
+
+def test_ignored_root_depth_is_rejected_before_ancestry_descent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _paths = _ignored_witness_fixture(tmp_path)
+    (repo / "outer" / "inner").mkdir(parents=True)
+    monkeypatch.setattr(rollout_module, "_MAX_IGNORED_DEPTH", 1)
+    real_open = os.open
+    descended = False
+
+    def observe_open(path: object, flags: int, *args: object, **kwargs: object):
+        nonlocal descended
+        if path == "outer" and kwargs.get("dir_fd") is not None:
+            descended = True
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", observe_open)
+
+    with pytest.raises(ValueError, match="depth"):
+        rollout_module._capture_ignored_inventory(repo, b"!! outer/inner/\0")
+
+    assert descended is False
+
+
+def test_ignored_directory_pin_fstat_failure_closes_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, _paths = _ignored_witness_fixture(tmp_path)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+    real_fstat = os.fstat
+    failed = False
+
+    def fail_first_pin(descriptor: int):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("injected pin fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(os, "fstat", fail_first_pin)
+
+    with pytest.raises(ValueError, match="pinned"):
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! ignored-witness/\0"
+        )
+
+    after = {entry.name for entry in fd_root.iterdir()}
+    assert failed is True
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("constant", "match"),
+    [
+        ("_MAX_IGNORED_NAME_BYTES", "name"),
+        ("_MAX_IGNORED_METADATA_BYTES", "metadata"),
+    ],
+)
+def test_ignored_inventory_applies_name_and_metadata_bounds_before_descend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    constant: str,
+    match: str,
+) -> None:
+    repo, _paths = _ignored_witness_fixture(tmp_path)
+    monkeypatch.setattr(rollout_module, constant, 1, raising=False)
+
+    with pytest.raises(ValueError, match=match):
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! ignored-witness/\0"
+        )
+
+
+@pytest.mark.parametrize(("kind", "expected"), [("fifo", "fifo"), ("socket", "socket")])
+def test_ignored_inventory_records_special_entry_metadata_and_detects_drift(
+    tmp_path: Path, kind: str, expected: str
+) -> None:
+    repo, paths = _ignored_witness_fixture(tmp_path)
+    special = paths["ignored"] / f"ignored-{kind}-unique"
+    if kind == "fifo":
+        os.mkfifo(special, 0o600)
+    else:
+        endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        original_directory = os.open(".", os.O_RDONLY)
+        try:
+            os.chdir(paths["ignored"])
+            endpoint.bind(special.name)
+        finally:
+            os.fchdir(original_directory)
+            os.close(original_directory)
+            endpoint.close()
+
+    before = rollout_module._capture_repository_witness(repo)
+    record = next(
+        item for item in before.ignored_inventory if item[0] == special.relative_to(repo).as_posix()
+    )
+    special.chmod(0o644)
+    after = rollout_module._capture_repository_witness(repo)
+
+    assert record[1] == expected
+    assert after != before
+
+
+def test_repository_witness_realistic_git_fixture_remains_admissible(
+    tmp_path: Path
+) -> None:
+    repo, _paths = _ignored_witness_fixture(tmp_path)
+
+    witness = rollout_module._capture_repository_witness(repo)
+
+    assert witness.repository == repo.resolve(strict=True)
+    assert witness.ignored_inventory
 
 
 def test_live_authority_and_dry_run_allow_absent_provider_witnesses(

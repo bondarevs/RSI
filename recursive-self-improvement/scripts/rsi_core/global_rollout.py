@@ -65,7 +65,10 @@ _REASONS = frozenset(
 _MAX_CAPTURE_BYTES = 64 * 1024
 _MAX_IGNORED_ENTRIES = 16_384
 _MAX_IGNORED_PATH_BYTES = 4 * 1024 * 1024
+_MAX_IGNORED_NAME_BYTES = 2 * 1024 * 1024
+_MAX_IGNORED_METADATA_BYTES = 4 * 1024 * 1024
 _MAX_IGNORED_SYMLINK_BYTES = 256 * 1024
+_MAX_IGNORED_DEPTH = 64
 DRY_RUN_ATTESTED_NOW = "2026-08-13T00:00:00Z"
 _CLOCK_CAPABILITY_MODULE = "_rsi_attested_clock_capability"
 _CLOCK_CAPABILITY_DOMAIN = "rsi-dry-run-bootstrap-clock-v1"
@@ -1277,6 +1280,24 @@ def _ignored_stat_signature(value: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _ignored_kind(mode: int) -> str:
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISBLK(mode):
+        return "block"
+    if stat.S_ISCHR(mode):
+        return "char"
+    return "other"
+
+
 def _capture_ignored_inventory(
     repository: Path, ignored_status: bytes
 ) -> tuple[tuple[object, ...], ...]:
@@ -1313,18 +1334,39 @@ def _capture_ignored_inventory(
     records: list[tuple[object, ...]] = []
     seen_entries: set[str] = set()
     path_bytes = 0
+    name_bytes = 0
+    metadata_bytes = 0
     symlink_bytes = 0
 
-    def account(relative: str) -> None:
-        nonlocal path_bytes
+    def reserve(
+        relative: str,
+        name: str,
+        depth: int,
+        metadata: os.stat_result,
+        kind: str,
+    ) -> tuple[int, ...]:
+        nonlocal path_bytes, name_bytes, metadata_bytes
         if relative in seen_entries:
             raise ValueError("ignored repository inventory contains a duplicate entry")
-        seen_entries.add(relative)
-        path_bytes += len(relative.encode("utf-8"))
-        if len(seen_entries) > _MAX_IGNORED_ENTRIES:
+        encoded_relative = relative.encode("utf-8")
+        encoded_name = name.encode("utf-8")
+        signature = _ignored_stat_signature(metadata)
+        record_metadata_bytes = len(kind.encode("ascii")) + 8 * len(signature)
+        if len(seen_entries) + 1 > _MAX_IGNORED_ENTRIES:
             raise ValueError("ignored repository entry bound exceeded")
-        if path_bytes > _MAX_IGNORED_PATH_BYTES:
+        if path_bytes + len(encoded_relative) > _MAX_IGNORED_PATH_BYTES:
             raise ValueError("ignored repository path byte bound exceeded")
+        if name_bytes + len(encoded_name) > _MAX_IGNORED_NAME_BYTES:
+            raise ValueError("ignored repository name byte bound exceeded")
+        if metadata_bytes + record_metadata_bytes > _MAX_IGNORED_METADATA_BYTES:
+            raise ValueError("ignored repository metadata byte bound exceeded")
+        if depth > _MAX_IGNORED_DEPTH:
+            raise ValueError("ignored repository depth bound exceeded")
+        seen_entries.add(relative)
+        path_bytes += len(encoded_relative)
+        name_bytes += len(encoded_name)
+        metadata_bytes += record_metadata_bytes
+        return signature
 
     def record_for(
         relative: str,
@@ -1352,42 +1394,12 @@ def _capture_ignored_inventory(
             target_digest,
         )
 
-    def scan(parent_fd: int, name: str, relative: str) -> None:
-        nonlocal symlink_bytes
-        relative = _canonical_ignored_relative(relative)
-        account(relative)
+    open_descriptors: set[int] = set()
+
+    def pin_directory(parent_fd: int, name: str, expected: tuple[int, ...]) -> int:
+        descriptor: int | None = None
         try:
-            named_before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError:
-            raise ValueError("ignored repository entry is unavailable") from None
-        before_signature = _ignored_stat_signature(named_before)
-        if stat.S_ISLNK(named_before.st_mode):
-            try:
-                target_text = os.readlink(name, dir_fd=parent_fd)
-                target = target_text.encode("utf-8", "strict")
-                named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            except (OSError, UnicodeEncodeError):
-                raise ValueError("ignored repository symlink is invalid") from None
-            symlink_bytes += len(target)
-            if symlink_bytes > _MAX_IGNORED_SYMLINK_BYTES:
-                raise ValueError("ignored repository symlink byte bound exceeded")
-            if _ignored_stat_signature(named_after) != before_signature:
-                raise ValueError("ignored repository symlink changed during capture")
-            records.append(record_for(relative, "symlink", named_after, target))
-            return
-        if stat.S_ISREG(named_before.st_mode):
-            try:
-                named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            except OSError:
-                raise ValueError("ignored repository file changed during capture") from None
-            if _ignored_stat_signature(named_after) != before_signature:
-                raise ValueError("ignored repository file changed during capture")
-            records.append(record_for(relative, "regular", named_after))
-            return
-        if not stat.S_ISDIR(named_before.st_mode):
-            raise ValueError("ignored repository entry has an unsupported type")
-        try:
-            directory_fd = os.open(
+            descriptor = os.open(
                 name,
                 os.O_RDONLY
                 | getattr(os, "O_DIRECTORY", 0)
@@ -1395,39 +1407,59 @@ def _capture_ignored_inventory(
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=parent_fd,
             )
+            opened = os.fstat(descriptor)
         except OSError:
+            if descriptor is not None:
+                os.close(descriptor)
             raise ValueError("ignored repository directory cannot be pinned") from None
+        if _ignored_stat_signature(opened) != expected:
+            os.close(descriptor)
+            raise ValueError("ignored repository directory changed while opening")
+        open_descriptors.add(descriptor)
+        return descriptor
+
+    def enumerate_children(
+        directory_fd: int, relative: str, depth: int
+    ) -> list[tuple[str, str, int, tuple[int, ...]]]:
+        children: list[tuple[str, str, int, tuple[int, ...]]] = []
         try:
-            opened_before = os.fstat(directory_fd)
-            if _ignored_stat_signature(opened_before) != before_signature:
-                raise ValueError("ignored repository directory changed while opening")
-            try:
-                names = sorted(os.listdir(directory_fd), key=os.fsencode)
-            except OSError:
-                raise ValueError("ignored repository directory cannot be enumerated") from None
-            for child_name in names:
-                if type(child_name) is not str:
-                    raise ValueError("ignored repository entry name is invalid")
-                child_relative = _canonical_ignored_relative(
-                    relative + "/" + child_name
-                )
-                scan(directory_fd, child_name, child_relative)
-            opened_after = os.fstat(directory_fd)
-            try:
-                named_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            except OSError:
-                raise ValueError("ignored repository directory changed during capture") from None
-            signatures = {
-                before_signature,
-                _ignored_stat_signature(opened_before),
-                _ignored_stat_signature(opened_after),
-                _ignored_stat_signature(named_after),
-            }
-            if len(signatures) != 1:
-                raise ValueError("ignored repository directory changed during capture")
-            records.append(record_for(relative, "directory", named_after))
-        finally:
-            os.close(directory_fd)
+            with os.scandir(directory_fd) as iterator:
+                for entry in iterator:
+                    child_name = entry.name
+                    if type(child_name) is not str:
+                        raise ValueError("ignored repository entry name is invalid")
+                    child_relative = _canonical_ignored_relative(
+                        relative + "/" + child_name
+                    )
+                    try:
+                        child_metadata = os.stat(
+                            child_name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        raise ValueError(
+                            "ignored repository entry changed during enumeration"
+                        ) from None
+                    child_kind = _ignored_kind(child_metadata.st_mode)
+                    child_signature = reserve(
+                        child_relative,
+                        child_name,
+                        depth + 1,
+                        child_metadata,
+                        child_kind,
+                    )
+                    children.append(
+                        (child_name, child_relative, depth + 1, child_signature)
+                    )
+        except ValueError:
+            raise
+        except OSError:
+            raise ValueError(
+                "ignored repository directory cannot be enumerated"
+            ) from None
+        children.sort(key=lambda child: child[0].encode("utf-8"))
+        return children
 
     repository_fd = os.open(
         repository,
@@ -1436,10 +1468,14 @@ def _capture_ignored_inventory(
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0),
     )
+    open_descriptors.add(repository_fd)
     try:
         for relative in roots:
             parts = relative.split("/")
+            if len(parts) > _MAX_IGNORED_DEPTH:
+                raise ValueError("ignored repository depth bound exceeded")
             parent_fd = os.dup(repository_fd)
+            open_descriptors.add(parent_fd)
             try:
                 for component in parts[:-1]:
                     try:
@@ -1468,12 +1504,143 @@ def _capture_ignored_inventory(
                             "ignored repository root ancestry changed while opening"
                         )
                     os.close(parent_fd)
+                    open_descriptors.remove(parent_fd)
                     parent_fd = child_fd
-                scan(parent_fd, parts[-1], relative)
+                    open_descriptors.add(parent_fd)
+                try:
+                    root_metadata = os.stat(
+                        parts[-1], dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except OSError:
+                    raise ValueError("ignored repository entry is unavailable") from None
+                root_kind = _ignored_kind(root_metadata.st_mode)
+                root_signature = reserve(
+                    relative,
+                    parts[-1],
+                    len(parts),
+                    root_metadata,
+                    root_kind,
+                )
+                tasks: list[tuple[object, ...]] = [
+                    ("entry", parent_fd, parts[-1], relative, len(parts), root_signature)
+                ]
+                while tasks:
+                    task = tasks.pop()
+                    if task[0] == "finish":
+                        _, task_parent, task_name, task_relative, expected, directory_fd = task
+                        try:
+                            opened_after = os.fstat(directory_fd)
+                            named_after = os.stat(
+                                task_name,
+                                dir_fd=task_parent,
+                                follow_symlinks=False,
+                            )
+                        except OSError:
+                            raise ValueError(
+                                "ignored repository directory changed during capture"
+                            ) from None
+                        if (
+                            _ignored_stat_signature(opened_after) != expected
+                            or _ignored_stat_signature(named_after) != expected
+                        ):
+                            raise ValueError(
+                                "ignored repository directory changed during capture"
+                            )
+                        records.append(
+                            record_for(task_relative, "directory", named_after)
+                        )
+                        os.close(directory_fd)
+                        open_descriptors.remove(directory_fd)
+                        continue
+                    _, task_parent, task_name, task_relative, depth, expected = task
+                    try:
+                        named_before = os.stat(
+                            task_name,
+                            dir_fd=task_parent,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        raise ValueError(
+                            "ignored repository entry is unavailable"
+                        ) from None
+                    if _ignored_stat_signature(named_before) != expected:
+                        raise ValueError(
+                            "ignored repository entry changed before capture"
+                        )
+                    kind = _ignored_kind(named_before.st_mode)
+                    if kind == "directory":
+                        directory_fd = pin_directory(
+                            task_parent, task_name, expected
+                        )
+                        children = enumerate_children(
+                            directory_fd, task_relative, depth
+                        )
+                        tasks.append(
+                            (
+                                "finish",
+                                task_parent,
+                                task_name,
+                                task_relative,
+                                expected,
+                                directory_fd,
+                            )
+                        )
+                        for child in reversed(children):
+                            child_name, child_relative, child_depth, child_signature = child
+                            tasks.append(
+                                (
+                                    "entry",
+                                    directory_fd,
+                                    child_name,
+                                    child_relative,
+                                    child_depth,
+                                    child_signature,
+                                )
+                            )
+                        continue
+                    target: bytes | None = None
+                    if kind == "symlink":
+                        try:
+                            target = os.readlink(
+                                task_name, dir_fd=task_parent
+                            ).encode("utf-8", "strict")
+                        except (OSError, UnicodeEncodeError):
+                            raise ValueError(
+                                "ignored repository symlink is invalid"
+                            ) from None
+                        symlink_bytes += len(target)
+                        if symlink_bytes > _MAX_IGNORED_SYMLINK_BYTES:
+                            raise ValueError(
+                                "ignored repository symlink byte bound exceeded"
+                            )
+                    try:
+                        named_after = os.stat(
+                            task_name,
+                            dir_fd=task_parent,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        raise ValueError(
+                            "ignored repository entry changed during capture"
+                        ) from None
+                    if _ignored_stat_signature(named_after) != expected:
+                        raise ValueError(
+                            "ignored repository entry changed during capture"
+                        )
+                    records.append(
+                        record_for(task_relative, kind, named_after, target)
+                    )
             finally:
-                os.close(parent_fd)
+                if parent_fd in open_descriptors:
+                    os.close(parent_fd)
+                    open_descriptors.remove(parent_fd)
     finally:
-        os.close(repository_fd)
+        for descriptor in tuple(open_descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            open_descriptors.discard(descriptor)
     records.sort(key=lambda record: str(record[0]).encode("utf-8"))
     return tuple(records)
 

@@ -1682,6 +1682,32 @@ def test_active_pointer_validates_every_derived_field_before_any_authority_read(
     assert reads == [paths.active_authority_file]
 
 
+def test_active_pointer_boolean_schema_version_cannot_select_authority_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo, "active-schema-install")
+    pointer = json.loads(paths.active_authority_file.read_bytes())
+    pointer["schemaVersion"] = True
+    paths.active_authority_file.write_bytes(canonical_json_bytes(pointer))
+    real_read = deployment_module._read_regular_file
+    reads: list[Path] = []
+
+    def pointer_only(path: Path, *, label: str):
+        reads.append(path)
+        if path != paths.active_authority_file:
+            raise AssertionError(f"boolean pointer schema selected a read: {path}")
+        return real_read(path, label=label)
+
+    monkeypatch.setattr(deployment_module, "_read_regular_file", pointer_only)
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._validated_active_authority(paths)
+
+    assert reads == [paths.active_authority_file]
+
+
 @pytest.mark.parametrize("value", [["deploy"], {"deploy": True}, None, True, 1])
 def test_stored_operation_request_kind_requires_exact_string_type(value: object) -> None:
     payload = canonical_json_bytes(
@@ -1690,6 +1716,22 @@ def test_stored_operation_request_kind_requires_exact_string_type(value: object)
             "domain": "rsi-global-operation-request-v1",
             "operationId": "stored-request",
             "operationKind": value,
+            "requestReceiptId": None,
+            "priorStateBackupDigest": "sha256:" + "a" * 64,
+        }
+    )
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._OperationRequest.from_bytes(payload)
+
+
+def test_stored_operation_request_rejects_boolean_schema_version() -> None:
+    payload = canonical_json_bytes(
+        {
+            "schemaVersion": True,
+            "domain": "rsi-global-operation-request-v1",
+            "operationId": "stored-request",
+            "operationKind": "deploy",
             "requestReceiptId": None,
             "priorStateBackupDigest": "sha256:" + "a" * 64,
         }
@@ -1750,6 +1792,101 @@ def test_stored_backup_enums_reject_invalid_types_before_derived_reads(
         deployment_module._validate_backup(renamed)
 
     assert reads == [renamed / "backup.json"]
+
+
+@pytest.mark.parametrize(
+    ("field", "nested"),
+    [
+        ("schemaVersion", False),
+        ("packageManifestByteLength", False),
+        ("byteLength", True),
+        ("mode", True),
+    ],
+)
+def test_backup_boolean_numeric_fields_fail_before_derived_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    nested: bool,
+) -> None:
+    repo_v1 = _write_repository(tmp_path, version="backup-bool-v1")
+    repo_v2 = _write_repository(tmp_path, version="backup-bool-v2")
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    deployer = GlobalRsiDeployer(paths)
+    deployer.deploy(repo_v1, "backup-bool-v1")
+    deployer.deploy(repo_v2, "backup-bool-v2")
+    backups = [
+        path
+        for path in paths.backups_root.iterdir()
+        if path.is_dir()
+        and json.loads((path / "backup.json").read_bytes()).get("packageState")
+        == "present"
+    ]
+    assert len(backups) == 1
+    backup = backups[0]
+    metadata_path = backup / "backup.json"
+    metadata = json.loads(metadata_path.read_bytes())
+    if nested:
+        assert type(metadata["agents"]) is dict
+        metadata["agents"][field] = True
+    else:
+        metadata[field] = True
+    metadata_bytes = canonical_json_bytes(metadata)
+    metadata_path.write_bytes(metadata_bytes)
+    renamed = paths.backups_root / (
+        "sha256:" + hashlib.sha256(metadata_bytes).hexdigest()
+    )
+    backup.rename(renamed)
+    real_read = deployment_module._read_regular_file
+    reads: list[Path] = []
+
+    def metadata_only(path: Path, *, label: str):
+        reads.append(path)
+        if path != renamed / "backup.json":
+            raise AssertionError(f"boolean backup integer selected a read: {path}")
+        return real_read(path, label=label)
+
+    monkeypatch.setattr(deployment_module, "_read_regular_file", metadata_only)
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._validate_backup(renamed)
+
+    assert reads == [renamed / "backup.json"]
+
+
+def test_authority_boolean_schema_version_fails_before_receipt_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _write_repository(tmp_path)
+    paths = DeploymentPaths.for_testing(tmp_path / "codex")
+    GlobalRsiDeployer(paths).deploy(repo, "authority-schema-install")
+    pointer = json.loads(paths.active_authority_file.read_bytes())
+    operation_id = pointer["operationId"]
+    state = pointer["state"]
+    authority_path = paths.authorities_root / f"{operation_id}.{state}.json"
+    authority = json.loads(authority_path.read_bytes())
+    authority["schemaVersion"] = True
+    authority_bytes = canonical_json_bytes(authority)
+    authority_path.write_bytes(authority_bytes)
+    pointer["authorityDigest"] = "sha256:" + hashlib.sha256(authority_bytes).hexdigest()
+    paths.active_authority_file.write_bytes(canonical_json_bytes(pointer))
+    real_named_read = deployment_module._read_named_regular_file
+    names: list[str] = []
+
+    def authority_only(root: Path, name: str, *, label: str):
+        names.append(name)
+        if name != authority_path.name:
+            raise AssertionError(f"boolean authority schema selected a read: {name}")
+        return real_named_read(root, name, label=label)
+
+    monkeypatch.setattr(
+        deployment_module, "_read_named_regular_file", authority_only
+    )
+
+    with pytest.raises(DeploymentIntegrityError):
+        deployment_module._validated_active_authority(paths)
+
+    assert names == [authority_path.name]
 
 
 @pytest.mark.parametrize("value", [["present"], {"present": True}, None, True, 1])

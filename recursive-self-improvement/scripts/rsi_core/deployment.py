@@ -359,7 +359,9 @@ class _OperationRequest:
             "operationKind",
             "requestReceiptId",
             "priorStateBackupDigest",
-        } or mapping.get("schemaVersion") != 1 or mapping.get(
+        } or type(mapping.get("schemaVersion")) is not int or mapping.get(
+            "schemaVersion"
+        ) != 1 or mapping.get(
             "domain"
         ) != "rsi-global-operation-request-v1":
             raise DeploymentIntegrityError("deployment operation request schema is invalid")
@@ -2211,16 +2213,20 @@ def _validate_backup(
     }
     package_state = metadata.get("packageState")
     operation_kind = metadata.get("operationKind")
+    schema_version = metadata.get("schemaVersion")
+    agents_value = metadata.get("agents")
     if (
         type(package_state) is not str
         or package_state not in {"present", "absent"}
         or type(operation_kind) is not str
         or operation_kind not in {"deploy", "rollback"}
+        or type(schema_version) is not int
+        or schema_version != 1
+        or not isinstance(agents_value, dict)
     ):
         raise DeploymentIntegrityError("deployment backup metadata schema is invalid")
     if (
         set(metadata) != (present_keys if package_state == "present" else common_keys)
-        or metadata.get("schemaVersion") != 1
         or metadata.get("domain") != "rsi-global-deployment-backup-v1"
         or (
             metadata.get("requestReceiptId") is not None
@@ -2228,6 +2234,31 @@ def _validate_backup(
         )
     ):
         raise DeploymentIntegrityError("deployment backup metadata schema is invalid")
+    agents_state = agents_value.get("state")
+    if type(agents_state) is not str:
+        raise DeploymentIntegrityError("deployment backup AGENTS state is invalid")
+    if agents_state == "absent":
+        if set(agents_value) != {"state"}:
+            raise DeploymentIntegrityError("absent deployment backup AGENTS arm is invalid")
+    elif agents_state == "present":
+        agents_byte_length = agents_value.get("byteLength")
+        agents_mode = agents_value.get("mode")
+        if (
+            set(agents_value) != {"state", "byteLength", "digest", "mode"}
+            or type(agents_byte_length) is not int
+            or agents_byte_length < 0
+            or type(agents_mode) is not int
+            or agents_mode < 0
+            or agents_mode > 0o777
+        ):
+            raise DeploymentIntegrityError("present deployment backup AGENTS arm is invalid")
+    else:
+        raise DeploymentIntegrityError("deployment backup AGENTS state is invalid")
+    if package_state == "present" and (
+        type(metadata.get("packageManifestByteLength")) is not int
+        or metadata.get("packageManifestByteLength", -1) < 1
+    ):
+        raise DeploymentIntegrityError("deployment backup package binding is invalid")
     if path.name != _sha256(metadata_bytes):
         raise DeploymentIntegrityError("deployment backup directory digest is invalid")
     expected_members = {"backup.json", "agents.bin"} if (path / "agents.bin").exists() else {"backup.json"}
@@ -2259,17 +2290,11 @@ def _validate_backup(
         _verify_installed_modes(package, manifest)
     if root_members != expected_members:
         raise DeploymentIntegrityError("deployment backup contains an unlisted member")
-    agents_value = metadata.get("agents")
-    if not isinstance(agents_value, dict):
-        raise DeploymentIntegrityError("deployment backup AGENTS arm is invalid")
-    state = agents_value.get("state")
-    if state == "absent":
+    if agents_state == "absent":
         if set(agents_value) != {"state"} or (path / "agents.bin").exists():
             raise DeploymentIntegrityError("absent deployment backup AGENTS arm is invalid")
         agents = _AgentsFile(None, None, None, None)
-    elif state == "present":
-        if set(agents_value) != {"state", "byteLength", "digest", "mode"}:
-            raise DeploymentIntegrityError("present deployment backup AGENTS arm is invalid")
+    else:
         agents_bytes, agents_stat = _read_regular_file(
             path / "agents.bin", label="deployment backup AGENTS bytes"
         )
@@ -2277,16 +2302,11 @@ def _validate_backup(
             raise DeploymentIntegrityError("deployment backup AGENTS storage mode is invalid")
         mode = agents_value.get("mode")
         if (
-            type(mode) is not int
-            or mode < 0
-            or mode > 0o777
-            or agents_value.get("byteLength") != len(agents_bytes)
+            agents_value.get("byteLength") != len(agents_bytes)
             or agents_value.get("digest") != _sha256(agents_bytes)
         ):
             raise DeploymentIntegrityError("deployment backup AGENTS binding is invalid")
         agents = _AgentsFile(agents_bytes, mode, agents_stat.st_dev, agents_stat.st_ino)
-    else:
-        raise DeploymentIntegrityError("deployment backup AGENTS state is invalid")
     return _BackupRecord(
         path=path,
         identity_payload=metadata_bytes,
@@ -3215,7 +3235,9 @@ def _validated_active_authority(
         "state",
         "operationId",
         "authorityDigest",
-    } or pointer.get("schemaVersion") != 1 or pointer.get(
+    } or type(pointer.get("schemaVersion")) is not int or pointer.get(
+        "schemaVersion"
+    ) != 1 or pointer.get(
         "domain"
     ) != "rsi-global-active-authority-v1":
         raise DeploymentIntegrityError("active authority pointer schema is invalid")
@@ -3246,7 +3268,9 @@ def _validated_active_authority(
         "requestReceiptId",
         "receiptDigest",
         "manifestDigest",
-    } or authority.get("schemaVersion") != 1 or authority.get(
+    } or type(authority.get("schemaVersion")) is not int or authority.get(
+        "schemaVersion"
+    ) != 1 or authority.get(
         "domain"
     ) != "rsi-global-deployment-authority-v1" or authority.get(
         "state"

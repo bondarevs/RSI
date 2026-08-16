@@ -324,6 +324,36 @@ def test_receipt_rejects_nonclosed_or_invalid_bindings(mutation) -> None:
         DeploymentReceipt.from_mapping(value)
 
 
+@pytest.mark.parametrize(
+    ("schema", "field"),
+    [
+        ("manifest", "schemaVersion"),
+        ("manifest", "productionAllowlistEntryCount"),
+        ("manifest-entry", "byteLength"),
+        ("receipt", "schemaVersion"),
+        ("receipt", "manifestByteLength"),
+    ],
+)
+def test_deployment_wire_integers_reject_boolean_aliases(
+    schema: str, field: str
+) -> None:
+    value = receipt_fixture() if schema == "receipt" else manifest_fixture()
+    parser = (
+        DeploymentReceipt.from_mapping
+        if schema == "receipt"
+        else DeploymentManifest.from_mapping
+    )
+    if schema == "manifest-entry":
+        entries = value["fileEntries"]
+        assert type(entries) is list and type(entries[0]) is dict
+        entries[0][field] = True
+    else:
+        value[field] = True
+
+    with pytest.raises(DeploymentSchemaError):
+        parser(value)
+
+
 @pytest.mark.parametrize("operation_id", ["A", "Deploy-1", "a.b", "a:b"])
 @pytest.mark.parametrize("schema", ["manifest", "receipt"])
 def test_operation_ids_reject_casefold_and_receipt_path_alias_grammar(
