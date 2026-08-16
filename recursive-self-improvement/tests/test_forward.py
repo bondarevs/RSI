@@ -24,7 +24,7 @@ from rsi_core.deployment import (
     GlobalRsiDeployer,
 )
 from rsi_core.deployment_fs import DeploymentIntegrityError
-from rsi_core.global_instructions import GlobalInstructionsError
+from rsi_core.global_instructions import GlobalInstructionsError, MANAGED_BLOCK
 from rsi_core.global_rollout import DryRunAuthority, run_observe_dry_run
 from rsi_core.report import GlobalReportService
 from rsi_core.storage import EventStore
@@ -820,7 +820,51 @@ def _forward_rollout_repository(root: Path) -> Path:
     return repository
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="atomic rollout mutation is Darwin-only")
+def _normalized_release_tree(
+    root: Path, *, source: bool
+) -> tuple[tuple[str, str, int, bytes], ...]:
+    rows: list[tuple[str, str, int, bytes]] = []
+    for path in [root, *sorted(root.rglob("*"), key=lambda item: item.as_posix())]:
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        if relative == ".rsi-deployment-manifest.json":
+            continue
+        metadata = path.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            mode = 0o700 if source else stat.S_IMODE(metadata.st_mode)
+            rows.append((relative, "directory", mode, b""))
+        else:
+            assert stat.S_ISREG(metadata.st_mode)
+            mode = 0o700 if metadata.st_mode & 0o111 else 0o600
+            actual_mode = mode if source else stat.S_IMODE(metadata.st_mode)
+            rows.append((relative, "file", actual_mode, path.read_bytes()))
+    return tuple(rows)
+
+
+def _optional_file_state(path: Path) -> tuple[str, int | None, bytes | None]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return ("absent", None, None)
+    assert stat.S_ISREG(metadata.st_mode)
+    return ("present", stat.S_IMODE(metadata.st_mode), path.read_bytes())
+
+
+def _global_rollout_recovery_contract() -> dict[str, str]:
+    text = (PACKAGE_ROOT / "references" / "global-rollout.md").read_text(
+        encoding="utf-8"
+    )
+    matches = re.findall(r"```rsi-rollout-contract\n(.*?)\n```", text, re.S)
+    assert len(matches) == 1
+    value = json.loads(matches[0])
+    assert isinstance(value, dict) and isinstance(value.get("recovery"), dict)
+    recovery = value["recovery"]
+    assert all(isinstance(key, str) and isinstance(item, str) for key, item in recovery.items())
+    return recovery
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin", reason="atomic rollout mutation is Darwin-only"
+)
 def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix(
     tmp_path: Path,
 ) -> None:
@@ -840,10 +884,21 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
         (root / "witness.bin").write_bytes(payload)
     provider_ledger = provider / "witness.bin"
     protected_before = (_tree(provider), _tree(target), _tree(simulated_live))
+    source_package = repository / "recursive-self-improvement"
+    v1_release = _normalized_release_tree(source_package, source=True)
+    assert _optional_file_state(paths.agents_file) == ("absent", None, None)
 
     installed = deployer.deploy(repository, "forward-install-v1")
     assert installed.operation_id == "forward-install-v1"
     assert deployer.verify().verified is True
+    assert (
+        _normalized_release_tree(paths.installed_root, source=False) == v1_release
+    )
+    paths.agents_file.write_bytes(b"user-before-update\n" + MANAGED_BLOCK)
+    paths.agents_file.chmod(0o640)
+    assert deployer.verify().verified is True
+    v1_agents = _optional_file_state(paths.agents_file)
+    assert v1_agents[0] == "present"
     authority = DryRunAuthority.for_testing(
         deployment_paths=paths,
         source_repository=repository,
@@ -851,15 +906,108 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
         provider_ledger=provider_ledger,
         target_roots=(target, simulated_live),
     )
-    report = run_observe_dry_run(
-        paths.installed_root, tmp_path / "observe-dry-run", authority=authority
-    )
-    by_name = {case.name: case for case in report.cases}
-    assert by_name["safe-finding"].invoked is True
-    assert by_name["ordinary"].invoked is False
-    assert by_name["recursive"].invoked is False
+    dry_root = tmp_path / "observe-dry-run"
+    report = run_observe_dry_run(paths.installed_root, dry_root, authority=authority)
+    assert report.complete is True
+    assert [case.to_mapping() for case in report.cases] == [
+        {
+            "name": "safe-finding",
+            "disposition": "triggered-safe",
+            "reason": "safe-reusable-finding",
+            "invoked": True,
+            "status": "completed",
+            "entryPoint": "scripts/rsi.py",
+            "mode": "observe",
+            "hookMode": "late-review",
+            "recursionGuard": "1",
+        },
+        {
+            "name": "skill-no-finding",
+            "disposition": "triggered-no-finding",
+            "reason": "skill-used-no-finding",
+            "invoked": True,
+            "status": "completed",
+            "entryPoint": "scripts/rsi.py",
+            "mode": "observe",
+            "hookMode": "late-review",
+            "recursionGuard": "1",
+        },
+        {
+            "name": "ordinary",
+            "disposition": "skipped",
+            "reason": "excluded-task-kind",
+            "invoked": False,
+            "status": "not-invoked",
+            "entryPoint": None,
+            "mode": None,
+            "hookMode": None,
+            "recursionGuard": None,
+        },
+        {
+            "name": "maintenance",
+            "disposition": "skipped",
+            "reason": "excluded-task-kind",
+            "invoked": False,
+            "status": "not-invoked",
+            "entryPoint": None,
+            "mode": None,
+            "hookMode": None,
+            "recursionGuard": None,
+        },
+        {
+            "name": "sensitive",
+            "disposition": "skipped",
+            "reason": "sensitive-evidence",
+            "invoked": False,
+            "status": "not-invoked",
+            "entryPoint": None,
+            "mode": None,
+            "hookMode": None,
+            "recursionGuard": None,
+        },
+        {
+            "name": "recursive",
+            "disposition": "skipped",
+            "reason": "recursion-guard-active",
+            "invoked": False,
+            "status": "not-invoked",
+            "entryPoint": None,
+            "mode": None,
+            "hookMode": None,
+            "recursionGuard": None,
+        },
+    ]
+    for case_name in ("safe-finding", "skill-no-finding"):
+        state = dry_root / f"rsi-state-{case_name}"
+        event_lines = (state / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        events = [json.loads(line) for line in event_lines]
+        assert [event["eventType"] for event in events] == [
+            "run.started",
+            "task.observed",
+            "evaluation.completed",
+            "report.generated",
+            "run.closed",
+        ]
+        observations = list((state / "objects" / "observations").glob("*.json"))
+        reports = list((state / "reports").glob("local-review-*.json"))
+        assert len(observations) == len(reports) == 1
+        observation = json.loads(observations[0].read_text(encoding="utf-8"))
+        report_value = json.loads(reports[0].read_text(encoding="utf-8"))
+        assert observation["evidence"] == [
+            {"kind": "test-result", "summary": "The verified fixture passed."}
+        ]
+        assert report_value["mutationPerformed"] is False
+    for case_name in ("ordinary", "maintenance", "sensitive", "recursive"):
+        assert not (dry_root / f"rsi-state-{case_name}").exists()
+        assert not (dry_root / f"target-{case_name}").exists()
+        assert not (dry_root / f"request-{case_name}.json").exists()
 
-    release_note = repository / "recursive-self-improvement" / "references" / "global-rollout.md"
+    release_note = (
+        repository
+        / "recursive-self-improvement"
+        / "references"
+        / "global-rollout.md"
+    )
     release_note.write_bytes(release_note.read_bytes() + b"\nRelease fixture revision.\n")
     subprocess.run(
         ["git", "-C", str(repository), "add", "recursive-self-improvement"],
@@ -869,12 +1017,73 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
         ["git", "-C", str(repository), "commit", "-q", "-m", "release-v2"],
         check=True,
     )
+    v2_release = _normalized_release_tree(source_package, source=True)
+    assert v2_release != v1_release
     updated = deployer.deploy(repository, "forward-update-v2")
     assert updated.operation_id == "forward-update-v2"
     assert deployer.verify().operation_id == "forward-update-v2"
+    assert (
+        _normalized_release_tree(paths.installed_root, source=False) == v2_release
+    )
+
+    recovery = _global_rollout_recovery_contract()
+    exact_agents = _optional_file_state(paths.agents_file)
+    assert exact_agents == v1_agents
+    assert exact_agents[2] is not None
+    paths.agents_file.write_bytes(
+        exact_agents[2].replace(b"observe", b"observe-drift", 1)
+    )
+    instruction_drift = _tree(paths.codex_home)
+    with pytest.raises(
+        (DeploymentError, DeploymentIntegrityError, GlobalInstructionsError)
+    ):
+        deployer.deploy(repository, "instruction-drift-deploy")
+    with pytest.raises(
+        (DeploymentError, DeploymentIntegrityError, GlobalInstructionsError)
+    ):
+        deployer.rollback("forward-update-v2", "instruction-drift-rollback")
+    assert _tree(paths.codex_home) == instruction_drift
+    assert recovery["instructionDrift"] == (
+        "restore-exact-committed-block-preserve-surrounding-bytes-and-mode;"
+        "verify-before-deploy-or-rollback"
+    )
+    paths.agents_file.write_bytes(exact_agents[2])
+    paths.agents_file.chmod(exact_agents[1])
+    assert deployer.verify().verified is True
+
+    installed_reference = (
+        paths.installed_root / "references" / "global-rollout.md"
+    )
+    exact_installed_reference = _optional_file_state(installed_reference)
+    assert exact_installed_reference[2] is not None
+    installed_reference.write_bytes(
+        exact_installed_reference[2] + b"installed-drift\n"
+    )
+    installed_drift = _tree(paths.codex_home)
+    assert deployer.verify().state == "invalid"
+    with pytest.raises((DeploymentError, DeploymentIntegrityError)):
+        deployer.deploy(repository, "installed-drift-deploy")
+    with pytest.raises((DeploymentError, DeploymentIntegrityError)):
+        deployer.rollback("forward-update-v2", "installed-drift-rollback")
+    assert _tree(paths.codex_home) == installed_drift
+    assert recovery["installedDrift"] == (
+        "preserve-state-and-evidence;do-not-deploy-or-rollback;"
+        "escalate-reviewed-recovery"
+    )
+    installed_reference.write_bytes(exact_installed_reference[2])
+    installed_reference.chmod(exact_installed_reference[1])
+    assert deployer.verify().verified is True
+
+    paths.agents_file.write_bytes(b"user-after-update\n" + MANAGED_BLOCK)
+    paths.agents_file.chmod(0o600)
+    assert deployer.verify().verified is True
     rolled_back = deployer.rollback("forward-update-v2", "forward-rollback-v1")
     assert rolled_back.operation_id == "forward-rollback-v1"
     assert deployer.verify().operation_id == "forward-rollback-v1"
+    assert (
+        _normalized_release_tree(paths.installed_root, source=False) == v1_release
+    )
+    assert _optional_file_state(paths.agents_file) == v1_agents
 
     committed_source = release_note.read_bytes()
     release_note.write_bytes(committed_source + b"dirty-source\n")
@@ -882,16 +1091,4 @@ def test_forward_global_rollout_install_dry_run_update_rollback_and_drift_matrix
         deployer.plan(repository)
     release_note.write_bytes(committed_source)
 
-    exact_agents = paths.agents_file.read_bytes()
-    paths.agents_file.write_bytes(exact_agents.replace(b"observe", b"observe-drift", 1))
-    with pytest.raises((DeploymentError, DeploymentIntegrityError, GlobalInstructionsError)):
-        deployer.plan(repository)
-    paths.agents_file.write_bytes(exact_agents)
-    assert deployer.verify().verified is True
-
-    installed_reference = paths.installed_root / "references" / "global-rollout.md"
-    installed_reference.write_bytes(installed_reference.read_bytes() + b"installed-drift\n")
-    status = deployer.verify()
-    assert status.state == "invalid"
-    assert status.verified is False
     assert (_tree(provider), _tree(target), _tree(simulated_live)) == protected_before

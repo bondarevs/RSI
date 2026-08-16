@@ -54,8 +54,8 @@ options and environment variables cannot redirect them.
   },
   "recovery": {
     "invalidSource": "repair-or-commit-source-then-rerun-plan",
-    "installedDrift": "stop-trigger-and-preserve-bytes",
-    "instructionDrift": "restore-exact-managed-block-or-use-verified-rollback",
+    "installedDrift": "preserve-state-and-evidence;do-not-deploy-or-rollback;escalate-reviewed-recovery",
+    "instructionDrift": "restore-exact-committed-block-preserve-surrounding-bytes-and-mode;verify-before-deploy-or-rollback",
     "failedReverseExchange": "preserve-evidence-and-escalate-ambiguous",
     "ambiguousState": "do-not-retry-or-overwrite;preserve-and-investigate"
   }
@@ -167,12 +167,18 @@ make a check pass. Never delete an unexplained temporary inode.
 - Invalid source: keep the active deployment unchanged. Repair or deliberately
   commit the source, make the worktree exactly clean, and rerun `plan` before
   `deploy`.
-- Installed drift: stop treating the global trigger as available. Preserve the
-  installed bytes and deployment state, inspect with `verify`, and choose only
-  a clean verified redeploy or a verified rollback.
-- Instruction drift: preserve the user-owned prefix and suffix. Restore the
-  exact managed block only from a verified source, or use rollback when its
-  backup validates; do not normalize or reconstruct the complete file.
+- Installed drift: stop treating the global trigger as available and preserve
+  the complete installed tree, receipts, manifests, authorities, backups, and
+  filesystem identities as evidence. The current CLI deliberately rejects both
+  `deploy` and `rollback` while the active installation is unverified; neither
+  command is a repair path. Escalate to a separately reviewed explicit recovery
+  procedure. Do not overwrite, remove, or normalize the drifted bytes.
+- Instruction drift: `plan`, `deploy`, and `rollback` fail closed and do not
+  repair it. In a separately reviewed/manual safe procedure, restore only the
+  exact committed managed-block bytes while preserving every surrounding byte
+  and the exact existing safe file mode. Do not reconstruct or normalize the
+  complete file. Rerun `verify`; only after it reports a verified deployment may
+  the ordinary deploy or rollback workflow resume.
 - Failed reverse exchange: if an update failure cannot prove the old package
   and instruction bytes were restored, preserve both operands and all
   transaction evidence. Treat the state as ambiguous.

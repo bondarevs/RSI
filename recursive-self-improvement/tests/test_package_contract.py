@@ -92,8 +92,14 @@ def test_global_rollout_reference_is_a_closed_release_contract() -> None:
         },
         "recovery": {
             "invalidSource": "repair-or-commit-source-then-rerun-plan",
-            "installedDrift": "stop-trigger-and-preserve-bytes",
-            "instructionDrift": "restore-exact-managed-block-or-use-verified-rollback",
+            "installedDrift": (
+                "preserve-state-and-evidence;do-not-deploy-or-rollback;"
+                "escalate-reviewed-recovery"
+            ),
+            "instructionDrift": (
+                "restore-exact-committed-block-preserve-surrounding-bytes-and-mode;"
+                "verify-before-deploy-or-rollback"
+            ),
             "failedReverseExchange": "preserve-evidence-and-escalate-ambiguous",
             "ambiguousState": "do-not-retry-or-overwrite;preserve-and-investigate",
         },
