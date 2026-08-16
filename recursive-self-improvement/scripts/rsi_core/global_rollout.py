@@ -243,19 +243,102 @@ class DryRunAuthority:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class AttestedCatalogFile:
+    """One manifest-bound catalog file retained by a nofollow descriptor."""
+
+    relative_path: str
+    descriptor: int
+    payload_bytes: bytes
+    byte_length: int
+    executable: bool
+    digest: str
+    identity: tuple[int, int, int, int]
+
+    def verify(self) -> None:
+        try:
+            metadata = os.fstat(self.descriptor)
+            payload = _read_fd(self.descriptor, limit=16 * 1024 * 1024)
+        except (OSError, ValueError):
+            raise ValueError("attested catalog descriptor is unavailable") from None
+        identity = (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+        )
+        expected_mode = 0o700 if self.executable else 0o600
+        if (
+            identity != self.identity
+            or not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink not in {0, 1}
+            or len(payload) != self.byte_length
+            or payload != self.payload_bytes
+            or "sha256:" + hashlib.sha256(payload).hexdigest() != self.digest
+        ):
+            raise ValueError("attested catalog descriptor differs from its manifest")
+
+
+@dataclass(frozen=True, slots=True)
+class AttestedCatalogSurface:
+    """Exact catalog bytes and authority retained by a verified snapshot."""
+
+    installed_root: Path
+    authority_digest: str
+    files: tuple[AttestedCatalogFile, ...]
+
+    def _file(self, relative_path: str) -> AttestedCatalogFile:
+        matches = [item for item in self.files if item.relative_path == relative_path]
+        if len(matches) != 1:
+            raise ValueError("attested catalog member is unavailable")
+        return matches[0]
+
+    def verify(self) -> None:
+        if tuple(item.relative_path for item in self.files) != (
+            "SKILL.md",
+            "agents/openai.yaml",
+        ):
+            raise ValueError("attested catalog surface is incomplete")
+        for item in self.files:
+            item.verify()
+
+    def payload(self, relative_path: str) -> bytes:
+        item = self._file(relative_path)
+        item.verify()
+        return item.payload_bytes
+
+    def verified_locator(self, relative_path: str) -> Path:
+        self._file(relative_path)
+        return self.installed_root / relative_path
+
+
 @dataclass(slots=True)
 class AttestedPythonSnapshot:
-    """Open immutable-by-FD Python bytes from one fully verified deployment."""
+    """Open immutable-by-FD executable and catalog bytes from one deployment."""
 
     installed_root: Path
     root_fd: int
     records: dict[str, dict[str, object]]
+    catalog_files: tuple[AttestedCatalogFile, ...]
     file_fds: tuple[int, ...]
     source_repository: Path
     source_commit: str
     source_tree_digest: str
     authority_digest: str
     closed: bool = False
+
+    def catalog_surface(self) -> AttestedCatalogSurface:
+        if self.closed:
+            raise ValueError("attested catalog surface is unavailable")
+        surface = AttestedCatalogSurface(
+            installed_root=self.installed_root,
+            authority_digest=self.authority_digest,
+            files=self.catalog_files,
+        )
+        surface.verify()
+        return surface
 
     def close(self) -> None:
         if self.closed:
@@ -567,6 +650,40 @@ def attest_installed_snapshot(
                 "sha256": hashlib.sha256(payload).hexdigest(),
                 "path": relative,
             }
+        catalog_files: list[AttestedCatalogFile] = []
+        for relative in ("SKILL.md", "agents/openai.yaml"):
+            entry = entries.get(relative)
+            if entry is None:
+                raise ValueError("installed catalog surface is not manifested")
+            descriptor = _open_relative_file(root_fd, relative)
+            file_fds.append(descriptor)
+            payload = _read_fd(descriptor, limit=16 * 1024 * 1024)
+            metadata = os.fstat(descriptor)
+            expected_mode = 0o700 if entry.executable else 0o600
+            if (
+                len(payload) != entry.byte_length
+                or "sha256:" + hashlib.sha256(payload).hexdigest() != entry.digest
+                or stat.S_IMODE(metadata.st_mode) != expected_mode
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+            ):
+                raise ValueError("installed catalog surface differs from its manifest")
+            catalog_files.append(
+                AttestedCatalogFile(
+                    relative_path=relative,
+                    descriptor=descriptor,
+                    payload_bytes=payload,
+                    byte_length=entry.byte_length,
+                    executable=entry.executable,
+                    digest=entry.digest,
+                    identity=(
+                        metadata.st_dev,
+                        metadata.st_ino,
+                        metadata.st_mode,
+                        metadata.st_uid,
+                    ),
+                )
+            )
         named_after = os.stat(installed_root, follow_symlinks=False)
         opened_after = os.fstat(root_fd)
         identities = {
@@ -592,14 +709,15 @@ def attest_installed_snapshot(
             canonical_json_bytes(authority_fields)
         ).hexdigest()
         return AttestedPythonSnapshot(
-            installed_root,
-            root_fd,
-            records,
-            tuple(file_fds),
-            Path(manifest.source_repository),
-            manifest.source_commit,
-            manifest.source_tree_digest,
-            authority_digest,
+            installed_root=installed_root,
+            root_fd=root_fd,
+            records=records,
+            catalog_files=tuple(catalog_files),
+            file_fds=tuple(file_fds),
+            source_repository=Path(manifest.source_repository),
+            source_commit=manifest.source_commit,
+            source_tree_digest=manifest.source_tree_digest,
+            authority_digest=authority_digest,
         )
     except Exception:
         for descriptor in file_fds:
@@ -1201,10 +1319,21 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 def _capture_bounded(
-    process: subprocess.Popen[bytes], *, deadline_seconds: float = 30.0
+    process: subprocess.Popen[bytes],
+    *,
+    deadline_seconds: float = 30.0,
+    max_capture_bytes: int = _MAX_CAPTURE_BYTES,
+    context: str = "installed RSI dry run",
 ) -> tuple[int, bytes, bytes]:
+    if (
+        type(max_capture_bytes) is not int
+        or max_capture_bytes < 1
+        or type(context) is not str
+        or not context
+    ):
+        raise RuntimeError("bounded subprocess capture configuration is invalid")
     if process.stdout is None or process.stderr is None:
-        raise RuntimeError("dry-run subprocess pipes are unavailable")
+        raise RuntimeError(f"{context} subprocess pipes are unavailable")
     selector = selectors.DefaultSelector()
     streams = {process.stdout.fileno(): bytearray(), process.stderr.fileno(): bytearray()}
     os.set_blocking(process.stdout.fileno(), False)
@@ -1219,7 +1348,7 @@ def _capture_bounded(
             if remaining <= 0:
                 cleanup_attempted = True
                 _terminate_process_group(process)
-                raise RuntimeError("installed RSI dry run timed out")
+                raise RuntimeError(f"{context} timed out")
             events = selector.select(min(0.25, remaining))
             if not events and process.poll() is not None:
                 events = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
@@ -1232,16 +1361,26 @@ def _capture_bounded(
                     selector.unregister(key.fileobj)
                     continue
                 streams[key.fd].extend(chunk)
-                if sum(len(value) for value in streams.values()) > _MAX_CAPTURE_BYTES:
+                if sum(len(value) for value in streams.values()) > max_capture_bytes:
                     cleanup_attempted = True
                     _terminate_process_group(process)
-                    raise RuntimeError("installed RSI dry-run output exceeded its bound")
-        return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+                    raise RuntimeError(f"{context} output exceeded its bound")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            cleanup_attempted = True
+            _terminate_process_group(process)
+            raise RuntimeError(f"{context} timed out")
+        try:
+            return_code = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            cleanup_attempted = True
+            _terminate_process_group(process)
+            raise RuntimeError(f"{context} timed out") from None
         if _process_group_exists(process.pid, process):
             cleanup_attempted = True
             _terminate_process_group(process)
             raise RuntimeError(
-                "dry-run subprocess reported success with lingering descendants"
+                f"{context} reported success with lingering descendants"
             )
         return (
             return_code,

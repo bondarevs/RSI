@@ -47,6 +47,16 @@ client and a published client synchronize `skills/.system`. Therefore neither
 client may run with the live Codex home during a visibility probe. The safe
 probe projects only the two verified catalog inputs into per-client disposable
 homes and witnesses every live authority before and after the clients run.
+Those inputs are opened without following links during deployment attestation,
+matched to the active manifest, and retained by descriptor; projection writes
+only those attested bytes and never reopens an installed catalog pathname.
+Resolver and client processes run in new process groups with bounded streaming
+capture and TERM-to-KILL cleanup. Post-client deployment and live-witness
+comparisons are unconditional, including timeout, output, resolver, and client
+failure paths. Disposable homes fail closed on RSI/provider/deployment state
+outside the exact catalog projection and client-owned `skills/.system` subtree.
+Skills and target trees use the bounded nofollow protected-tree witness so
+supported symlink and special-file topology is witnessed rather than rejected.
 
 ## Decision
 
@@ -165,7 +175,12 @@ verified:
    the live `CODEX_HOME`. Each result records its client version, exactly one
    model-visible row, the projected locator, the verified live locator and
    catalog-surface digest that bind the projection, and absence of the skill
-   body. Latest-client resolution or execution failure keeps the gate closed.
+   body. Both inputs remain bound by nofollow descriptors to active manifest
+   entries throughout projection; no installed pathname is reopened. Resolver
+   and client output is bounded in flight, every process group is reaped after
+   timeout, output excess, failure, or lingering-child detection, and the final
+   live witness comparison always runs. Latest-client resolution or execution
+   failure keeps the gate closed with its exact stage/version error.
 4. The qualifying safe and qualifying no-finding cases still invoke only the
    verified installed snapshot in `observe + late-review`.
 5. Ordinary conversation, status questions, one-off facts, tasks without
@@ -175,7 +190,9 @@ verified:
    spies remain at zero calls.
 7. The full package, deployment, rollout, forward, adversarial, and repository
    test suite passes; the local/latest real-client mutation regression proves
-   `.system` synchronization is confined to disposable homes; and the skill
+   `.system` synchronization is confined to disposable homes, no disposable
+   RSI/provider state remains, and supported protected-tree symlink/special
+   topology is stable but drift-sensitive; and the skill
    validator, learning-ledger validator, installed-layout link, permission,
    unfinished-marker, compile, and diff checks pass.
 8. A fresh independent security/spec review approves the exact implementation

@@ -176,6 +176,15 @@ resolves `@openai/codex@latest`, records that version, and executes the exact
 resolved version. Internally, each client runs `codex debug prompt-input` only
 against its disposable catalog projection; client `.system` synchronization is
 discarded with that projection. Never run either client against the live `CODEX_HOME`.
+Both catalog inputs are opened without following links during attestation,
+matched to active manifest entries, retained by descriptor, and projected from
+those retained bytes without reopening installed paths. Resolver and client
+output is bounded while streaming; each command runs in a new process group
+that is terminated and reaped on timeout, excess output, failure, or lingering
+descendants. Deployment status and all live witnesses are compared even when a
+client fails. RSI/provider/deployment/event/observation/report state anywhere
+outside the exact disposable catalog projection and client-owned
+`skills/.system` subtree fails closed.
 
 The canonical result must report both clients and their exact versions, one
 `recursive-self-improvement` row per client, the model-visible projected

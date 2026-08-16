@@ -26,6 +26,42 @@ _MAX_CLIENT_OUTPUT_BYTES = 16 * 1024 * 1024
 _MAX_VERSION_CHARS = 160
 _CLIENT_TIMEOUT_SECONDS = 120
 _VERSION = re.compile(r"(?<![0-9])([0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?)")
+_STATE_NAMES = frozenset(
+    {
+        "deployment",
+        "deployments",
+        "event",
+        "events",
+        "events.jsonl",
+        "observation",
+        "observations",
+        "observations.jsonl",
+        "provider",
+        "provider-home",
+        "provider-ledger",
+        "report",
+        "reports",
+        "reports.jsonl",
+        "rsi",
+        "rsi-deployments-v1",
+        "rsi-state",
+    }
+)
+_STATE_PREFIXES = (
+    ".rsi-",
+    "deployment-",
+    "deployment_",
+    "event-",
+    "event_",
+    "observation-",
+    "observation_",
+    "provider-",
+    "provider_",
+    "report-",
+    "report_",
+    "rsi-",
+    "rsi_",
+)
 
 
 class CatalogProbeError(RuntimeError):
@@ -112,6 +148,53 @@ def _surface_digest(snapshot: tuple[tuple[str, int, int, str], ...]) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
+def _attested_surface_snapshot(surface: object) -> tuple[tuple[str, int, int, str], ...]:
+    try:
+        surface.verify()
+        files = surface.files
+    except (AttributeError, OSError, ValueError):
+        raise CatalogProbeError("attested catalog surface is unavailable") from None
+    rows: list[tuple[str, int, int, str]] = []
+    for item in files:
+        rows.append(
+            (
+                item.relative_path,
+                0o700 if item.executable else 0o600,
+                item.byte_length,
+                item.digest.removeprefix("sha256:"),
+            )
+        )
+    if tuple(row[0] for row in rows) != _CATALOG_FILES:
+        raise CatalogProbeError("attested catalog surface is incomplete")
+    return tuple(rows)
+
+
+def _write_private_file(path: Path, payload: bytes, *, executable: bool) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            0o700 if executable else 0o600,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("catalog projection write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+    except OSError:
+        raise CatalogProbeError("catalog surface projection failed") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
     rows: list[tuple[object, ...]] = []
     try:
@@ -154,6 +237,37 @@ def _change_count(
     left = {str(row[0]): row[1:] for row in before}
     right = {str(row[0]): row[1:] for row in after}
     return sum(left.get(path) != right.get(path) for path in left.keys() | right.keys())
+
+
+def _assert_no_unexpected_state(
+    snapshot: tuple[tuple[object, ...], ...],
+) -> None:
+    allowed_projection = {
+        "codex-home/skills",
+        "codex-home/skills/recursive-self-improvement",
+        "codex-home/skills/recursive-self-improvement/SKILL.md",
+        "codex-home/skills/recursive-self-improvement/agents",
+        "codex-home/skills/recursive-self-improvement/agents/openai.yaml",
+    }
+    for row in snapshot:
+        relative = str(row[0])
+        if relative == "." or relative in allowed_projection:
+            continue
+        if relative == "codex-home/skills/.system" or relative.startswith(
+            "codex-home/skills/.system/"
+        ):
+            continue
+        components = relative.split("/")
+        for component in components:
+            lowered = component.lower()
+            if (
+                lowered == "recursive-self-improvement"
+                or lowered in _STATE_NAMES
+                or lowered.startswith(_STATE_PREFIXES)
+            ):
+                raise CatalogProbeError(
+                    "catalog client created unexpected RSI or provider state"
+                )
 
 
 def _description(skill_payload: bytes) -> str:
@@ -216,27 +330,41 @@ def _run_client(
     environment: dict[str, str],
 ) -> subprocess.CompletedProcess[bytes]:
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             [*command, *arguments],
             cwd=run_root,
             env=environment,
-            check=False,
-            capture_output=True,
-            timeout=_CLIENT_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except OSError:
         raise CatalogProbeError("catalog client is unavailable") from None
-    if (
-        completed.returncode != 0
-        or len(completed.stdout) > _MAX_CLIENT_OUTPUT_BYTES
-        or len(completed.stderr) > _MAX_CLIENT_OUTPUT_BYTES
-    ):
-        raise CatalogProbeError("catalog client failed or exceeded its output bound")
-    return completed
+    try:
+        from .global_rollout import _capture_bounded
+
+        return_code, stdout_bytes, stderr_bytes = _capture_bounded(
+            process,
+            deadline_seconds=_CLIENT_TIMEOUT_SECONDS,
+            max_capture_bytes=_MAX_CLIENT_OUTPUT_BYTES,
+            context="catalog client",
+        )
+    except RuntimeError as error:
+        raise CatalogProbeError(str(error)) from None
+    if return_code != 0:
+        raise CatalogProbeError(f"catalog client failed with exit code {return_code}")
+    return subprocess.CompletedProcess(
+        args=[*command, *arguments],
+        returncode=return_code,
+        stdout=stdout_bytes,
+        stderr=stderr_bytes,
+    )
 
 
 def probe_catalog_client(
-    installed_root: Path,
+    catalog_surface: object,
     run_root: Path,
     *,
     command: tuple[str, ...],
@@ -252,42 +380,46 @@ def probe_catalog_client(
         or re.fullmatch(r"[a-z][a-z0-9-]{0,31}", client_name) is None
     ):
         raise CatalogProbeError("catalog client descriptor is invalid")
-    if not isinstance(installed_root, Path) or not isinstance(run_root, Path):
-        raise CatalogProbeError("catalog probe roots must be Paths")
-    installed_root = Path(os.path.abspath(installed_root))
+    from .global_rollout import AttestedCatalogSurface
+
+    if type(catalog_surface) is not AttestedCatalogSurface or not isinstance(
+        run_root, Path
+    ):
+        raise CatalogProbeError("catalog probe requires an attested surface and Path root")
+    installed_root = Path(os.path.abspath(catalog_surface.installed_root))
     run_root = Path(os.path.abspath(run_root))
-    try:
-        installed_metadata = os.lstat(installed_root)
-    except OSError:
-        raise CatalogProbeError("verified installed package is unavailable") from None
-    if not stat.S_ISDIR(installed_metadata.st_mode) or run_root.exists():
-        raise CatalogProbeError("catalog probe requires a real package and fresh run root")
-    canonical_installed = installed_root.resolve(strict=True)
+    if run_root.exists():
+        raise CatalogProbeError("catalog probe requires a fresh run root")
     canonical_parent = run_root.parent.resolve(strict=True)
     canonical_run = canonical_parent / run_root.name
     if (
-        canonical_run == canonical_installed
-        or canonical_run in canonical_installed.parents
-        or canonical_installed in canonical_run.parents
+        canonical_run == installed_root
+        or canonical_run in installed_root.parents
+        or installed_root in canonical_run.parents
     ):
         raise CatalogProbeError("catalog probe roots overlap")
 
-    surface_before = _surface_snapshot(canonical_installed)
+    surface_before = _attested_surface_snapshot(catalog_surface)
     surface_digest = _surface_digest(surface_before)
-    skill_payload = (canonical_installed / "SKILL.md").read_bytes()
+    try:
+        skill_payload = catalog_surface.payload("SKILL.md")
+    except ValueError:
+        raise CatalogProbeError("attested SKILL.md is unavailable") from None
     description = _description(skill_payload)
 
     canonical_run.mkdir(mode=0o700)
     codex_home = canonical_run / "codex-home"
     projected = codex_home / "skills" / "recursive-self-improvement"
     (projected / "agents").mkdir(parents=True, mode=0o700)
-    for relative in _CATALOG_FILES:
-        source = canonical_installed / relative
-        destination = projected / relative
-        shutil.copy2(source, destination, follow_symlinks=False)
+    for item in catalog_surface.files:
+        _write_private_file(
+            projected / item.relative_path,
+            item.payload_bytes,
+            executable=item.executable,
+        )
     projected_before = _surface_snapshot(projected)
-    client_home_before = _tree_snapshot(codex_home)
     environment = _client_environment(canonical_run, codex_home)
+    disposable_before = _tree_snapshot(canonical_run)
 
     version_result = _run_client(
         command,
@@ -340,37 +472,39 @@ def probe_catalog_client(
         raise CatalogProbeError("catalog client injected the RSI skill body")
 
     projected_after = _surface_snapshot(projected)
-    surface_after = _surface_snapshot(canonical_installed)
+    surface_after = _attested_surface_snapshot(catalog_surface)
     if projected_after != projected_before or surface_after != surface_before:
         raise CatalogProbeError("catalog probe changed a catalog surface")
-    isolated_changes = _change_count(
-        client_home_before,
-        _tree_snapshot(codex_home),
-    )
+    disposable_after = _tree_snapshot(canonical_run)
+    _assert_no_unexpected_state(disposable_after)
+    isolated_changes = _change_count(disposable_before, disposable_after)
     return CatalogClientResult(
         client_name=client_name,
         version=version,
         catalog_entry_count=1,
         model_locator=expected_locator,
-        verified_locator=canonical_installed / "SKILL.md",
+        verified_locator=catalog_surface.verified_locator("SKILL.md"),
         catalog_surface_digest=surface_digest,
         isolated_home_change_count=isolated_changes,
         skill_body_absent=True,
     )
 
 
-def _latest_command(npx: str, root: Path) -> tuple[str, ...]:
+def _latest_command(npx: str, root: Path) -> tuple[tuple[str, ...], str]:
     resolver = root / "latest-resolver"
     resolver.mkdir(mode=0o700)
     codex_home = resolver / "codex-home"
     codex_home.mkdir(mode=0o700)
     environment = _client_environment(resolver, codex_home)
-    completed = _run_client(
-        (npx, "--yes", "@openai/codex@latest"),
-        ("--version",),
-        run_root=resolver,
-        environment=environment,
-    )
+    try:
+        completed = _run_client(
+            (npx, "--yes", "@openai/codex@latest"),
+            ("--version",),
+            run_root=resolver,
+            environment=environment,
+        )
+    except CatalogProbeError as error:
+        raise CatalogProbeError(f"latest Codex resolution failed: {error}") from None
     try:
         rendered = completed.stdout.decode("utf-8").strip()
     except UnicodeDecodeError:
@@ -378,33 +512,46 @@ def _latest_command(npx: str, root: Path) -> tuple[str, ...]:
     matches = _VERSION.findall(rendered)
     if len(matches) != 1:
         raise CatalogProbeError("latest Codex version cannot be pinned exactly")
-    return (npx, "--yes", f"@openai/codex@{matches[0]}")
+    _assert_no_unexpected_state(_tree_snapshot(resolver))
+    return (npx, "--yes", f"@openai/codex@{matches[0]}"), matches[0]
 
 
 def _live_witness(authority: object) -> tuple[object, ...]:
     from .global_rollout import (
         _capture_optional_path_witness,
+        _capture_protected_tree_witness,
         _capture_repository_witness,
     )
 
     paths = authority.deployment_paths
-    protected_paths = (
+    protected_trees = (
         paths.skills_root,
+        *authority.target_roots,
+    )
+    strict_paths = (
+        paths.installed_root,
         paths.agents_file,
         paths.state_root,
         authority.provider_home,
         authority.provider_ledger,
-        *authority.target_roots,
     )
-    unique: list[Path] = []
-    for path in protected_paths:
-        if path not in unique:
-            unique.append(path)
+    unique_trees: list[Path] = []
+    for path in protected_trees:
+        if path not in unique_trees:
+            unique_trees.append(path)
+    unique_strict: list[Path] = []
+    for path in strict_paths:
+        if path not in unique_strict:
+            unique_strict.append(path)
     return (
         _capture_repository_witness(authority.source_repository),
         *(
+            (os.fspath(path), _capture_protected_tree_witness(path))
+            for path in unique_trees
+        ),
+        *(
             _capture_optional_path_witness(path, label="catalog probe protected root")
-            for path in unique
+            for path in unique_strict
         ),
     )
 
@@ -413,7 +560,7 @@ def run_live_catalog_probe() -> CatalogProbeReport:
     """Verify live authority and run mandatory local/latest isolated probes."""
 
     from .deployment import GlobalRsiDeployer
-    from .global_rollout import DryRunAuthority
+    from .global_rollout import DryRunAuthority, attest_installed_snapshot
 
     local = shutil.which("codex")
     npx = shutil.which("npx")
@@ -431,27 +578,60 @@ def run_live_catalog_probe() -> CatalogProbeReport:
     ):
         raise CatalogProbeError("live RSI deployment is not verified")
     witness_before = _live_witness(authority)
-    with tempfile.TemporaryDirectory(prefix="rsi-catalog-probe-") as raw_root:
-        root = Path(raw_root).resolve(strict=True)
-        latest = _latest_command(npx, root)
-        clients = (
-            probe_catalog_client(
-                authority.deployment_paths.installed_root,
+    snapshot = None
+    clients: tuple[CatalogClientResult, ...] | None = None
+    primary_error: Exception | None = None
+    try:
+        snapshot = attest_installed_snapshot(
+            authority.deployment_paths.installed_root,
+            deployer,
+        )
+        catalog_surface = snapshot.catalog_surface()
+        with tempfile.TemporaryDirectory(prefix="rsi-catalog-probe-") as raw_root:
+            root = Path(raw_root).resolve(strict=True)
+            latest, latest_version = _latest_command(npx, root)
+            local_result = probe_catalog_client(
+                catalog_surface,
                 root / "local",
                 command=(local,),
                 client_name="local",
-            ),
-            probe_catalog_client(
-                authority.deployment_paths.installed_root,
+            )
+            latest_result = probe_catalog_client(
+                catalog_surface,
                 root / "latest",
                 command=latest,
                 client_name="latest",
-            ),
+            )
+            if _VERSION.findall(latest_result.version) != [latest_version]:
+                raise CatalogProbeError(
+                    "latest Codex execution version differs from its exact pin"
+                )
+            clients = (local_result, latest_result)
+    except Exception as error:
+        primary_error = error
+    comparison_error: Exception | None = None
+    status_after = None
+    witness_after = None
+    try:
+        status_after = deployer.verify()
+        witness_after = _live_witness(authority)
+    except Exception as error:
+        comparison_error = error
+    finally:
+        if snapshot is not None:
+            snapshot.close()
+    if (
+        comparison_error is not None
+        or status_after != status_before
+        or witness_after != witness_before
+    ):
+        raise CatalogProbeError("catalog probe changed a protected live witness") from (
+            primary_error if primary_error is not None else comparison_error
         )
-    status_after = deployer.verify()
-    witness_after = _live_witness(authority)
-    if status_after != status_before or witness_after != witness_before:
-        raise CatalogProbeError("catalog probe changed a protected live witness")
+    if primary_error is not None:
+        raise primary_error
+    if clients is None:
+        raise CatalogProbeError("catalog clients did not complete")
     return CatalogProbeReport(
         clients=clients,
         deployment_operation_id=status_before.operation_id,

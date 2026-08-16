@@ -11,10 +11,12 @@ import stat
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
 import rsi_deploy
+import rsi_core.catalog_probe as catalog_probe_module
 import rsi_core.deployment as deployment_module
 import rsi_core.global_rollout as rollout_module
 from rsi_core.deployment import (
@@ -256,6 +258,31 @@ def _genuine_install(tmp_path: Path) -> tuple[Path, GlobalRsiDeployer, Path, Dry
         target_roots=(target,),
     )
     return repo, deployer, paths.installed_root, authority
+
+
+def _write_fake_catalog_client(
+    path: Path,
+    *,
+    state_statement: str,
+) -> tuple[str, ...]:
+    path.write_text(
+        "\n".join(
+            (
+                "import json, os, pathlib, sys",
+                "if sys.argv[1:] == ['--version']:",
+                "    print('codex-cli 9.9.9')",
+                "    raise SystemExit(0)",
+                state_statement,
+                "skill = pathlib.Path(os.environ['CODEX_HOME']) / 'skills/recursive-self-improvement/SKILL.md'",
+                "text = skill.read_text()",
+                "description = [line.removeprefix('description: ') for line in text.splitlines() if line.startswith('description: ')][0]",
+                "rendered = '### Available skills\\n- recursive-self-improvement: ' + description + ' (file: ' + str(skill) + ')'",
+                "print(json.dumps([{'content': [{'type': 'input_text', 'text': rendered}]}]))",
+            )
+        ),
+        encoding="utf-8",
+    )
+    return (sys.executable, os.fspath(path))
 
 
 def _genuine_live_install(
@@ -1767,6 +1794,243 @@ def test_catalog_probe_entry_point_executes_only_from_attested_installed_bytes(
         assert tuple(descriptors) == snapshot.file_fds
     finally:
         snapshot.close()
+
+
+def test_catalog_surface_is_manifest_bound_and_retained_by_descriptor(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, installed, _authority = _genuine_install(tmp_path)
+    original_skill = (installed / "SKILL.md").read_bytes()
+    original_metadata = (installed / "agents/openai.yaml").read_bytes()
+    snapshot = attest_installed_snapshot(installed, deployer)
+    replacement = installed / "replacement-skill.md"
+    replacement.write_bytes(
+        original_skill.replace(
+            b"description: Use only during or after",
+            b"description: TAMPERED after verification; use only during or after",
+            1,
+        )
+    )
+    replacement.chmod(0o600)
+    os.replace(replacement, installed / "SKILL.md")
+    try:
+        surface = snapshot.catalog_surface()
+        assert surface.installed_root == installed
+        assert surface.authority_digest == snapshot.authority_digest
+        assert surface.payload("SKILL.md") == original_skill
+        assert surface.payload("agents/openai.yaml") == original_metadata
+        assert surface.verified_locator("SKILL.md") == installed / "SKILL.md"
+    finally:
+        snapshot.close()
+
+
+def test_catalog_projection_copies_attested_bytes_not_reopened_path(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, installed, _authority = _genuine_install(tmp_path / "install")
+    original_skill = (installed / "SKILL.md").read_bytes()
+    snapshot = attest_installed_snapshot(installed, deployer)
+    replacement = installed / "replacement-skill.md"
+    replacement.write_bytes(
+        original_skill.replace(
+            b"description: Use only during or after",
+            b"description: TAMPERED after verification; use only during or after",
+            1,
+        )
+    )
+    replacement.chmod(0o600)
+    os.replace(replacement, installed / "SKILL.md")
+    client = tmp_path / "catalog-client.py"
+    client.write_text(
+        "\n".join(
+            (
+                "import json, os, pathlib, sys",
+                "if sys.argv[1:] == ['--version']:",
+                "    print('codex-cli 9.9.9')",
+                "    raise SystemExit(0)",
+                "skill = pathlib.Path(os.environ['CODEX_HOME']) / 'skills/recursive-self-improvement/SKILL.md'",
+                "text = skill.read_text()",
+                "description = [line.removeprefix('description: ') for line in text.splitlines() if line.startswith('description: ')][0]",
+                "rendered = '### Available skills\\n- recursive-self-improvement: ' + description + ' (file: ' + str(skill) + ')'",
+                "print(json.dumps([{'content': [{'type': 'input_text', 'text': rendered}]}]))",
+            )
+        ),
+        encoding="utf-8",
+    )
+    try:
+        result = catalog_probe_module.probe_catalog_client(
+            snapshot.catalog_surface(),
+            tmp_path / "run",
+            command=(sys.executable, os.fspath(client)),
+            client_name="local",
+        )
+        assert result.catalog_entry_count == 1
+        assert "TAMPERED" not in result.catalog_surface_digest
+        assert result.verified_locator == installed / "SKILL.md"
+    finally:
+        snapshot.close()
+
+
+def test_catalog_probe_rejects_rsi_state_created_in_disposable_client_space(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, _installed, _authority = _genuine_install(tmp_path / "install")
+    snapshot = attest_installed_snapshot(deployer.paths.installed_root, deployer)
+    command = _write_fake_catalog_client(
+        tmp_path / "stateful-client.py",
+        state_statement=(
+            "state = pathlib.Path(os.environ['HOME']) / 'rsi-deployments-v1'; "
+            "state.mkdir(); (state / 'events.jsonl').write_text('{}\\n')"
+        ),
+    )
+    try:
+        with pytest.raises(
+            catalog_probe_module.CatalogProbeError,
+            match="unexpected RSI or provider state",
+        ):
+            catalog_probe_module.probe_catalog_client(
+                snapshot.catalog_surface(),
+                tmp_path / "run",
+                command=command,
+                client_name="local",
+            )
+    finally:
+        snapshot.close()
+
+
+def test_catalog_probe_allows_benign_client_system_synchronization(
+    tmp_path: Path,
+) -> None:
+    _repo, deployer, _installed, _authority = _genuine_install(tmp_path / "install")
+    snapshot = attest_installed_snapshot(deployer.paths.installed_root, deployer)
+    command = _write_fake_catalog_client(
+        tmp_path / "system-sync-client.py",
+        state_statement=(
+            "state = pathlib.Path(os.environ['CODEX_HOME']) / 'skills/.system/client-owned'; "
+            "state.mkdir(parents=True); (state / 'cache.json').write_text('{}\\n')"
+        ),
+    )
+    try:
+        result = catalog_probe_module.probe_catalog_client(
+            snapshot.catalog_surface(),
+            tmp_path / "run",
+            command=command,
+            client_name="local",
+        )
+        assert result.catalog_entry_count == 1
+        assert result.isolated_home_change_count > 0
+    finally:
+        snapshot.close()
+
+
+def test_catalog_probe_compares_live_witness_after_client_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _repo, _deployer, _installed, authority = _genuine_install(tmp_path)
+    drifted = False
+    witness_calls: list[bool] = []
+
+    def capture_witness(_authority: object) -> tuple[object, ...]:
+        witness_calls.append(drifted)
+        return ("protected", drifted)
+
+    def fail_latest(_npx: str, _root: Path) -> tuple[str, ...]:
+        nonlocal drifted
+        drifted = True
+        raise catalog_probe_module.CatalogProbeError("simulated resolver failure")
+
+    monkeypatch.setattr(
+        rollout_module.DryRunAuthority,
+        "live",
+        classmethod(lambda cls: authority),
+    )
+    monkeypatch.setattr(
+        catalog_probe_module.shutil,
+        "which",
+        lambda name: f"/synthetic/{name}",
+    )
+    monkeypatch.setattr(catalog_probe_module, "_live_witness", capture_witness)
+    monkeypatch.setattr(catalog_probe_module, "_latest_command", fail_latest)
+
+    with pytest.raises(
+        catalog_probe_module.CatalogProbeError,
+        match="changed a protected live witness",
+    ):
+        catalog_probe_module.run_live_catalog_probe()
+    assert witness_calls == [False, True]
+
+
+def _catalog_witness_authority(tmp_path: Path) -> SimpleNamespace:
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    (skills_root / "regular.txt").write_bytes(b"skills\n")
+    installed_root = skills_root / "recursive-self-improvement"
+    installed_root.mkdir()
+    (installed_root / "SKILL.md").write_bytes(b"installed\n")
+    os.symlink("regular.txt", skills_root / "link")
+    os.mkfifo(skills_root / "client.pipe", 0o600)
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    (target_root / "regular.txt").write_bytes(b"target\n")
+    os.symlink("regular.txt", target_root / "link")
+    os.mkfifo(target_root / "target.pipe", 0o600)
+    agents_file = tmp_path / "AGENTS.md"
+    agents_file.write_bytes(b"agents\n")
+    state_root = tmp_path / "deployment-state"
+    state_root.mkdir()
+    provider_home = tmp_path / "provider"
+    provider_home.mkdir()
+    provider_ledger = provider_home / "learning.jsonl"
+    provider_ledger.write_bytes(b"")
+    return SimpleNamespace(
+        deployment_paths=SimpleNamespace(
+            skills_root=skills_root,
+            installed_root=installed_root,
+            agents_file=agents_file,
+            state_root=state_root,
+        ),
+        provider_home=provider_home,
+        provider_ledger=provider_ledger,
+        source_repository=tmp_path / "source",
+        target_roots=(target_root,),
+    )
+
+
+def test_catalog_live_witness_supports_protected_symlink_and_special_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = _catalog_witness_authority(tmp_path)
+    monkeypatch.setattr(
+        rollout_module,
+        "_capture_repository_witness",
+        lambda _root: ("source",),
+    )
+
+    first = catalog_probe_module._live_witness(authority)
+    second = catalog_probe_module._live_witness(authority)
+
+    assert first == second
+
+
+def test_catalog_live_witness_detects_supported_topology_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    authority = _catalog_witness_authority(tmp_path)
+    monkeypatch.setattr(
+        rollout_module,
+        "_capture_repository_witness",
+        lambda _root: ("source",),
+    )
+    before = catalog_probe_module._live_witness(authority)
+    skills_root = authority.deployment_paths.skills_root
+    (skills_root / "link").unlink()
+    os.symlink("different-target", skills_root / "link")
+    (skills_root / "client.pipe").unlink()
+    (skills_root / "client.pipe").write_bytes(b"no longer special\n")
+
+    after = catalog_probe_module._live_witness(authority)
+
+    assert after != before
 
 
 def test_ordinary_installed_process_cannot_spoof_event_clock_with_environment(

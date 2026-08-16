@@ -23,6 +23,12 @@
   home. Client `.system` synchronization is confined and discarded, while all
   live RSI, provider, target, deployment, global-instruction, and source
   witnesses must remain exact.
+- Both catalog inputs are retained by nofollow descriptors, checked against the
+  active deployment manifest, and projected from attested bytes without a
+  pathname reopen. Resolver/client output is bounded in flight; each command
+  runs in a new process group that is reaped on every exit path. Final live
+  witness comparison is unconditional. Disposable RSI/provider/deployment
+  state outside the exact projection and `skills/.system` fails closed.
 - All code changes follow RED → GREEN → relevant regression → full-suite verification and are committed separately from review fixes.
 - Stop after each task's tests, review, report, and commit are complete; do not begin the next task with a provisional failure or open finding.
 - Preserve the existing untracked `uv.lock` and `__pycache__` directories; never stage or delete them as part of this plan.
@@ -716,7 +722,14 @@ PYTHONDONTWRITEBYTECODE=1 python3 \
 The probe uses the installed local `codex`, resolves
 `@openai/codex@latest`, records its version, and then runs that exact resolved
 version. It invokes `debug prompt-input` only inside the disposable homes. The
-canonical result must require for both clients:
+two catalog inputs must remain bound to the active manifest by retained
+nofollow descriptors; projection must copy their retained bytes without
+reopening either installed pathname. Version resolution and both client runs
+must use bounded streaming capture in new process groups, terminate the whole
+group on timeout/output excess, reject lingering descendants, and reap the
+leader. Deployment status and every live witness must be compared in an
+unconditional failure-path cleanup. The canonical result must require for both
+clients:
 
 - `### Available skills` is present;
 - exactly one `- recursive-self-improvement:` catalog entry is present;
@@ -728,9 +741,14 @@ canonical result must require for both clients:
 - the installed package, source repository, provider, target, deployment, and
   global-instruction witnesses are unchanged after both probes.
 
-Client-created `.system` rows are allowed only inside their disposable homes
-and are deleted with those homes. Direct `codex debug prompt-input` or
-`npx ... debug prompt-input` against the live `CODEX_HOME` is forbidden.
+Client-created `.system` rows are allowed only below the disposable
+`CODEX_HOME/skills/.system` subtree and are deleted with those homes. Any
+RSI/provider/deployment/event/observation/report state elsewhere in disposable
+`HOME`, `CODEX_HOME`, temporary, or npm-cache space fails the probe. Skills and
+target roots use the bounded nofollow protected-tree witness so supported
+symlink/special topology is accepted but any drift fails. Direct
+`codex debug prompt-input` or `npx ... debug prompt-input` against the live
+`CODEX_HOME` is forbidden.
 
 If network access prevents latest-version resolution or exact execution, the
 probe exits nonzero. Do not weaken the gate or call the rollout complete;
