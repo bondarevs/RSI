@@ -1398,6 +1398,15 @@ def _capture_ignored_inventory(
 
     def pin_directory(parent_fd: int, name: str, expected: tuple[int, ...]) -> int:
         descriptor: int | None = None
+
+        def close_registered() -> None:
+            if descriptor is not None and descriptor in open_descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                open_descriptors.remove(descriptor)
+
         try:
             descriptor = os.open(
                 name,
@@ -1407,15 +1416,19 @@ def _capture_ignored_inventory(
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=parent_fd,
             )
+            open_descriptors.add(descriptor)
             opened = os.fstat(descriptor)
         except OSError:
-            if descriptor is not None:
-                os.close(descriptor)
+            close_registered()
             raise ValueError("ignored repository directory cannot be pinned") from None
-        if _ignored_stat_signature(opened) != expected:
-            os.close(descriptor)
-            raise ValueError("ignored repository directory changed while opening")
-        open_descriptors.add(descriptor)
+        try:
+            identity_matches = _ignored_stat_signature(opened) == expected
+        except OSError:
+            close_registered()
+            raise ValueError("ignored repository directory cannot be pinned") from None
+        if not identity_matches:
+            close_registered()
+            raise ValueError("ignored repository directory identity changed while opening")
         return descriptor
 
     def enumerate_children(
@@ -1482,31 +1495,20 @@ def _capture_ignored_inventory(
                         named = os.stat(
                             component, dir_fd=parent_fd, follow_symlinks=False
                         )
-                        child_fd = os.open(
+                        if not stat.S_ISDIR(named.st_mode):
+                            raise ValueError("ancestry member is not a directory")
+                        child_fd = pin_directory(
+                            parent_fd,
                             component,
-                            os.O_RDONLY
-                            | getattr(os, "O_DIRECTORY", 0)
-                            | getattr(os, "O_NOFOLLOW", 0)
-                            | getattr(os, "O_CLOEXEC", 0),
-                            dir_fd=parent_fd,
+                            _ignored_stat_signature(named),
                         )
-                    except OSError:
+                    except (OSError, ValueError):
                         raise ValueError(
                             "ignored repository root ancestry is unsafe"
                         ) from None
-                    if (
-                        not stat.S_ISDIR(named.st_mode)
-                        or _ignored_stat_signature(os.fstat(child_fd))
-                        != _ignored_stat_signature(named)
-                    ):
-                        os.close(child_fd)
-                        raise ValueError(
-                            "ignored repository root ancestry changed while opening"
-                        )
                     os.close(parent_fd)
                     open_descriptors.remove(parent_fd)
                     parent_fd = child_fd
-                    open_descriptors.add(parent_fd)
                 try:
                     root_metadata = os.stat(
                         parts[-1], dir_fd=parent_fd, follow_symlinks=False

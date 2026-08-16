@@ -1052,6 +1052,84 @@ def test_ignored_directory_pin_fstat_failure_closes_open_descriptor(
     assert after == before
 
 
+@pytest.mark.parametrize("component", ["outer", "middle"])
+@pytest.mark.parametrize("fault", ["stat", "open", "fstat", "signature"])
+def test_nested_ignored_root_ancestry_faults_are_bounded_and_close_each_fd_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+    fault: str,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / "outer" / "middle" / "ignored").mkdir(parents=True)
+    fd_root = Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    before = {entry.name for entry in fd_root.iterdir()}
+    real_open = os.open
+    real_close = os.close
+    real_stat = os.stat
+    real_fstat = os.fstat
+    real_signature = rollout_module._ignored_stat_signature
+    ancestry_fds: dict[int, str] = {}
+    opened_stats: dict[int, os.stat_result] = {}
+    close_counts: dict[int, int] = {}
+
+    def injected_open(path: object, flags: int, *args: object, **kwargs: object):
+        if (
+            fault == "open"
+            and path == component
+            and kwargs.get("dir_fd") is not None
+        ):
+            raise OSError("injected ancestry open failure")
+        descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+        if type(path) is str and path in {"outer", "middle"}:
+            ancestry_fds[descriptor] = path
+        return descriptor
+
+    def injected_stat(path: object, *args: object, **kwargs: object):
+        if (
+            fault == "stat"
+            and path == component
+            and kwargs.get("dir_fd") is not None
+        ):
+            raise OSError("injected ancestry stat failure")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    def injected_fstat(descriptor: int):
+        if fault == "fstat" and ancestry_fds.get(descriptor) == component:
+            raise OSError("injected ancestry fstat failure")
+        result = real_fstat(descriptor)
+        if ancestry_fds.get(descriptor) == component:
+            opened_stats[descriptor] = result
+        return result
+
+    def injected_signature(value: os.stat_result):
+        if fault == "signature" and any(value is item for item in opened_stats.values()):
+            raise OSError("injected ancestry identity failure")
+        return real_signature(value)
+
+    def counted_close(descriptor: int) -> None:
+        if descriptor in ancestry_fds:
+            close_counts[descriptor] = close_counts.get(descriptor, 0) + 1
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "open", injected_open)
+    monkeypatch.setattr(os, "stat", injected_stat)
+    monkeypatch.setattr(os, "fstat", injected_fstat)
+    monkeypatch.setattr(os, "close", counted_close)
+    monkeypatch.setattr(
+        rollout_module, "_ignored_stat_signature", injected_signature
+    )
+
+    with pytest.raises(ValueError, match="ancestry"):
+        rollout_module._capture_ignored_inventory(
+            repo, b"!! outer/middle/ignored/\0"
+        )
+
+    after = {entry.name for entry in fd_root.iterdir()}
+    assert after == before
+    assert close_counts == {descriptor: 1 for descriptor in ancestry_fds}
+
+
 @pytest.mark.parametrize(
     ("constant", "match"),
     [
