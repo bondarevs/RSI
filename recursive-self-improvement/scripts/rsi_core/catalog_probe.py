@@ -27,6 +27,9 @@ _MAX_VERSION_CHARS = 160
 _CLIENT_TIMEOUT_SECONDS = 120
 _MAX_CLIENT_TREE_ENTRIES = 100_000
 _MAX_CLIENT_TREE_PATH_BYTES = 16 * 1024 * 1024
+_MAX_CLIENT_TREE_NAME_BYTES = 8 * 1024 * 1024
+_MAX_CLIENT_TREE_METADATA_BYTES = 16 * 1024 * 1024
+_MAX_CLIENT_TREE_SYMLINK_BYTES = 4 * 1024 * 1024
 _MAX_CLIENT_TREE_DEPTH = 128
 _MAX_CLIENT_TREE_FILE_BYTES = 256 * 1024 * 1024
 _MAX_CLIENT_TREE_TOTAL_FILE_BYTES = 1024 * 1024 * 1024
@@ -209,111 +212,475 @@ def _write_private_file(path: Path, payload: bytes, *, executable: bool) -> None
             os.close(descriptor)
 
 
-def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
-    rows: list[tuple[object, ...]] = []
-    paths = [root]
-    path_bytes = len(os.fsencode("."))
+def _tree_metadata_signature(metadata: os.stat_result) -> tuple[int, ...]:
     try:
-        for path in root.rglob("*"):
-            relative_path = path.relative_to(root)
-            encoded = os.fsencode(relative_path)
-            if len(paths) + 1 > _MAX_CLIENT_TREE_ENTRIES:
-                raise CatalogProbeError("isolated client tree entry bound exceeded")
-            if path_bytes + len(encoded) > _MAX_CLIENT_TREE_PATH_BYTES:
-                raise CatalogProbeError("isolated client tree path bound exceeded")
-            if len(relative_path.parts) > _MAX_CLIENT_TREE_DEPTH:
-                raise CatalogProbeError("isolated client tree depth bound exceeded")
-            paths.append(path)
-            path_bytes += len(encoded)
-        ordered = sorted(paths, key=lambda path: os.fsencode(path.relative_to(root)))
-    except CatalogProbeError:
-        raise
-    except OSError:
-        raise CatalogProbeError("isolated client home cannot be enumerated") from None
+        signature = (
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_gid,
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_nlink,
+            metadata.st_rdev,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+    except (AttributeError, OverflowError):
+        raise CatalogProbeError("isolated client tree metadata is invalid") from None
+    if any(type(item) is not int for item in signature):
+        raise CatalogProbeError("isolated client tree metadata is invalid")
+    return signature
+
+
+def _tree_entry_kind(mode: int) -> str:
+    if stat.S_ISREG(mode):
+        return "regular"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISFIFO(mode):
+        return "fifo"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISCHR(mode):
+        return "character-device"
+    if stat.S_ISBLK(mode):
+        return "block-device"
+    return "special"
+
+
+def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
+    """Capture one bounded descriptor-relative nofollow disposable-tree witness."""
+
+    if not isinstance(root, Path):
+        raise CatalogProbeError("isolated client root must be a Path")
+    root = Path(os.path.abspath(root))
+    from .global_rollout import _pin_canonical_protected_path
+
+    try:
+        pinned_root = _pin_canonical_protected_path(
+            root,
+            label="isolated client root",
+            require_directory=True,
+        )
+    except (OSError, OverflowError, ValueError):
+        raise CatalogProbeError("isolated client root cannot be pinned") from None
+
+    rows: list[tuple[object, ...]] = []
+    seen: set[str] = set()
+    path_bytes = 0
+    name_bytes = 0
+    metadata_bytes = 0
+    symlink_bytes = 0
     total_file_bytes = 0
-    for path in ordered:
+    open_descriptors: set[int] = set()
+    metadata_record_bytes = 10 * 8
+
+    def close_registered(descriptor: int) -> None:
+        if descriptor not in open_descriptors:
+            return
         try:
-            metadata = os.lstat(path)
+            os.close(descriptor)
         except OSError:
-            raise CatalogProbeError("isolated client home changed while scanning") from None
-        relative = "." if path == root else path.relative_to(root).as_posix()
-        mode = stat.S_IMODE(metadata.st_mode)
-        if stat.S_ISREG(metadata.st_mode):
-            total_file_bytes += metadata.st_size
+            pass
+        open_descriptors.remove(descriptor)
+
+    def require_signature(
+        metadata: os.stat_result,
+        expected: tuple[int, ...],
+        *,
+        context: str,
+    ) -> None:
+        if _tree_metadata_signature(metadata) != expected:
+            raise CatalogProbeError(
+                f"isolated client tree {context} identity changed"
+            )
+
+    def preflight_name(
+        relative: str,
+        name: str,
+        depth: int,
+    ) -> tuple[bytes, bytes]:
+        if relative in seen:
+            raise CatalogProbeError("isolated client tree contains a duplicate entry")
+        is_root = relative == "." and name == "." and depth == 0
+        if (
+            type(name) is not str
+            or not name
+            or (name in {".", ".."} and not is_root)
+            or "/" in name
+            or "\x00" in name
+        ):
+            raise CatalogProbeError("isolated client tree entry name is invalid")
+        try:
+            encoded_relative = os.fsencode(relative)
+            encoded_name = os.fsencode(name)
+        except (TypeError, UnicodeError, ValueError):
+            raise CatalogProbeError("isolated client tree entry name is invalid") from None
+        if len(seen) + 1 > _MAX_CLIENT_TREE_ENTRIES:
+            raise CatalogProbeError("isolated client tree entry bound exceeded")
+        if depth > _MAX_CLIENT_TREE_DEPTH:
+            raise CatalogProbeError("isolated client tree depth bound exceeded")
+        if path_bytes + len(encoded_relative) > _MAX_CLIENT_TREE_PATH_BYTES:
+            raise CatalogProbeError("isolated client tree path bound exceeded")
+        if name_bytes + len(encoded_name) > _MAX_CLIENT_TREE_NAME_BYTES:
+            raise CatalogProbeError("isolated client tree name bound exceeded")
+        if metadata_bytes + metadata_record_bytes > _MAX_CLIENT_TREE_METADATA_BYTES:
+            raise CatalogProbeError("isolated client tree metadata bound exceeded")
+        return encoded_relative, encoded_name
+
+    def reserve(
+        relative: str,
+        encoded_relative: bytes,
+        encoded_name: bytes,
+        metadata: os.stat_result,
+    ) -> tuple[tuple[int, ...], str]:
+        nonlocal path_bytes, name_bytes, metadata_bytes
+        nonlocal symlink_bytes, total_file_bytes
+        signature = _tree_metadata_signature(metadata)
+        kind = _tree_entry_kind(metadata.st_mode)
+        if kind == "regular":
+            if metadata.st_size < 0 or metadata.st_size > _MAX_CLIENT_TREE_FILE_BYTES:
+                raise CatalogProbeError("isolated client file byte bound exceeded")
             if (
-                metadata.st_size > _MAX_CLIENT_TREE_FILE_BYTES
-                or total_file_bytes > _MAX_CLIENT_TREE_TOTAL_FILE_BYTES
+                total_file_bytes + metadata.st_size
+                > _MAX_CLIENT_TREE_TOTAL_FILE_BYTES
             ):
                 raise CatalogProbeError("isolated client file byte bound exceeded")
-            descriptor: int | None = None
-            try:
-                descriptor = os.open(
-                    path,
-                    os.O_RDONLY
-                    | getattr(os, "O_NOFOLLOW", 0)
-                    | getattr(os, "O_CLOEXEC", 0),
-                )
-                opened = os.fstat(descriptor)
-                identity = (
-                    metadata.st_dev,
-                    metadata.st_ino,
-                    metadata.st_mode,
-                    metadata.st_uid,
-                    metadata.st_nlink,
-                    metadata.st_size,
-                    metadata.st_mtime_ns,
-                    metadata.st_ctime_ns,
-                )
-                opened_identity = (
-                    opened.st_dev,
-                    opened.st_ino,
-                    opened.st_mode,
-                    opened.st_uid,
-                    opened.st_nlink,
-                    opened.st_size,
-                    opened.st_mtime_ns,
-                    opened.st_ctime_ns,
-                )
-                if identity != opened_identity or not stat.S_ISREG(opened.st_mode):
-                    raise CatalogProbeError(
-                        "isolated client file changed while scanning"
+        elif kind == "symlink":
+            if metadata.st_size < 0:
+                raise CatalogProbeError("isolated client symlink metadata is invalid")
+            if symlink_bytes + metadata.st_size > _MAX_CLIENT_TREE_SYMLINK_BYTES:
+                raise CatalogProbeError("isolated client symlink byte bound exceeded")
+        seen.add(relative)
+        path_bytes += len(encoded_relative)
+        name_bytes += len(encoded_name)
+        metadata_bytes += metadata_record_bytes
+        if kind == "regular":
+            total_file_bytes += metadata.st_size
+        elif kind == "symlink":
+            symlink_bytes += metadata.st_size
+        return signature, kind
+
+    def enumerate_children(
+        directory_fd: int,
+        relative: str,
+        depth: int,
+    ) -> list[tuple[bytes, str, str, int, tuple[int, ...], str]]:
+        children: list[tuple[bytes, str, str, int, tuple[int, ...], str]] = []
+        try:
+            with os.scandir(directory_fd) as iterator:
+                for entry in iterator:
+                    child_name = entry.name
+                    child_relative = (
+                        child_name
+                        if relative == "."
+                        else relative + "/" + child_name
                     )
-                digest = hashlib.sha256()
-                offset = 0
-                while offset < opened.st_size:
-                    chunk = os.pread(
-                        descriptor,
-                        min(64 * 1024, opened.st_size - offset),
-                        offset,
+                    child_depth = depth + 1
+                    encoded_relative, encoded_name = preflight_name(
+                        child_relative,
+                        child_name,
+                        child_depth,
                     )
-                    if not chunk:
-                        raise CatalogProbeError(
-                            "isolated client file read made no progress"
+                    try:
+                        child_metadata = os.stat(
+                            child_name,
+                            dir_fd=directory_fd,
+                            follow_symlinks=False,
                         )
-                    digest.update(chunk)
-                    offset += len(chunk)
-                if os.fstat(descriptor) != opened:
+                    except (OSError, OverflowError):
+                        raise CatalogProbeError(
+                            "isolated client tree entry changed during enumeration"
+                        ) from None
+                    signature, kind = reserve(
+                        child_relative,
+                        encoded_relative,
+                        encoded_name,
+                        child_metadata,
+                    )
+                    children.append(
+                        (
+                            encoded_name,
+                            child_name,
+                            child_relative,
+                            child_depth,
+                            signature,
+                            kind,
+                        )
+                    )
+        except CatalogProbeError:
+            raise
+        except (OSError, OverflowError, TypeError, ValueError):
+            raise CatalogProbeError(
+                "isolated client tree cannot be enumerated"
+            ) from None
+        children.sort(key=lambda child: child[0])
+        return children
+
+    def pin_directory(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, ...],
+    ) -> int:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent_fd,
+            )
+            open_descriptors.add(descriptor)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise CatalogProbeError(
+                    "isolated client tree directory changed type"
+                )
+            require_signature(opened, expected, context="directory")
+            return descriptor
+        except CatalogProbeError:
+            if descriptor is not None:
+                close_registered(descriptor)
+            raise
+        except (OSError, OverflowError):
+            if descriptor is not None:
+                close_registered(descriptor)
+            raise CatalogProbeError(
+                "isolated client tree directory cannot be pinned"
+            ) from None
+
+    def digest_regular(
+        parent_fd: int,
+        name: str,
+        expected: tuple[int, ...],
+    ) -> tuple[int, str]:
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=parent_fd,
+            )
+            open_descriptors.add(descriptor)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise CatalogProbeError("isolated client file changed type")
+            require_signature(opened, expected, context="file")
+            digest = hashlib.sha256()
+            offset = 0
+            while offset < opened.st_size:
+                chunk = os.pread(
+                    descriptor,
+                    min(64 * 1024, opened.st_size - offset),
+                    offset,
+                )
+                if not chunk:
+                    raise CatalogProbeError(
+                        "isolated client file read made no progress"
+                    )
+                offset += len(chunk)
+                if offset > opened.st_size:
                     raise CatalogProbeError(
                         "isolated client file changed while scanning"
                     )
-            except OSError:
-                raise CatalogProbeError("isolated client file cannot be read") from None
-            finally:
-                if descriptor is not None:
-                    os.close(descriptor)
-            evidence: object = (opened.st_size, digest.hexdigest())
-            kind = "regular"
-        elif stat.S_ISDIR(metadata.st_mode):
-            evidence, kind = None, "directory"
-        elif stat.S_ISLNK(metadata.st_mode):
+                digest.update(chunk)
+            require_signature(
+                os.fstat(descriptor),
+                expected,
+                context="file",
+            )
+            return opened.st_size, digest.hexdigest()
+        except CatalogProbeError:
+            raise
+        except (OSError, OverflowError):
+            raise CatalogProbeError("isolated client file cannot be read") from None
+        finally:
+            if descriptor is not None:
+                close_registered(descriptor)
+
+    try:
+        root_encoded_relative, root_encoded_name = preflight_name(".", ".", 0)
+        root_signature, root_kind = reserve(
+            ".",
+            root_encoded_relative,
+            root_encoded_name,
+            pinned_root.final_metadata,
+        )
+        if root_kind != "directory":
+            raise CatalogProbeError("isolated client root is not a directory")
+        tasks: list[tuple[object, ...]] = [
+            (
+                "scan",
+                pinned_root.final_parent_fd,
+                pinned_root.final_name,
+                ".",
+                0,
+                root_signature,
+                root_kind,
+                pinned_root.final_fd,
+                False,
+            )
+        ]
+        while tasks:
+            task = tasks.pop()
+            if task[0] == "finish":
+                (
+                    _,
+                    parent_fd,
+                    name,
+                    relative,
+                    expected,
+                    kind,
+                    directory_fd,
+                    close_when_done,
+                ) = task
+                try:
+                    opened_after = os.fstat(directory_fd)
+                    named_after = (
+                        os.lstat(name)
+                        if parent_fd is None
+                        else os.stat(
+                            name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    )
+                except (OSError, OverflowError):
+                    raise CatalogProbeError(
+                        "isolated client tree directory changed during capture"
+                    ) from None
+                require_signature(opened_after, expected, context="directory")
+                require_signature(named_after, expected, context="directory")
+                rows.append(
+                    (
+                        relative,
+                        kind,
+                        stat.S_IMODE(expected[0]),
+                        expected[5],
+                        None,
+                        expected,
+                    )
+                )
+                if close_when_done:
+                    close_registered(directory_fd)
+                continue
+            if task[0] == "scan":
+                (
+                    _,
+                    parent_fd,
+                    name,
+                    relative,
+                    depth,
+                    expected,
+                    kind,
+                    directory_fd,
+                    close_when_done,
+                ) = task
+                children = enumerate_children(directory_fd, relative, depth)
+                tasks.append(
+                    (
+                        "finish",
+                        parent_fd,
+                        name,
+                        relative,
+                        expected,
+                        kind,
+                        directory_fd,
+                        close_when_done,
+                    )
+                )
+                for child in reversed(children):
+                    tasks.append(("entry", directory_fd, *child[1:]))
+                continue
+            _, parent_fd, name, relative, depth, expected, kind = task
             try:
-                evidence = os.readlink(path)
-            except OSError:
-                raise CatalogProbeError("isolated client link cannot be read") from None
-            kind = "symlink"
-        else:
-            evidence, kind = None, "special"
-        rows.append((relative, kind, mode, metadata.st_nlink, evidence))
+                named_before = os.stat(
+                    name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except (OSError, OverflowError):
+                raise CatalogProbeError(
+                    "isolated client tree entry changed while scanning"
+                ) from None
+            require_signature(named_before, expected, context="entry")
+            if _tree_entry_kind(named_before.st_mode) != kind:
+                raise CatalogProbeError("isolated client tree entry changed type")
+            if kind == "directory":
+                directory_fd = pin_directory(parent_fd, name, expected)
+                tasks.append(
+                    (
+                        "scan",
+                        parent_fd,
+                        name,
+                        relative,
+                        depth,
+                        expected,
+                        kind,
+                        directory_fd,
+                        True,
+                    )
+                )
+                continue
+            evidence: object = None
+            if kind == "regular":
+                evidence = digest_regular(parent_fd, name, expected)
+            elif kind == "symlink":
+                try:
+                    target = os.readlink(os.fsencode(name), dir_fd=parent_fd)
+                except (OSError, OverflowError, TypeError, ValueError):
+                    raise CatalogProbeError(
+                        "isolated client link cannot be read"
+                    ) from None
+                if type(target) is not bytes or len(target) != expected[7]:
+                    raise CatalogProbeError(
+                        "isolated client link changed while scanning"
+                    )
+                if len(target) > _MAX_CLIENT_TREE_SYMLINK_BYTES:
+                    raise CatalogProbeError(
+                        "isolated client symlink byte bound exceeded"
+                    )
+                evidence = os.fsdecode(target)
+            try:
+                named_after = os.stat(
+                    name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except (OSError, OverflowError):
+                raise CatalogProbeError(
+                    "isolated client tree entry changed while scanning"
+                ) from None
+            require_signature(named_after, expected, context="entry")
+            rows.append(
+                (
+                    relative,
+                    kind,
+                    stat.S_IMODE(expected[0]),
+                    expected[5],
+                    evidence,
+                    expected,
+                )
+            )
+        try:
+            pinned_root.verify()
+        except (OSError, OverflowError, ValueError):
+            raise CatalogProbeError(
+                "isolated client root changed while scanning"
+            ) from None
+    finally:
+        for descriptor in tuple(open_descriptors):
+            close_registered(descriptor)
+        pinned_root.close()
+    rows.sort(key=lambda row: os.fsencode(str(row[0])))
     return tuple(rows)
 
 

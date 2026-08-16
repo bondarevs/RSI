@@ -63,6 +63,13 @@ def _kill_pid_for_test(process_id: int) -> None:
     _wait_pid_absent(process_id)
 
 
+def _open_descriptor_names() -> set[str]:
+    descriptor_root = (
+        Path("/dev/fd") if Path("/dev/fd").is_dir() else Path("/proc/self/fd")
+    )
+    return {entry.name for entry in descriptor_root.iterdir()}
+
+
 def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
     result: list[tuple[object, ...]] = []
     for path in sorted((root, *root.rglob("*")), key=lambda item: os.fsencode(item)):
@@ -302,6 +309,307 @@ def test_disposable_tree_inventory_is_bounded_before_state_classification(
 
     with pytest.raises(catalog_probe.CatalogProbeError, match="entry bound"):
         catalog_probe._tree_snapshot(tmp_path)
+
+
+def test_disposable_tree_inventory_stops_before_materializing_large_fanout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    for index in range(20):
+        (tmp_path / f"entry-{index:02d}.bin").write_bytes(b"entry")
+    real_scandir = os.scandir
+    consumed = 0
+
+    class CountingScandir:
+        def __init__(self, directory: object) -> None:
+            self._iterator = real_scandir(directory)  # type: ignore[arg-type]
+
+        def __enter__(self) -> CountingScandir:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._iterator.close()
+
+        def __iter__(self) -> CountingScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            nonlocal consumed
+            entry = next(self._iterator)
+            consumed += 1
+            return entry
+
+    descriptors_before = _open_descriptor_names()
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog_probe, "_MAX_CLIENT_TREE_ENTRIES", 2)
+        patch.setattr(catalog_probe.os, "scandir", CountingScandir)
+        with pytest.raises(catalog_probe.CatalogProbeError, match="entry bound"):
+            catalog_probe._tree_snapshot(tmp_path)
+        consumed_before_descriptor_check = consumed
+
+    assert _open_descriptor_names() == descriptors_before
+    assert consumed_before_descriptor_check <= 3
+
+
+@pytest.mark.parametrize(
+    ("bound_name", "bound", "fixture_kind", "message"),
+    [
+        ("_MAX_CLIENT_TREE_DEPTH", 0, "nested", "depth bound"),
+        ("_MAX_CLIENT_TREE_PATH_BYTES", 1, "regular", "path bound"),
+        ("_MAX_CLIENT_TREE_NAME_BYTES", 1, "regular", "name bound"),
+        ("_MAX_CLIENT_TREE_METADATA_BYTES", 8, "regular", "metadata bound"),
+        ("_MAX_CLIENT_TREE_SYMLINK_BYTES", 1, "symlink", "symlink byte bound"),
+        ("_MAX_CLIENT_TREE_FILE_BYTES", 3, "regular", "file byte bound"),
+        (
+            "_MAX_CLIENT_TREE_TOTAL_FILE_BYTES",
+            7,
+            "regular-pair",
+            "file byte bound",
+        ),
+    ],
+)
+def test_disposable_tree_inventory_enforces_every_structural_and_payload_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bound_name: str,
+    bound: int,
+    fixture_kind: str,
+    message: str,
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    if fixture_kind == "nested":
+        (tmp_path / "nested").mkdir()
+    elif fixture_kind == "symlink":
+        (tmp_path / "alias").symlink_to("long-target")
+    else:
+        (tmp_path / "payload.bin").write_bytes(b"four")
+        if fixture_kind == "regular-pair":
+            (tmp_path / "second.bin").write_bytes(b"four")
+    real_open = os.open
+    real_pread = os.pread
+    real_readlink = os.readlink
+    descendant_opens = 0
+    content_reads = 0
+    link_reads = 0
+
+    def count_descendant_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal descendant_opens
+        if path in {"nested", "payload.bin", "second.bin"} and kwargs.get(
+            "dir_fd"
+        ) is not None:
+            descendant_opens += 1
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    def count_content_read(descriptor: int, size: int, offset: int) -> bytes:
+        nonlocal content_reads
+        content_reads += 1
+        return real_pread(descriptor, size, offset)
+
+    def count_link_read(path: object, *args: object, **kwargs: object):
+        nonlocal link_reads
+        link_reads += 1
+        return real_readlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(catalog_probe, bound_name, bound, raising=False)
+    monkeypatch.setattr(catalog_probe.os, "open", count_descendant_open)
+    monkeypatch.setattr(catalog_probe.os, "pread", count_content_read)
+    monkeypatch.setattr(catalog_probe.os, "readlink", count_link_read)
+    descriptors_before = _open_descriptor_names()
+
+    with pytest.raises(catalog_probe.CatalogProbeError, match=message):
+        catalog_probe._tree_snapshot(tmp_path)
+
+    assert _open_descriptor_names() == descriptors_before
+    assert descendant_opens == 0
+    assert content_reads == 0
+    assert link_reads == 0
+
+
+def test_disposable_tree_inventory_is_deterministic_and_never_follows_links(
+    tmp_path: Path,
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    external = tmp_path.parent / "external.bin"
+    external.write_bytes(b"outside-one")
+    (tmp_path / "z-directory").mkdir()
+    (tmp_path / "z-directory" / "payload.bin").write_bytes(b"nested")
+    (tmp_path / "a-link").symlink_to(external)
+    os.mkfifo(tmp_path / "m-fifo")
+    descriptors_before = _open_descriptor_names()
+
+    before = catalog_probe._tree_snapshot(tmp_path)
+    external.write_bytes(b"outside-two")
+    after = catalog_probe._tree_snapshot(tmp_path)
+
+    assert after == before
+    assert [row[0] for row in before] == sorted(
+        (row[0] for row in before), key=os.fsencode
+    )
+    assert {str(row[0]): row[1] for row in before}["a-link"] == "symlink"
+    assert {str(row[0]): row[1] for row in before}["m-fifo"] == "fifo"
+    assert _open_descriptor_names() == descriptors_before
+
+
+def test_disposable_tree_inventory_rejects_duplicate_directory_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    (tmp_path / "payload.bin").write_bytes(b"payload")
+    real_scandir = os.scandir
+
+    class DuplicateScandir:
+        def __init__(self, directory: object) -> None:
+            self._iterator = real_scandir(directory)  # type: ignore[arg-type]
+            self._first: os.DirEntry[str] | None = None
+            self._state = 0
+
+        def __enter__(self) -> DuplicateScandir:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            self._iterator.close()
+
+        def __iter__(self) -> DuplicateScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            if self._state == 0:
+                self._first = next(self._iterator)
+                self._state = 1
+                return self._first
+            if self._state == 1:
+                self._state = 2
+                assert self._first is not None
+                return self._first
+            raise StopIteration
+
+    descriptors_before = _open_descriptor_names()
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog_probe.os, "scandir", DuplicateScandir)
+        with pytest.raises(catalog_probe.CatalogProbeError, match="duplicate"):
+            catalog_probe._tree_snapshot(tmp_path)
+
+    assert _open_descriptor_names() == descriptors_before
+
+
+def test_disposable_tree_inventory_rejects_directory_rebind_without_fd_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "payload.bin").write_bytes(b"payload")
+    real_open = os.open
+    rebound = False
+    descriptors_before = _open_descriptor_names()
+
+    def rebind_before_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal rebound
+        if path == "nested" and kwargs.get("dir_fd") is not None and not rebound:
+            rebound = True
+            nested.rename(tmp_path / "nested-displaced")
+            nested.mkdir()
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog_probe.os, "open", rebind_before_open)
+        with pytest.raises(catalog_probe.CatalogProbeError, match="identity|changed"):
+            catalog_probe._tree_snapshot(tmp_path)
+
+    assert rebound is True
+    assert _open_descriptor_names() == descriptors_before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["scandir", "stat", "open", "fstat", "pread", "readlink"],
+)
+def test_disposable_tree_inventory_syscall_faults_are_bounded_and_fd_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    catalog_probe = importlib.import_module("rsi_core.catalog_probe")
+    (tmp_path / "payload.bin").write_bytes(b"payload")
+    (tmp_path / "alias").symlink_to("payload.bin")
+    real_scandir = os.scandir
+    real_stat = os.stat
+    real_open = os.open
+    real_fstat = os.fstat
+    real_pread = os.pread
+    real_readlink = os.readlink
+    payload_descriptor: int | None = None
+    injected = False
+
+    def fail_scandir(directory: object):
+        nonlocal injected
+        if not injected:
+            injected = True
+            raise OSError("injected scandir failure")
+        return real_scandir(directory)  # type: ignore[arg-type]
+
+    def fail_stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        nonlocal injected
+        if path == "payload.bin" and kwargs.get("dir_fd") is not None:
+            injected = True
+            raise OSError("injected stat failure")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    def fail_open(
+        path: object, flags: int, *args: object, **kwargs: object
+    ) -> int:
+        nonlocal injected, payload_descriptor
+        if path == "payload.bin" and kwargs.get("dir_fd") is not None:
+            if fault == "open":
+                injected = True
+                raise OSError("injected open failure")
+            descriptor = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+            payload_descriptor = descriptor
+            return descriptor
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    def fail_fstat(descriptor: int) -> os.stat_result:
+        nonlocal injected
+        if descriptor == payload_descriptor:
+            injected = True
+            raise OSError("injected fstat failure")
+        return real_fstat(descriptor)
+
+    def fail_pread(descriptor: int, size: int, offset: int) -> bytes:
+        nonlocal injected
+        if descriptor == payload_descriptor:
+            injected = True
+            raise OSError("injected pread failure")
+        return real_pread(descriptor, size, offset)
+
+    def fail_readlink(path: object, *args: object, **kwargs: object):
+        nonlocal injected
+        if path in {"alias", b"alias"} and kwargs.get("dir_fd") is not None:
+            injected = True
+            raise OSError("injected readlink failure")
+        return real_readlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    descriptors_before = _open_descriptor_names()
+    with monkeypatch.context() as patch:
+        if fault == "scandir":
+            patch.setattr(catalog_probe.os, "scandir", fail_scandir)
+        elif fault == "stat":
+            patch.setattr(catalog_probe.os, "stat", fail_stat)
+        elif fault in {"open", "fstat", "pread"}:
+            patch.setattr(catalog_probe.os, "open", fail_open)
+            if fault == "fstat":
+                patch.setattr(catalog_probe.os, "fstat", fail_fstat)
+            elif fault == "pread":
+                patch.setattr(catalog_probe.os, "pread", fail_pread)
+        else:
+            patch.setattr(catalog_probe.os, "readlink", fail_readlink)
+        with pytest.raises(catalog_probe.CatalogProbeError, match="cannot|changed"):
+            catalog_probe._tree_snapshot(tmp_path)
+
+    assert injected is True
+    assert _open_descriptor_names() == descriptors_before
 
 
 @pytest.mark.parametrize(
