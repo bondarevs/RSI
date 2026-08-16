@@ -9,10 +9,13 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 
 import pytest
 
 import rsi_deploy
+import rsi_core.deployment as deployment_module
+import rsi_core.global_rollout as rollout_module
 from rsi_core.deployment import (
     DeploymentAmbiguousError,
     DeploymentOperationConflict,
@@ -244,7 +247,7 @@ def _genuine_install(tmp_path: Path) -> tuple[Path, GlobalRsiDeployer, Path, Dry
     provider_ledger.write_bytes(b"")
     target = tmp_path / "protected-target"
     target.mkdir()
-    authority = DryRunAuthority(
+    authority = DryRunAuthority.for_testing(
         deployment_paths=paths,
         source_repository=repo,
         provider_home=provider_home,
@@ -252,6 +255,53 @@ def _genuine_install(tmp_path: Path) -> tuple[Path, GlobalRsiDeployer, Path, Dry
         target_roots=(target,),
     )
     return repo, deployer, paths.installed_root, authority
+
+
+def _genuine_live_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, DeploymentPaths, Path]:
+    fake_home = tmp_path / "passwd-home"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setattr(deployment_module, "_actual_user_home", lambda: fake_home)
+    validator_source = (
+        Path.home()
+        / ".codex"
+        / "skills"
+        / ".system"
+        / "skill-creator"
+        / "scripts"
+        / "quick_validate.py"
+    )
+    validator_target = (
+        fake_home
+        / ".codex"
+        / "skills"
+        / ".system"
+        / "skill-creator"
+        / "scripts"
+        / "quick_validate.py"
+    )
+    validator_target.parent.mkdir(parents=True)
+    shutil.copy2(validator_source, validator_target)
+    source_package = Path(__file__).resolve().parents[1]
+    repo = tmp_path / "live-source-repository"
+    package = repo / "recursive-self-improvement"
+    shutil.copytree(
+        source_package,
+        package,
+        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc"),
+    )
+    subprocess.run(["git", "init", "-q", os.fspath(repo)], check=True)
+    _git(repo, "config", "user.email", "rsi-rollout@example.invalid")
+    _git(repo, "config", "user.name", "RSI Rollout Tests")
+    _git(repo, "add", "recursive-self-improvement")
+    _git(repo, "commit", "-q", "-m", "live-fixture")
+    paths = DeploymentPaths.live()
+    GlobalRsiDeployer(paths).deploy(repo, "deploy-live-rollout-fixture")
+    provider = paths.codex_home / "skill-learning"
+    provider.mkdir(mode=0o700)
+    (provider / "events.jsonl").write_bytes(b"")
+    return repo, paths, paths.installed_root
 
 
 def test_cli_read_only_missing_install_is_zero_write_and_disables_bytecode(
@@ -374,6 +424,83 @@ def test_trigger_classifies_actual_rejected_bytes_without_returning_or_hashing_t
     assert decision.reason == reason
     assert rejected not in encoded
     assert hashlib.sha256(rejected).hexdigest().encode() not in encoded
+
+
+def _group_exists(group_id: int) -> bool:
+    try:
+        os.killpg(group_id, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+@pytest.mark.parametrize("failure_kind", ["deadline", "overflow"])
+def test_bounded_capture_terminates_and_reaps_the_entire_process_group(
+    failure_kind: str,
+) -> None:
+    source = (
+        "import time; time.sleep(30)"
+        if failure_kind == "deadline"
+        else "import os,time; os.write(1,b'x'*70000); time.sleep(30)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", source],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    with pytest.raises(RuntimeError, match="timed out|exceeded"):
+        rollout_module._capture_bounded(process, deadline_seconds=0.2)
+
+    assert process.poll() is not None
+    assert not _group_exists(process.pid)
+
+
+def test_capture_kills_child_that_ignores_term_after_leader_exits() -> None:
+    child = (
+        "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "time.sleep(30)"
+    )
+    leader = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable,'-c',{child!r}]);"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", leader],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    with pytest.raises(RuntimeError, match="timed out|descendant|group"):
+        rollout_module._capture_bounded(process, deadline_seconds=0.3)
+
+    assert process.poll() is not None
+    assert not _group_exists(process.pid)
+
+
+def test_success_cannot_return_with_a_lingering_daemonized_group_member() -> None:
+    child = (
+        "import os,signal,time; os.close(1); os.close(2); "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(30)"
+    )
+    leader = (
+        "import subprocess,sys; "
+        f"subprocess.Popen([sys.executable,'-c',{child!r}]);"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", leader],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+
+    with pytest.raises(RuntimeError, match="descendant|group"):
+        rollout_module._capture_bounded(process, deadline_seconds=2)
+
+    assert process.poll() is not None
+    assert not _group_exists(process.pid)
 
 
 @dataclass(frozen=True)
@@ -559,6 +686,56 @@ def test_observe_dry_run_uses_only_installed_cli_and_temporary_state(tmp_path: P
     assert not (temp_root / "rsi-state-maintenance").exists()
     assert not (temp_root / "rsi-state-sensitive").exists()
     assert not (temp_root / "rsi-state-recursive").exists()
+    for state_root in temp_root.glob("rsi-state-*"):
+        events = [json.loads(line) for line in (state_root / "events.jsonl").read_text().splitlines()]
+        assert {event["createdAt"] for event in events} == {
+            rollout_module.DRY_RUN_ATTESTED_NOW
+        }
+
+
+def test_live_authority_constructor_and_public_dry_run_use_only_fixed_live_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, paths, installed = _genuine_live_install(tmp_path, monkeypatch)
+    before = (_snapshot(repo), _snapshot(paths.codex_home))
+
+    authority = DryRunAuthority.live()
+    report = run_observe_dry_run(installed, tmp_path / "live-dry-run")
+
+    assert authority.deployment_paths == paths
+    assert authority.source_repository == repo
+    assert authority.provider_home == paths.codex_home / "skill-learning"
+    assert authority.provider_ledger == paths.codex_home / "skill-learning" / "events.jsonl"
+    assert authority.target_roots == (paths.skills_root,)
+    assert report.complete is True
+    assert (_snapshot(repo), _snapshot(paths.codex_home)) == before
+
+
+def test_testing_authority_cannot_alias_the_live_codex_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_live_home = tmp_path / "live-home"
+    fake_live_home.mkdir()
+    monkeypatch.setattr(deployment_module, "_actual_user_home", lambda: fake_live_home)
+    testing_paths = DeploymentPaths.for_testing(tmp_path / "testing-codex")
+    testing_paths.codex_home.mkdir()
+    live_provider = fake_live_home / ".codex" / "skill-learning"
+    live_provider.mkdir(parents=True)
+    ledger = live_provider / "events.jsonl"
+    ledger.write_bytes(b"")
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+
+    with pytest.raises(ValueError, match="live|protected"):
+        DryRunAuthority.for_testing(
+            deployment_paths=testing_paths,
+            source_repository=source,
+            provider_home=live_provider,
+            provider_ledger=ledger,
+            target_roots=(target,),
+        )
 
 
 def test_observe_dry_run_never_persists_rejected_bytes_or_their_hashes(tmp_path: Path) -> None:
@@ -618,6 +795,61 @@ def test_observe_dry_run_rejects_a_lexical_temp_alias(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="lexically canonical"):
         run_observe_dry_run(installed, aliased, authority=authority)
+
+
+@pytest.mark.parametrize(
+    "protected_name",
+    ["installed", "source", "codex", "state", "provider", "target"],
+)
+def test_observe_dry_run_rejects_every_cited_protected_root_overlap(
+    tmp_path: Path, protected_name: str
+) -> None:
+    repo, _deployer, installed, authority = _genuine_install(tmp_path / "installation")
+    paths = authority.deployment_paths
+    roots = {
+        "installed": installed,
+        "source": repo,
+        "codex": paths.codex_home,
+        "state": paths.state_root,
+        "provider": authority.provider_home,
+        "target": authority.target_roots[0],
+    }
+
+    with pytest.raises(ValueError, match="protected|disjoint"):
+        run_observe_dry_run(
+            installed,
+            roots[protected_name] / "fresh-dry-run-child",
+            authority=authority,
+        )
+
+
+@pytest.mark.parametrize("variant_name", ["base64", "url", "json", "normalized", "hash"])
+def test_rejected_transformed_variants_are_detected_in_temporary_state(
+    tmp_path: Path, variant_name: str
+) -> None:
+    rejected = (
+        "pe\u0301rson@example.invalid".encode("utf-8")
+        if variant_name == "normalized"
+        else b"api_key=rsi-dry-run-secret-credential"
+    )
+    variants = rollout_module._rejected_variants(rejected)
+    selected = {
+        "base64": __import__("base64").b64encode(rejected),
+        "url": __import__("urllib.parse", fromlist=["quote_from_bytes"]).quote_from_bytes(rejected).encode(),
+        "json": json.dumps(rejected.decode()).encode(),
+        "normalized": __import__("unicodedata").normalize(
+            "NFC", rejected.decode()
+        ).encode(),
+        "hash": hashlib.sha256(rejected).hexdigest().encode(),
+    }[variant_name]
+    assert selected in variants
+    temp_root = tmp_path / "state"
+    temp_root.mkdir()
+    (temp_root / "leak.bin").write_bytes(selected)
+    report = rollout_module.DryRunReport(True, ())
+
+    with pytest.raises(RuntimeError, match="leaked"):
+        rollout_module._scan_rejected_material(temp_root, report, (), (rejected,))
 
 
 def test_observe_dry_run_preserves_unrelated_repository_agents_provider_and_targets(

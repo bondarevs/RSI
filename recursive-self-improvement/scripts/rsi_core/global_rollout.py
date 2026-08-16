@@ -61,6 +61,10 @@ _REASONS = frozenset(
     }
 )
 _MAX_CAPTURE_BYTES = 64 * 1024
+DRY_RUN_ATTESTED_NOW = "2026-08-13T00:00:00Z"
+_DRY_RUN_CLOCK_AUTHORITY = "sha256:" + hashlib.sha256(
+    ("rsi-dry-run-attested-clock-v1\0" + DRY_RUN_ATTESTED_NOW).encode("utf-8")
+).hexdigest()
 _REJECTED_DRY_RUN_VALUES = (
     b"api_key=rsi-dry-run-secret-credential",
     b"person@example.invalid",
@@ -90,7 +94,7 @@ exec(compile(read_record(records["entry"]),sys.argv[0],"exec"),scope)
 '''
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DryRunAuthority:
     """Explicit isolated authority and protected roots for one dry run."""
 
@@ -99,6 +103,107 @@ class DryRunAuthority:
     provider_home: Path
     provider_ledger: Path
     target_roots: tuple[Path, ...]
+    _provenance: str
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        raise ValueError(
+            "dry-run authority must be created by live() or for_testing()"
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        *,
+        deployment_paths: object,
+        source_repository: Path,
+        provider_home: Path,
+        provider_ledger: Path,
+        target_roots: tuple[Path, ...],
+        provenance: str,
+    ) -> "DryRunAuthority":
+        instance = object.__new__(cls)
+        values = {
+            "deployment_paths": deployment_paths,
+            "source_repository": source_repository,
+            "provider_home": provider_home,
+            "provider_ledger": provider_ledger,
+            "target_roots": target_roots,
+            "_provenance": provenance,
+        }
+        for name, value in values.items():
+            object.__setattr__(instance, name, value)
+        return instance
+
+    @classmethod
+    def live(cls) -> "DryRunAuthority":
+        """Derive read-only production authority from exact passwd-home paths."""
+
+        from .deployment import DeploymentPaths, GlobalRsiDeployer
+
+        paths = DeploymentPaths.live()
+        deployer = GlobalRsiDeployer(paths)
+        snapshot = attest_installed_snapshot(paths.installed_root, deployer)
+        try:
+            source = snapshot.source_repository.resolve(strict=True)
+        finally:
+            snapshot.close()
+        provider_home = paths.codex_home / "skill-learning"
+        provider_ledger = provider_home / "events.jsonl"
+        for path in (provider_home, provider_ledger, paths.skills_root):
+            _canonical_protected_path(Path(path), label="live dry-run authority")
+        return cls._create(
+            deployment_paths=paths,
+            source_repository=source,
+            provider_home=provider_home,
+            provider_ledger=provider_ledger,
+            target_roots=(paths.skills_root,),
+            provenance="live",
+        )
+
+    @classmethod
+    def for_testing(
+        cls,
+        *,
+        deployment_paths: object,
+        source_repository: Path,
+        provider_home: Path,
+        provider_ledger: Path,
+        target_roots: tuple[Path, ...],
+    ) -> "DryRunAuthority":
+        """Create explicit isolated test authority; live aliases are forbidden."""
+
+        from .deployment import DeploymentPaths
+
+        if (
+            type(deployment_paths) is not DeploymentPaths
+            or deployment_paths.testing is not True
+            or type(target_roots) is not tuple
+            or not target_roots
+        ):
+            raise ValueError("testing dry-run authority is invalid")
+        values = (
+            deployment_paths.codex_home,
+            source_repository,
+            provider_home,
+            provider_ledger,
+            *target_roots,
+        )
+        canonical = tuple(
+            _canonical_protected_path(Path(path), label="testing dry-run authority")
+            for path in values
+        )
+        live_root = DeploymentPaths.live().codex_home
+        for path in canonical:
+            if path == live_root or path in live_root.parents or live_root in path.parents:
+                raise ValueError("testing authority aliases a live protected root")
+        return cls._create(
+            deployment_paths=deployment_paths,
+            source_repository=canonical[1],
+            provider_home=canonical[2],
+            provider_ledger=canonical[3],
+            target_roots=tuple(canonical[4:]),
+            provenance="testing",
+        )
 
 
 @dataclass(slots=True)
@@ -587,24 +692,68 @@ def _write_canonical(path: Path, value: Mapping[str, object]) -> None:
         os.close(descriptor)
 
 
+def _process_group_exists(
+    group_id: int, process: subprocess.Popen[bytes] | None = None
+) -> bool:
+    try:
+        os.killpg(group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        if process is not None and process.poll() is not None:
+            return False
+        raise RuntimeError("dry-run process group identity is ambiguous") from None
+    return True
+
+
+def _wait_group_absent(
+    group_id: int, deadline: float, process: subprocess.Popen[bytes]
+) -> bool:
+    while time.monotonic() < deadline:
+        process.poll()
+        if not _process_group_exists(group_id, process):
+            return True
+        time.sleep(0.01)
+    process.poll()
+    return not _process_group_exists(group_id, process)
+
+
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    group_id = process.pid
     try:
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(group_id, signal.SIGTERM)
     except ProcessLookupError:
         pass
+    except PermissionError:
+        if process.poll() is None:
+            raise RuntimeError("dry-run process group identity is ambiguous") from None
     try:
-        process.wait(timeout=2)
-        return
+        process.wait(timeout=0.25)
     except subprocess.TimeoutExpired:
         pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    if _process_group_exists(group_id, process):
+        try:
+            os.killpg(group_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if process.poll() is None:
+                raise RuntimeError("dry-run process group identity is ambiguous") from None
     try:
         process.wait(timeout=2)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("dry-run subprocess group could not be reaped") from None
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("dry-run subprocess leader could not be reaped") from None
+    if not _wait_group_absent(group_id, time.monotonic() + 2.0, process):
+        raise RuntimeError(
+            "dry-run process group survived SIGKILL; state is ambiguous"
+        )
 
 
 def _capture_bounded(
@@ -619,10 +768,12 @@ def _capture_bounded(
     selector.register(process.stdout, selectors.EVENT_READ)
     selector.register(process.stderr, selectors.EVENT_READ)
     deadline = time.monotonic() + deadline_seconds
+    cleanup_attempted = False
     try:
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                cleanup_attempted = True
                 _terminate_process_group(process)
                 raise RuntimeError("installed RSI dry run timed out")
             events = selector.select(min(0.25, remaining))
@@ -638,20 +789,40 @@ def _capture_bounded(
                     continue
                 streams[key.fd].extend(chunk)
                 if sum(len(value) for value in streams.values()) > _MAX_CAPTURE_BYTES:
+                    cleanup_attempted = True
                     _terminate_process_group(process)
                     raise RuntimeError("installed RSI dry-run output exceeded its bound")
         return_code = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        if _process_group_exists(process.pid, process):
+            cleanup_attempted = True
+            _terminate_process_group(process)
+            raise RuntimeError(
+                "dry-run subprocess reported success with lingering descendants"
+            )
         return (
             return_code,
             bytes(streams[process.stdout.fileno()]),
             bytes(streams[process.stderr.fileno()]),
         )
     except Exception:
-        if process.poll() is None:
+        if process.poll() is None and not cleanup_attempted:
             _terminate_process_group(process)
+        # Once the whole group is gone, drain only the bounded kernel-pipe
+        # residue before closing descriptors.  Captured storage never grows
+        # beyond the aggregate bound.
+        for stream in (process.stdout, process.stderr):
+            while True:
+                try:
+                    chunk = os.read(stream.fileno(), 8192)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
         raise
     finally:
         selector.close()
+        process.stdout.close()
+        process.stderr.close()
 
 
 def _verify_emitted_state(
@@ -675,6 +846,8 @@ def _verify_emitted_state(
     if response.get("eventIds") != emitted_ids:
         raise RuntimeError("dry-run result is not bound to its exact events")
     event_types = [event.get("eventType") for event in events]
+    if {event.get("createdAt") for event in events} != {DRY_RUN_ATTESTED_NOW}:
+        raise RuntimeError("dry-run events differ from attested clock authority")
     if event_types[0] != "run.started" or "task.observed" not in event_types:
         raise RuntimeError("dry-run lifecycle events are incomplete")
     if "finding.drafted" in event_types or "candidate.captured" in event_types:
@@ -768,6 +941,8 @@ def _run_installed_review(
         "CODEX_RSI_TRIGGER_ACTIVE": "1",
         "CODEX_RSI_HOME": os.fspath(state_home),
         "CODEX_RSI_PROVIDER_HOME": os.fspath(provider_home),
+        "CODEX_RSI_ATTESTED_NOW": DRY_RUN_ATTESTED_NOW,
+        "CODEX_RSI_ATTESTED_CLOCK_AUTHORITY": _DRY_RUN_CLOCK_AUTHORITY,
     }
     arguments = [
         "local-review",
@@ -846,7 +1021,10 @@ def _rejected_variants(value: bytes) -> tuple[bytes, ...]:
 
 
 def _scan_rejected_material(
-    temp_root: Path, report: DryRunReport, transient_payloads: tuple[bytes, ...]
+    temp_root: Path,
+    report: DryRunReport,
+    transient_payloads: tuple[bytes, ...],
+    rejected_values: tuple[bytes, ...],
 ) -> None:
     report_bytes = canonical_json_bytes(report.to_mapping())
     payloads = [report_bytes, *transient_payloads]
@@ -854,7 +1032,7 @@ def _scan_rejected_material(
         if path.is_file():
             payloads.append(_read_stable_file(path, limit=16 * 1024 * 1024))
     haystack = b"".join(payloads)
-    for rejected in _REJECTED_DRY_RUN_VALUES:
+    for rejected in rejected_values:
         if any(variant in haystack for variant in _rejected_variants(rejected)):
             raise RuntimeError("rejected evidence leaked into dry-run state")
 
@@ -880,12 +1058,25 @@ def _validate_dry_run_authority(
     installed_root: Path,
     temp_root: Path,
     authority: DryRunAuthority,
-) -> tuple[object, tuple[Path, ...]]:
+) -> tuple[object, tuple[Path, ...], tuple[Path, ...]]:
     if type(authority) is not DryRunAuthority:
-        raise ValueError("dry-run testing authority is required")
+        raise ValueError("dry-run authority is required")
     paths = authority.deployment_paths
+    from .deployment import DeploymentPaths
+
+    if authority._provenance == "live":
+        expected_live = DeploymentPaths.live()
+        provenance_valid = (
+            paths == expected_live
+            and getattr(paths, "testing", None) is False
+            and installed_root == expected_live.installed_root
+        )
+    elif authority._provenance == "testing":
+        provenance_valid = getattr(paths, "testing", None) is True
+    else:
+        provenance_valid = False
     if (
-        getattr(paths, "testing", None) is not True
+        not provenance_valid
         or getattr(paths, "installed_root", None) != installed_root
         or getattr(paths, "codex_home", None) is None
         or getattr(paths, "state_root", None) is None
@@ -919,14 +1110,15 @@ def _validate_dry_run_authority(
     from .deployment import GlobalRsiDeployer
 
     deployer = GlobalRsiDeployer(paths)
-    return deployer, protected
+    snapshotted = tuple(path for number, path in enumerate(protected) if number != 2)
+    return deployer, protected, snapshotted
 
 
 def run_observe_dry_run(
     installed_root: Path,
     temp_root: Path,
     *,
-    authority: DryRunAuthority,
+    authority: DryRunAuthority | None = None,
 ) -> DryRunReport:
     """Exercise an attested installed CLI with isolated explicit test authority."""
 
@@ -948,15 +1140,16 @@ def run_observe_dry_run(
         raise ValueError("temporary dry-run root must be fresh and disjoint")
     _require_real_directory(installed_root, label="installed package")
     _require_real_directory(temp_root.parent, label="temporary dry-run parent")
-    deployer, protected = _validate_dry_run_authority(
-        installed_root, temp_root, authority
+    selected_authority = DryRunAuthority.live() if authority is None else authority
+    deployer, protected, snapshotted = _validate_dry_run_authority(
+        installed_root, temp_root, selected_authority
     )
     snapshot = attest_installed_snapshot(installed_root, deployer)
-    if snapshot.source_repository.resolve(strict=True) != authority.source_repository:
+    if snapshot.source_repository.resolve(strict=True) != selected_authority.source_repository:
         snapshot.close()
         raise ValueError("installed source is not bound to dry-run authority")
     before_installed = _tree_digest(installed_root)
-    protected_before = tuple(_tree_digest(path) if path.is_dir() else _read_stable_file(path, limit=16 * 1024 * 1024) for path in protected)
+    protected_before = tuple(_tree_digest(path) if path.is_dir() else _read_stable_file(path, limit=16 * 1024 * 1024) for path in snapshotted)
     temp_root.mkdir(mode=0o700, parents=True)
 
     skill = SkillUse("mail", "sha256:" + "a" * 64)
@@ -1003,6 +1196,11 @@ def run_observe_dry_run(
     )
     cases: list[DryRunCase] = []
     transient_payloads: list[bytes] = []
+    rejected_values = tuple(
+        value
+        for _name, summary in scenarios
+        for value in summary.rejected_evidence
+    )
     try:
         for name, summary in scenarios:
             decision = classify_global_trigger(summary)
@@ -1043,10 +1241,12 @@ def run_observe_dry_run(
         report = DryRunReport(True, tuple(cases))
         if _tree_digest(installed_root) != before_installed:
             raise RuntimeError("installed RSI package changed during dry run")
-        protected_after = tuple(_tree_digest(path) if path.is_dir() else _read_stable_file(path, limit=16 * 1024 * 1024) for path in protected)
+        protected_after = tuple(_tree_digest(path) if path.is_dir() else _read_stable_file(path, limit=16 * 1024 * 1024) for path in snapshotted)
         if protected_after != protected_before:
             raise RuntimeError("dry run changed a protected authority root")
-        _scan_rejected_material(temp_root, report, tuple(transient_payloads))
+        _scan_rejected_material(
+            temp_root, report, tuple(transient_payloads), rejected_values
+        )
         return report
     finally:
         snapshot.close()
@@ -1055,6 +1255,7 @@ def run_observe_dry_run(
 __all__ = [
     "AttestedPythonSnapshot",
     "DryRunAuthority",
+    "DRY_RUN_ATTESTED_NOW",
     "DryRunCase",
     "DryRunReport",
     "FinalArtifact",
