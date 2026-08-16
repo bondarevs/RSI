@@ -47,6 +47,14 @@ PACKAGE_VALIDATOR = (
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
 DIGEST_C = "sha256:" + "c" * 64
+EXPECTED_SKILL_DESCRIPTION = (
+    "Use only during or after a completed, verified skill-driven task to preserve "
+    "and evaluate evidence-backed reusable findings without changing role goals or "
+    "weakening safeguards. Use for recurring role-skill evidence, validated "
+    "improvements, ownership audits, defragmentation, or cross-skill RSI reports. "
+    "Do not use for ordinary conversation, status questions, one-off facts, tasks "
+    "without reusable evidence, or RSI/skill-learning deployment and maintenance."
+)
 
 
 def _tree(root: Path) -> tuple[tuple[str, str, int, bytes], ...]:
@@ -716,6 +724,16 @@ def test_release_package_links_examples_metadata_permissions_and_validator() -> 
     assert metadata["policy"] == {"allow_implicit_invocation": True}
     assert "$recursive-self-improvement" in metadata["interface"]["default_prompt"]
     assert 25 <= len(metadata["interface"]["short_description"]) <= 64
+
+    skill_text = (PACKAGE_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    frontmatter = re.fullmatch(r"---\n(.*?)\n---\n.*", skill_text, re.S)
+    assert frontmatter is not None
+    description_lines = [
+        line.removeprefix("description: ")
+        for line in frontmatter.group(1).splitlines()
+        if line.startswith("description: ")
+    ]
+    assert description_lines == [EXPECTED_SKILL_DESCRIPTION]
 
     assert json.loads((PACKAGE_ROOT / "profiles" / "default.json").read_text())["mode"] == "observe"
     assert json.loads((PACKAGE_ROOT / "profiles" / "production.json").read_text())["activation"]["allowedTargets"] == []

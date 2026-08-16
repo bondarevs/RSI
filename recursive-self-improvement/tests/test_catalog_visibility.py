@@ -20,6 +20,14 @@ CATALOG_PROMPT = (
 SKILL_BODY_SENTINEL = (
     "Operate as the control plane for evidence-backed role-skill improvement."
 )
+EXPECTED_SKILL_DESCRIPTION = (
+    "Use only during or after a completed, verified skill-driven task to preserve "
+    "and evaluate evidence-backed reusable findings without changing role goals or "
+    "weakening safeguards. Use for recurring role-skill evidence, validated "
+    "improvements, ownership audits, defragmentation, or cross-skill RSI reports. "
+    "Do not use for ordinary conversation, status questions, one-off facts, tasks "
+    "without reusable evidence, or RSI/skill-learning deployment and maintenance."
+)
 
 
 def _tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
@@ -99,6 +107,7 @@ def test_fresh_codex_catalog_lists_rsi_without_invoking_it(tmp_path: Path) -> No
 
     assert "### Available skills" in rendered
     assert rendered.count("- recursive-self-improvement:") == 1
+    assert f"- recursive-self-improvement: {EXPECTED_SKILL_DESCRIPTION}" in rendered
     assert os.fspath(
         codex_home / "skills/recursive-self-improvement/SKILL.md"
     ) in rendered

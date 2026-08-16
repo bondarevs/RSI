@@ -84,6 +84,11 @@ def test_global_rollout_reference_is_a_closed_release_contract() -> None:
             "hookMode": "late-review",
             "productionAllowlist": [],
         },
+        "catalog": {
+            "allowImplicitInvocation": True,
+            "visibilityIsInvocationAuthority": False,
+            "freshTaskRequiredAfterInstall": True,
+        },
         "capabilities": {
             "promotionEnabled": False,
             "privilegedCoordinatorInstalled": False,
@@ -136,6 +141,10 @@ def test_global_rollout_reference_is_a_closed_release_contract() -> None:
     assert production["activation"]["allowedTargets"] == contract["defaults"][
         "productionAllowlist"
     ]
+
+    assert "Catalog visibility is not invocation authority" in text
+    assert "codex debug prompt-input" in text
+    assert "rollback through the exact deployment receipt" in text
 
 
 def test_global_rollout_managed_block_and_cli_examples_execute_the_real_grammar() -> None:

@@ -1,6 +1,6 @@
 ---
 name: recursive-self-improvement
-description: Track and evaluate Codex role-skill tasks, preserve evidence-backed reusable findings, validate safe local improvements, and aggregate global learning without changing role goals or weakening safeguards. Use during or after skill-driven tasks when important findings must not be lost, when reviewing a role's recurring failures or successes, when validating a proposed skill improvement, when auditing skill ownership or defragmentation, or when producing a cross-skill RSI report.
+description: Use only during or after a completed, verified skill-driven task to preserve and evaluate evidence-backed reusable findings without changing role goals or weakening safeguards. Use for recurring role-skill evidence, validated improvements, ownership audits, defragmentation, or cross-skill RSI reports. Do not use for ordinary conversation, status questions, one-off facts, tasks without reusable evidence, or RSI/skill-learning deployment and maintenance.
 ---
 
 # Recursive Self-Improvement

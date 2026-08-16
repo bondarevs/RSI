@@ -22,6 +22,11 @@ options and environment variables cannot redirect them.
     "hookMode": "late-review",
     "productionAllowlist": []
   },
+  "catalog": {
+    "allowImplicitInvocation": true,
+    "visibilityIsInvocationAuthority": false,
+    "freshTaskRequiredAfterInstall": true
+  },
   "capabilities": {
     "promotionEnabled": false,
     "privilegedCoordinatorInstalled": false
@@ -152,12 +157,28 @@ instruction-bearing evidence, and any nested invocation are skipped. The
 invocation receives only final sanitized artifacts and the exact guard
 `CODEX_RSI_TRIGGER_ACTIVE=1`; any other present guard value fails closed.
 
+## Catalog visibility
+
+The catalog policy `allow_implicit_invocation: true` makes the installed skill
+metadata model-visible. Catalog visibility is not invocation authority: seeing
+the name and description does not invoke RSI, authorize a write, enable
+promotion, or expand the empty production allowlist. The managed trigger still
+decides whether a completed task is eligible, and the exact runtime profile
+remains the authority gate for any admitted operation.
+
 Installation does not alter the catalog of an already running Codex task.
-After a successful install or update, start a new Codex task to verify that the
-installed `recursive-self-improvement` skill is discoverable. A dry run must
-use a fresh temporary RSI/provider home and must leave the repository,
-installed package, global instructions, live provider ledger, and all target
-roots byte-identical.
+After a successful install or update, start a new Codex task. Use
+`codex debug prompt-input` as the read-only probe and confirm that the catalog
+contains one `recursive-self-improvement` entry while its skill body is not
+injected or invoked. The probe must create no RSI/provider state and must leave
+the repository, installed package, global instructions, live provider ledger,
+and all target roots byte-identical.
+
+If the entry is absent, RSI is invoked unexpectedly, or the probe creates RSI
+state, stop the rollout and rollback through the exact deployment receipt. Do
+not repair the installed tree or retry under a new operation ID. The catalog
+visibility boundary is specified by the
+[catalog-visibility design addendum](../../docs/superpowers/specs/2026-08-16-global-rsi-catalog-visibility-design.md).
 
 ## Recovery
 
