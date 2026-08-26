@@ -12,6 +12,10 @@ import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+# The installed package is manifest-bound and must remain immutable at runtime.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 from rsi_core.defragment import DefragmentationService
 from rsi_core.evaluate import Evaluator
 from rsi_core.evolver_adapter import (

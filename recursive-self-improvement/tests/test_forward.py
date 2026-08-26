@@ -756,6 +756,41 @@ def test_release_package_links_examples_metadata_permissions_and_validator() -> 
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_release_cli_preflight_does_not_mutate_manifest_bound_package(
+    tmp_path: Path,
+) -> None:
+    """Even a plain installed CLI invocation must not create bytecode in-package."""
+
+    installed = tmp_path / "installed" / "recursive-self-improvement"
+    shutil.copytree(
+        PACKAGE_ROOT,
+        installed,
+        ignore=shutil.ignore_patterns("__pycache__", ".pytest_cache", "*.pyc"),
+    )
+    environment = os.environ.copy()
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(installed / "scripts" / "rsi.py"),
+            "preflight",
+            "--home",
+            str(tmp_path / "state"),
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not list(installed.rglob("__pycache__"))
+    assert not list(installed.rglob("*.pyc"))
+
+
 def test_installed_package_links_keep_the_catalog_design_inside_the_package(
     tmp_path: Path,
 ) -> None:
