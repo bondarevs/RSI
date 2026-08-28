@@ -791,6 +791,55 @@ def test_release_cli_preflight_does_not_mutate_manifest_bound_package(
     assert not list(installed.rglob("*.pyc"))
 
 
+def test_release_direct_core_import_does_not_mutate_manifest_bound_package(
+    tmp_path: Path,
+) -> None:
+    """Integrated hosts may import rsi_core without entering through rsi.py."""
+
+    def ignore_generated(directory: str, names: list[str]) -> set[str]:
+        return {
+            name
+            for name in names
+            if name == ".pytest_cache"
+            or name.endswith(".pyc")
+            or (
+                name == "__pycache__"
+                and (Path(directory) / name).is_dir()
+            )
+        }
+
+    installed = tmp_path / "installed" / "recursive-self-improvement"
+    shutil.copytree(
+        PACKAGE_ROOT,
+        installed,
+        ignore=ignore_generated,
+    )
+    blocker = installed / "scripts" / "rsi_core" / "__pycache__"
+    blocker_bytes = blocker.read_bytes()
+    environment = os.environ.copy()
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    environment.pop("PYTHONPYCACHEPREFIX", None)
+    environment["PYTHONPATH"] = str(installed / "scripts")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import rsi_core.events; import rsi_core.sanitize",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert blocker.is_file()
+    assert blocker.read_bytes() == blocker_bytes
+    assert not [path for path in installed.rglob("__pycache__") if path.is_dir()]
+    assert not list(installed.rglob("*.pyc"))
+
+
 def test_installed_package_links_keep_the_catalog_design_inside_the_package(
     tmp_path: Path,
 ) -> None:
